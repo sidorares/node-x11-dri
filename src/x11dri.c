@@ -431,6 +431,14 @@ static struct {
     void (*DrawElementsInstanced)(GLenum, GLsizei, GLenum, const void *, GLsizei);
     void (*VertexAttribDivisor)(GLuint, GLuint);
     void (*DrawBuffers)(GLsizei, const GLenum *);
+    void (*TexImage3D)(GLenum, GLint, GLint, GLsizei, GLsizei, GLsizei, GLint, GLenum, GLenum, const void *);
+    void (*TexSubImage3D)(GLenum, GLint, GLint, GLint, GLint, GLsizei, GLsizei, GLsizei, GLenum, GLenum, const void *);
+    void (*CopyTexSubImage3D)(GLenum, GLint, GLint, GLint, GLint, GLint, GLint, GLsizei, GLsizei);
+    void (*CompressedTexImage3D)(GLenum, GLint, GLenum, GLsizei, GLsizei, GLsizei, GLint, GLsizei, const void *);
+    void (*CompressedTexSubImage3D)(GLenum, GLint, GLint, GLint, GLint, GLsizei, GLsizei, GLsizei, GLenum, GLsizei, const void *);
+    void (*FramebufferTextureLayer)(GLenum, GLenum, GLuint, GLint, GLint);
+    void (*TexStorage2D)(GLenum, GLsizei, GLenum, GLsizei, GLsizei);
+    void (*TexStorage3D)(GLenum, GLsizei, GLenum, GLsizei, GLsizei, GLsizei);
 } gl;
 
 static const char *load_gbm(void) {
@@ -667,7 +675,33 @@ static const GlOptional gl_optional[] = {
     { (void **)&gl.DrawBuffers, "drawBuffers", {
         { "glDrawBuffers", NULL },
         { "glDrawBuffersEXT", "GL_EXT_draw_buffers" },
-        { "glDrawBuffersNV", "GL_NV_draw_buffers" } } }
+        { "glDrawBuffersNV", "GL_NV_draw_buffers" } } },
+    { (void **)&gl.TexImage3D, "texture3D", {
+        { "glTexImage3D", NULL },
+        { "glTexImage3DOES", "GL_OES_texture_3D" } } },
+    { (void **)&gl.TexSubImage3D, "texture3D", {
+        { "glTexSubImage3D", NULL },
+        { "glTexSubImage3DOES", "GL_OES_texture_3D" } } },
+    { (void **)&gl.CopyTexSubImage3D, "texture3D", {
+        { "glCopyTexSubImage3D", NULL },
+        { "glCopyTexSubImage3DOES", "GL_OES_texture_3D" } } },
+    { (void **)&gl.CompressedTexImage3D, "texture3D", {
+        { "glCompressedTexImage3D", NULL },
+        { "glCompressedTexImage3DOES", "GL_OES_texture_3D" } } },
+    { (void **)&gl.CompressedTexSubImage3D, "texture3D", {
+        { "glCompressedTexSubImage3D", NULL },
+        { "glCompressedTexSubImage3DOES", "GL_OES_texture_3D" } } },
+    // No ES 2.0 extension provides this: OES_texture_3D renders into a 3D
+    // slice with glFramebufferTexture3DOES instead, and array textures do not
+    // exist there at all. So it is ES 3.0 or nothing.
+    { (void **)&gl.FramebufferTextureLayer, "texture3D", {
+        { "glFramebufferTextureLayer", NULL } } },
+    { (void **)&gl.TexStorage2D, "textureStorage", {
+        { "glTexStorage2D", NULL },
+        { "glTexStorage2DEXT", "GL_EXT_texture_storage" } } },
+    { (void **)&gl.TexStorage3D, "textureStorage", {
+        { "glTexStorage3D", NULL },
+        { "glTexStorage3DEXT", "GL_EXT_texture_storage" } } }
 };
 
 // GL's extension string is space-separated, and one name can be a prefix of
@@ -2179,7 +2213,122 @@ static napi_value Gl_drawBuffers(napi_env env, napi_callback_info info) {
     return NULL;
 }
 
-// getFeatures() -> { vertexArrayObject, instancedArrays, drawBuffers }
+// --- 3D and array textures, immutable storage ------------------------------
+//
+// A 3D texture and a 2D array texture are the same call with a different
+// target: TEXTURE_3D filters across the third axis, TEXTURE_2D_ARRAY keeps
+// its layers independent. Both are ES 3.0 (or GL_OES_texture_3D for the 3D
+// half), so all of it goes through NEED_FN.
+
+// texImage3D(target, level, internalformat, width, height, depth, border,
+//            format, type, pixels|null)
+static napi_value Gl_texImage3D(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 10); NEED_GL(env);
+    NEED_FN(env, TexImage3D, "3D and array textures");
+    void *data;
+    if (!pixels_arg(env, args[9], &data))
+        THROW(env, "texImage3D expects a TypedArray or null as its last argument");
+    gl.TexImage3D(arg_u32(env, args[0]), arg_i32(env, args[1]),
+                  arg_i32(env, args[2]), arg_i32(env, args[3]),
+                  arg_i32(env, args[4]), arg_i32(env, args[5]),
+                  arg_i32(env, args[6]), arg_u32(env, args[7]),
+                  arg_u32(env, args[8]), data);
+    return NULL;
+}
+// texSubImage3D(target, level, xoffset, yoffset, zoffset, width, height,
+//               depth, format, type, pixels)
+static napi_value Gl_texSubImage3D(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 11); NEED_GL(env);
+    NEED_FN(env, TexSubImage3D, "3D and array textures");
+    void *data;
+    if (!pixels_arg(env, args[10], &data) || !data)
+        THROW(env, "texSubImage3D expects a TypedArray of pixels");
+    gl.TexSubImage3D(arg_u32(env, args[0]), arg_i32(env, args[1]),
+                     arg_i32(env, args[2]), arg_i32(env, args[3]),
+                     arg_i32(env, args[4]), arg_i32(env, args[5]),
+                     arg_i32(env, args[6]), arg_i32(env, args[7]),
+                     arg_u32(env, args[8]), arg_u32(env, args[9]), data);
+    return NULL;
+}
+// copyTexSubImage3D(target, level, xoffset, yoffset, zoffset, x, y, width,
+//                   height) — one layer, from the framebuffer
+static napi_value Gl_copyTexSubImage3D(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 9); NEED_GL(env);
+    NEED_FN(env, CopyTexSubImage3D, "3D and array textures");
+    gl.CopyTexSubImage3D(arg_u32(env, args[0]), arg_i32(env, args[1]),
+                         arg_i32(env, args[2]), arg_i32(env, args[3]),
+                         arg_i32(env, args[4]), arg_i32(env, args[5]),
+                         arg_i32(env, args[6]), arg_i32(env, args[7]),
+                         arg_i32(env, args[8]));
+    return NULL;
+}
+// compressedTexImage3D(target, level, internalformat, width, height, depth,
+//                      border, data)
+static napi_value Gl_compressedTexImage3D(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 8); NEED_GL(env);
+    NEED_FN(env, CompressedTexImage3D, "3D and array textures");
+    void *data;
+    size_t nbytes;
+    if (!typed_bytes(env, args[7], &data, &nbytes))
+        THROW(env, "compressedTexImage3D expects a TypedArray of compressed data");
+    gl.CompressedTexImage3D(arg_u32(env, args[0]), arg_i32(env, args[1]),
+                            arg_u32(env, args[2]), arg_i32(env, args[3]),
+                            arg_i32(env, args[4]), arg_i32(env, args[5]),
+                            arg_i32(env, args[6]), (GLsizei)nbytes, data);
+    return NULL;
+}
+// compressedTexSubImage3D(target, level, xoffset, yoffset, zoffset, width,
+//                         height, depth, format, data)
+static napi_value Gl_compressedTexSubImage3D(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 10); NEED_GL(env);
+    NEED_FN(env, CompressedTexSubImage3D, "3D and array textures");
+    void *data;
+    size_t nbytes;
+    if (!typed_bytes(env, args[9], &data, &nbytes))
+        THROW(env, "compressedTexSubImage3D expects a TypedArray of compressed data");
+    gl.CompressedTexSubImage3D(arg_u32(env, args[0]), arg_i32(env, args[1]),
+                               arg_i32(env, args[2]), arg_i32(env, args[3]),
+                               arg_i32(env, args[4]), arg_i32(env, args[5]),
+                               arg_i32(env, args[6]), arg_i32(env, args[7]),
+                               arg_u32(env, args[8]), (GLsizei)nbytes, data);
+    return NULL;
+}
+// framebufferTextureLayer(target, attachment, texture, level, layer) — how a
+// single slice of a 3D or array texture becomes a render target
+static napi_value Gl_framebufferTextureLayer(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 5); NEED_GL(env);
+    NEED_FN(env, FramebufferTextureLayer, "3D and array textures");
+    gl.FramebufferTextureLayer(arg_u32(env, args[0]), arg_u32(env, args[1]),
+                               arg_u32(env, args[2]), arg_i32(env, args[3]),
+                               arg_i32(env, args[4]));
+    return NULL;
+}
+
+// texStorage2D/3D(target, levels, internalformat, width, height[, depth])
+//
+// Immutable storage: the whole mipmap pyramid is allocated once, in a sized
+// format, and cannot be reshaped afterwards — only its contents change, via
+// texSubImage. That is the difference from texImage2D, which reallocates on
+// every call and leaves the driver unable to assume anything.
+static napi_value Gl_texStorage2D(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 5); NEED_GL(env);
+    NEED_FN(env, TexStorage2D, "immutable texture storage");
+    gl.TexStorage2D(arg_u32(env, args[0]), arg_i32(env, args[1]),
+                    arg_u32(env, args[2]), arg_i32(env, args[3]),
+                    arg_i32(env, args[4]));
+    return NULL;
+}
+static napi_value Gl_texStorage3D(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 6); NEED_GL(env);
+    NEED_FN(env, TexStorage3D, "immutable texture storage");
+    gl.TexStorage3D(arg_u32(env, args[0]), arg_i32(env, args[1]),
+                    arg_u32(env, args[2]), arg_i32(env, args[3]),
+                    arg_i32(env, args[4]), arg_i32(env, args[5]));
+    return NULL;
+}
+
+// getFeatures() -> { vertexArrayObject, instancedArrays, drawBuffers,
+//                    texture3D, textureStorage }
 //
 // A feature is present only when every entry point it needs resolved, so a
 // driver offering half an extension reports it as absent rather than
@@ -2509,6 +2658,14 @@ NAPI_MODULE_INIT() {
     EXPORT("glDrawElementsInstanced", Gl_drawElementsInstanced);
     EXPORT("glVertexAttribDivisor", Gl_vertexAttribDivisor);
     EXPORT("glDrawBuffers", Gl_drawBuffers);
+    EXPORT("glTexImage3D", Gl_texImage3D);
+    EXPORT("glTexSubImage3D", Gl_texSubImage3D);
+    EXPORT("glCopyTexSubImage3D", Gl_copyTexSubImage3D);
+    EXPORT("glCompressedTexImage3D", Gl_compressedTexImage3D);
+    EXPORT("glCompressedTexSubImage3D", Gl_compressedTexSubImage3D);
+    EXPORT("glFramebufferTextureLayer", Gl_framebufferTextureLayer);
+    EXPORT("glTexStorage2D", Gl_texStorage2D);
+    EXPORT("glTexStorage3D", Gl_texStorage3D);
     EXPORT("glGetFeatures", GlFeatures);
 #undef EXPORT
     return exports;

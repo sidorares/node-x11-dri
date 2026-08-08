@@ -16,8 +16,8 @@ fills exactly that hole:
   JS: shaders and programs, buffers and vertex attributes, draws, textures
   (including compressed uploads), blending, framebuffer objects for rendering
   to a texture, the uniform setters, program introspection, and `readPixels`
-  — plus vertex array objects, instanced drawing and multiple render targets
-  where the driver has them.
+  — plus vertex array objects, instanced drawing, multiple render targets and
+  3D/array textures where the driver has them.
 - **`createUdmabuf(size)`** — CPU memory turned into a dma-buf by the
   kernel's `/dev/udmabuf`, with the pixels mapped into JS as an
   `ArrayBuffer`: the GPU-less way to feed DRI3 (the same trick Xwayland
@@ -134,7 +134,7 @@ order, so code and tutorials carry over:
 | framebuffers | `createFramebuffer`, `bindFramebuffer`, `framebufferTexture2D`, `framebufferRenderbuffer`, `checkFramebufferStatus`, `createRenderbuffer`, `bindRenderbuffer`, `renderbufferStorage`, deletes |
 | per-fragment state | `blendFunc`, `blendFuncSeparate`, `blendEquation`, `blendEquationSeparate`, `blendColor`, `depthFunc`, `depthMask`, `depthRange`, `colorMask`, `scissor`, `polygonOffset`, `stencilFunc`, `stencilOp`, `stencilMask`, `clearStencil`, `cullFace`, `frontFace` |
 | introspection | `getActiveUniform`, `getActiveAttrib`, `getUniform`, `getAttachedShaders`, `getShaderSource`, `getShaderPrecisionFormat`, `getVertexAttrib`, `getVertexAttribOffset`, `getBufferParameter`, `getTexParameter`, `getFramebufferAttachmentParameter`, `getRenderbufferParameter`, `getSupportedExtensions`, `validateProgram`, `isBuffer`/`isProgram`/`isShader`/`isTexture`/`isFramebuffer`/`isRenderbuffer`/`isEnabled` |
-| optional (see `gpu.features`) | `createVertexArray`, `bindVertexArray`, `deleteVertexArray`, `isVertexArray`; `drawArraysInstanced`, `drawElementsInstanced`, `vertexAttribDivisor`; `drawBuffers` |
+| optional (see `gpu.features`) | `createVertexArray`, `bindVertexArray`, `deleteVertexArray`, `isVertexArray`; `drawArraysInstanced`, `drawElementsInstanced`, `vertexAttribDivisor`; `drawBuffers`; `texImage3D`, `texSubImage3D`, `copyTexSubImage3D`, `compressedTexImage3D`, `compressedTexSubImage3D`, `framebufferTextureLayer`; `texStorage2D`, `texStorage3D` |
 | the rest | `clear`, `clearColor`, `clearDepthf`, `viewport`, `enable`, `disable`, `lineWidth`, `pixelStorei`, `getParameter`, `getIntegerv`, `getFloatv`, `getBooleanv`, `getError`, `getString`, `readPixels`, `finish`, `flush` |
 
 `texImage2D` accepts `null` pixels, which is how a texture is allocated to be
@@ -161,15 +161,16 @@ hand and renders the result beside the uncompressed original.
 
 ### What is optional, and how to ask
 
-Vertex array objects, instanced drawing and multiple render targets are core
-in ES 3.0 and extensions before it, so whether they exist at all is a
-property of the driver and the context rather than of this build. They are
-resolved separately from everything else, against a live context, and
-reported per feature:
+Vertex array objects, instanced drawing, multiple render targets, 3D and
+array textures, and immutable storage are core in ES 3.0 and extensions
+before it, so whether they exist at all is a property of the driver and the
+context rather than of this build. They are resolved separately from
+everything else, against a live context, and reported per feature:
 
 ```js
 gpu.makeCurrent(surface);
-gpu.features            // { vertexArrayObject, instancedArrays, drawBuffers }
+gpu.features            // { vertexArrayObject, instancedArrays, drawBuffers,
+                        //   texture3D, textureStorage }
 if (gpu.features.instancedArrays)
     gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, count);
 ```
@@ -190,10 +191,38 @@ offering `glDrawArraysInstancedEXT` (or `…ANGLE`, or `…NV`) through
 `eglGetProcAddress` alone — so each feature carries a list of candidate
 spellings and takes the first that both resolves and is advertised.
 
-Not covered: 3D and array textures with the rest of ES 3.0. Adding one is
-still a small wrapper per entry point in `src/x11dri.c` plus a line in the
-`EXPORT` block — the JS name is derived from the `glFoo` export
-automatically.
+### 3D and array textures
+
+Same call, different target: `TEXTURE_3D` filters across the third axis,
+`TEXTURE_2D_ARRAY` keeps its layers independent — a fractional layer index
+rounds to one of them rather than blending two, which is what makes an array
+texture the right home for an atlas and a 3D texture the right home for a
+volume.
+
+```js
+gl.bindTexture(gl.TEXTURE_2D_ARRAY, tex);
+gl.texStorage3D(gl.TEXTURE_2D_ARRAY, 1, gl.RGBA8, w, h, layers);  // allocate once
+gl.texSubImage3D(gl.TEXTURE_2D_ARRAY, 0, 0, 0, 0, w, h, layers,
+                 gl.RGBA, gl.UNSIGNED_BYTE, pixels);              // then fill
+gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, tex, 0, 2);
+```
+
+`texStorage2D`/`texStorage3D` allocate the whole mipmap pyramid once in a
+sized format and refuse to be called twice; only the contents change
+afterwards, through `texSubImage`. Sampling either target needs GLSL ES 3.00
+(`sampler3D`, `sampler2DArray`), so it needs an ES 3.0 context — see
+`glVersion` above. `examples/texture-3d.js` ray-marches a 64³ volume beside
+the array texture and the slices it interpolates between.
+
+### Still not covered
+
+The rest of ES 3.0: sampler objects, uniform buffer objects, transform
+feedback, query and sync objects, multisampled renderbuffers, primitive
+restart, and `getUniformuiv` for unsigned-integer uniforms (`getUniform`
+answers `null` for a type it cannot read). Adding one is still a small
+wrapper per entry point in `src/x11dri.c` plus a line in the `EXPORT` block —
+the JS name is derived from the `glFoo` export automatically, and anything
+past ES 2.0 belongs in the optional table beside the features above.
 
 ## How it fits together
 
