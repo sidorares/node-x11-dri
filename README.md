@@ -8,7 +8,7 @@ connection with no native code at all. What JavaScript cannot do is *produce*
 those dma-bufs — that takes a GPU driver or an ioctl. This optional addon
 fills exactly that hole:
 
-- **`Gpu` / `Surface`** — an OpenGL ES 2.0 rendering context on a DRM render
+- **`Gpu` / `Surface`** — an OpenGL ES 2.0 or 3.0 rendering context on a DRM render
   node (GBM + EGL) whose finished frames are exportable as dma-buf fds:
   render → `swap()` → `{fd, stride, modifier}` → `DRI3.PixmapFromBuffer` →
   `Present.Pixmap`.
@@ -73,9 +73,10 @@ dri.probe();                              // { gbm, egl, gles, udmabuf }
 dri.listRenderNodes();                    // ['/dev/dri/renderD128', ...]
 
 const gpu = new dri.Gpu({                 // opens a render node (no X auth
-    devicePath: undefined,                //   needed), gbm + EGL + ES2 context
+    devicePath: undefined,                //   needed), gbm + EGL + a context
     format: dri.FORMAT.XRGB8888,          // must match the window depth
-    depthSize: 16                         // EGL depth buffer bits
+    depthSize: 16,                        // EGL depth buffer bits
+    glVersion: 'auto'                     // 'auto' | 3 | 2 — see below
 });
 const surface = gpu.createSurface(w, h);  // GBM swapchain (add
 gpu.makeCurrent(surface);                 //   dri.GBM_USE.LINEAR for
@@ -93,6 +94,31 @@ surface.destroy(); gpu.destroy();
 
 One EGL context per `Gpu`, one thread, GL calls valid between `makeCurrent`
 and `destroy` — deliberately no more machinery than a renderer needs.
+
+### Which ES version
+
+`glVersion` defaults to `'auto'`: ask EGL for ES 3.0, and fall back to ES 2.0
+when the display has no ES 3.0-capable config or refuses the context. Pass
+`3` to insist — you get an error naming the version rather than a silent
+downgrade — or `2` to pin.
+
+Two numbers come back, and they are not the same one:
+
+```js
+gpu.contextVersion   // 2 or 3: what EGL was asked for and granted
+gpu.makeCurrent(surface);
+gpu.glVersion        // { major, minor, string } — what the driver reports
+```
+
+A version request is a **floor, not a ceiling**. ES 3.0 is backward
+compatible with ES 2.0 and EGL is allowed to hand back more than was asked
+for: Mesa answers `glVersion: 2` with an ES 3.0 context, so
+`contextVersion === 2` with `glVersion.major === 3` is normal and not a bug.
+`glVersion` is the one to branch on — it is what the driver will actually
+honour, and it is what gates the optional entry points above.
+
+`gpu.glVersion` needs a current context to exist, so like `features` it
+appears on `makeCurrent` rather than in the constructor.
 
 ### What `gl` covers
 

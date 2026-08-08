@@ -227,6 +227,7 @@ typedef intptr_t EGLAttrib;
 #define EGL_RENDERABLE_TYPE       0x3040
 #define EGL_WINDOW_BIT            0x0004
 #define EGL_OPENGL_ES2_BIT        0x0004
+#define EGL_OPENGL_ES3_BIT        0x0040 // EGL 1.5; EGL_OPENGL_ES3_BIT_KHR before
 #define EGL_OPENGL_ES_API         0x30A0
 #define EGL_CONTEXT_CLIENT_VERSION 0x3098
 #define EGL_VENDOR                0x3053
@@ -728,6 +729,7 @@ typedef struct {
     EGLConfig cfg;
     EGLContext ctx;
     uint32_t format;   // GBM_FORMAT_* fourcc
+    int es_version;    // the ES version EGL actually gave us: 2 or 3
     int destroyed;
 } Gpu;
 
@@ -779,13 +781,19 @@ static napi_value get_external(napi_env env, napi_value v, void **out) {
     return v;
 }
 
-// createGpu(drmFd, formatFourcc, depthSize) -> external
+// createGpu(drmFd, formatFourcc, depthSize, glVersion) -> external
 // The fd is dup'ed; the caller keeps (and eventually closes) its own.
+// glVersion is 2 or 3 to insist on that ES version, or 0 to take the highest
+// on offer.
 static napi_value CreateGpu(napi_env env, napi_callback_info info) {
-    GET_ARGS(env, info, 3);
+    GET_ARGS(env, info, 4);
     int fd = arg_i32(env, args[0]);
     uint32_t format = arg_u32(env, args[1]);
     int depth_size = arg_i32(env, args[2]);
+    int want_es = arg_i32(env, args[3]);
+    if (want_es != 0 && want_es != 2 && want_es != 3)
+        THROWF(env, "glVersion must be 2, 3, or 0 for the highest available (got %d)",
+               want_es);
 
     const char *e;
     if ((e = load_gbm()) || (e = load_egl()) || (e = load_gles()))
@@ -816,39 +824,59 @@ static napi_value CreateGpu(napi_env env, napi_callback_info info) {
     }
     egl.BindAPI(EGL_OPENGL_ES_API);
 
-    // Pick a config whose native visual is exactly our GBM format; EGL is
-    // allowed to return both XRGB and ARGB for the same rgb888 request.
+    // Try for `es` first, and report whether it worked. A config has to be
+    // picked per version, not once: EGL_RENDERABLE_TYPE is part of the config
+    // query, so a display with no ES 3.0-capable config fails here rather
+    // than at context creation.
+    //
+    // Note this is a *floor*, not a ceiling. Mesa answers an ES 2.0 request
+    // with an ES 3.0 context, because ES 3.0 is backward compatible and EGL
+    // permits it — so glVersion 2 does not guarantee an ES 2.0 driver, only
+    // that ES 2.0 is all that was asked for. What the driver actually gave
+    // is glGetString(GL_VERSION), which is what gpu.glVersion reports and
+    // what gates the optional entry points.
     EGLint want_alpha = (g->format == GBM_FORMAT_ARGB8888) ? 8 : 0;
-    const EGLint attribs[] = {
-        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
-        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
-        EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8,
-        EGL_ALPHA_SIZE, want_alpha,
-        EGL_DEPTH_SIZE, depth_size,
-        EGL_NONE
-    };
-    EGLConfig cfgs[64];
-    EGLint ncfg = 0;
-    if (!egl.ChooseConfig(g->dpy, attribs, cfgs, 64, &ncfg) || ncfg == 0) {
-        egl.Terminate(g->dpy); gbm.device_destroy(g->gbm); close(dupfd); free(g);
-        THROW(env, "no EGL config for rgb888 + depth on this device");
-    }
-    g->cfg = cfgs[0];
-    for (EGLint i = 0; i < ncfg; i++) {
-        EGLint vid = 0;
-        if (egl.GetConfigAttrib(g->dpy, cfgs[i], EGL_NATIVE_VISUAL_ID, &vid) &&
-            (uint32_t)vid == g->format) {
-            g->cfg = cfgs[i];
-            break;
+    for (int es = (want_es ? want_es : 3); es >= 2; es--) {
+        const EGLint attribs[] = {
+            EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+            EGL_RENDERABLE_TYPE, es == 3 ? EGL_OPENGL_ES3_BIT : EGL_OPENGL_ES2_BIT,
+            EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8,
+            EGL_ALPHA_SIZE, want_alpha,
+            EGL_DEPTH_SIZE, depth_size,
+            EGL_NONE
+        };
+        EGLConfig cfgs[64];
+        EGLint ncfg = 0;
+        if (egl.ChooseConfig(g->dpy, attribs, cfgs, 64, &ncfg) && ncfg > 0) {
+            // Pick a config whose native visual is exactly our GBM format;
+            // EGL is allowed to return both XRGB and ARGB for the same
+            // rgb888 request.
+            g->cfg = cfgs[0];
+            for (EGLint i = 0; i < ncfg; i++) {
+                EGLint vid = 0;
+                if (egl.GetConfigAttrib(g->dpy, cfgs[i], EGL_NATIVE_VISUAL_ID, &vid) &&
+                    (uint32_t)vid == g->format) {
+                    g->cfg = cfgs[i];
+                    break;
+                }
+            }
+            const EGLint ctx_attribs[] = { EGL_CONTEXT_CLIENT_VERSION, es, EGL_NONE };
+            g->ctx = egl.CreateContext(g->dpy, g->cfg, NULL, ctx_attribs);
+            if (g->ctx) {
+                g->es_version = es;
+                break;
+            }
         }
+        if (want_es) // an explicit request does not fall back
+            break;
     }
-
-    const EGLint ctx_attribs[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
-    g->ctx = egl.CreateContext(g->dpy, g->cfg, NULL, ctx_attribs);
     if (!g->ctx) {
         EGLint ec = egl.GetError();
         egl.Terminate(g->dpy); gbm.device_destroy(g->gbm); close(dupfd); free(g);
-        THROWF(env, "eglCreateContext(ES2) failed (0x%x)", ec);
+        if (want_es)
+            THROWF(env, "no ES %d context: neither a config nor a context for "
+                        "rgb888 + depth at that version (0x%x)", want_es, ec);
+        THROWF(env, "no EGL config or context for rgb888 + depth on this device (0x%x)", ec);
     }
 
     napi_value ext;
@@ -856,7 +884,7 @@ static napi_value CreateGpu(napi_env env, napi_callback_info info) {
     return ext;
 }
 
-// gpuInfo(gpu) -> { eglVendor, eglVersion }
+// gpuInfo(gpu) -> { eglVendor, eglVersion, contextVersion }
 static napi_value GpuInfo(napi_env env, napi_callback_info info) {
     GET_ARGS(env, info, 1);
     Gpu *g;
@@ -865,6 +893,7 @@ static napi_value GpuInfo(napi_env env, napi_callback_info info) {
     NAPI_CALL(env, napi_create_object(env, &obj));
     obj_set(env, obj, "eglVendor", mk_str(env, egl.QueryString(g->dpy, EGL_VENDOR)));
     obj_set(env, obj, "eglVersion", mk_str(env, egl.QueryString(g->dpy, EGL_VERSION)));
+    obj_set(env, obj, "contextVersion", mk_i32(env, g->es_version));
     return obj;
 }
 

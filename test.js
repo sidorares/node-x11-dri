@@ -834,5 +834,86 @@ report('GL vertex arrays, instancing and multiple render targets', () => {
     return done.length ? done.join(', ') : 'none of the three offered by this driver';
 });
 
+// Which ES version the context is, and what that buys. Two numbers matter
+// and they are not the same one: contextVersion is what EGL was asked for and
+// granted, glVersion is what the driver then reported — a request for ES 2.0
+// is a floor, and Mesa answers it with an ES 3.0 context.
+report('GL ES 3.0 context selection', () => {
+    const W = 64;
+    const { gpu, surf, gl } = glSurface(W, { format: dri.FORMAT.ARGB8888, depthSize: 24 });
+    const glOk = what => {
+        const e = gl.getError();
+        assert.strictEqual(e, gl.NO_ERROR, `${what}: GL error 0x${e.toString(16)}`);
+    };
+
+    assert.ok([2, 3].includes(gpu.contextVersion),
+        `auto picked an ES version: ${gpu.contextVersion}`);
+    assert.ok(gpu.glVersion.major >= gpu.contextVersion,
+        `the driver gives at least what was asked: ${gpu.glVersion.string}`);
+    assert.ok(gpu.glVersion.string.includes('OpenGL ES'),
+        `and says so: ${gpu.glVersion.string}`);
+
+    let note = `auto -> ES ${gpu.contextVersion}, driver ${gpu.glVersion.major}.${gpu.glVersion.minor}`;
+
+    // The point of the whole exercise: on an ES 3.0 driver, GLSL ES 3.00
+    // compiles — `in`/`out` instead of attribute/varying, an explicit output,
+    // and attribute locations chosen in the shader rather than by the linker.
+    if (gpu.glVersion.major >= 3) {
+        const p = buildProgram(gl,
+            '#version 300 es\n' +
+            'layout(location = 0) in vec2 position;\n' +
+            'out vec2 vUv;\n' +
+            'void main() { vUv = position * 0.5 + 0.5; gl_Position = vec4(position, 0.0, 1.0); }',
+            '#version 300 es\n' +
+            'precision mediump float;\n' +
+            'uniform vec3 uColor;\n' +
+            'in vec2 vUv;\n' +
+            'layout(location = 0) out vec4 fragColor;\n' +
+            'void main() { fragColor = vec4(uColor * vUv.x, 1.0); }');
+        gl.useProgram(p);
+        assert.strictEqual(gl.getAttribLocation(p, 'position'), 0,
+            'layout(location = 0) is where the attribute went');
+        const buf = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+        gl.bufferData(gl.ARRAY_BUFFER,
+            new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+        gl.enableVertexAttribArray(0);
+        gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+        gl.uniform3f(gl.getUniformLocation(p, 'uColor'), 1, 0, 0);
+        gl.clearColor(0, 0, 0, 1);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        const px = new Uint8Array(W * W * 4);
+        gl.readPixels(0, 0, W, W, gl.RGBA, gl.UNSIGNED_BYTE, px);
+        const redAt = x => px[(32 * W + x) * 4];
+        // fragColor.r = vUv.x, so the quad is a ramp across the viewport
+        assert.ok(Math.abs(redAt(48) - 191) <= 6, `three quarters across: ${redAt(48)}`);
+        assert.ok(Math.abs(redAt(16) - 64) <= 6, `one quarter across: ${redAt(16)}`);
+        glOk('GLSL ES 3.00');
+        note += ', GLSL ES 3.00 compiles';
+    }
+    surf.destroy();
+    gpu.destroy();
+
+    // An explicit version is honoured, and a nonsense one is refused before
+    // any device is touched.
+    const pinned = new dri.Gpu({ glVersion: 2, format: dri.FORMAT.ARGB8888 });
+    assert.strictEqual(pinned.contextVersion, 2, 'glVersion: 2 asks for exactly that');
+    pinned.destroy();
+    assert.throws(() => new dri.Gpu({ glVersion: 4 }), /must be 2, 3, or 0/);
+
+    // ES 3.0 either works or says which version could not be had — never a
+    // silent downgrade, which is the difference from 'auto'.
+    try {
+        const three = new dri.Gpu({ glVersion: 3, format: dri.FORMAT.ARGB8888 });
+        assert.strictEqual(three.contextVersion, 3);
+        three.destroy();
+    } catch (e) {
+        assert.match(e.message, /no ES 3 context/, `and explains itself: ${e.message}`);
+        note += ' (no ES 3.0 config here)';
+    }
+    return note;
+});
+
 process.exitCode = failures ? 1 : 0;
 console.log(failures ? `${failures} failure(s)` : 'all good');
