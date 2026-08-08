@@ -13,7 +13,35 @@
 // for the complete picture.
 
 const fs = require('fs');
-const native = require('./build/Release/x11dri.node');
+const path = require('path');
+
+// A local build wins (dev iteration), then the prebuilt binary bundled in
+// the npm tarball for this platform/arch (see scripts/install.js — the
+// package works even when install scripts are disabled), then a clear error.
+function loadNative() {
+    const candidates = [
+        'build/Release/x11dri.node',
+        'build/Debug/x11dri.node',
+        `prebuilds/${process.platform}-${process.arch}/x11dri.node`
+    ];
+    const errors = [];
+    for (const rel of candidates) {
+        const abs = path.join(__dirname, rel);
+        if (!fs.existsSync(abs))
+            continue;
+        try {
+            return require(abs);
+        } catch (e) {
+            errors.push(`  ${rel}: ${e.message}`);
+        }
+    }
+    throw new Error(
+        `x11-dri: no loadable native binary for ${process.platform}-${process.arch}\n` +
+        (errors.length ? `tried:\n${errors.join('\n')}\n` : '') +
+        'rebuild with: npm rebuild x11-dri --build-from-source (needs a C toolchain)');
+}
+
+const native = loadNative();
 
 // ---- OpenGL ES 2.0 constants (the subset the bindings cover) ----
 const GL = {

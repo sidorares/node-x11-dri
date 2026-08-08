@@ -35,10 +35,12 @@
     "index.js",
     "binding.gyp",
     "src/",
+    "scripts/",
+    "prebuilds/",
     "test.js"
   ],
   "scripts": {
-    "install": "node-gyp rebuild",
+    "install": "node scripts/install.js",
     "test": "node test.js"
   },
   "gypfile": true

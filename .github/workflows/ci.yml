@@ -27,3 +27,35 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libgbm1 libegl1 libgles2
       - run: npm install
       - run: npm test
+
+  # Same steps the release workflow uses to produce the prebuilt binaries
+  # bundled into the npm tarball — run on every change so a broken pipeline
+  # is discovered now, not at release time. Debian 11 (glibc 2.31) is the
+  # compatibility baseline: binaries built there load on every current
+  # distro. Official Node images link addons against libc only (distro
+  # node-gyp setups may link libnode.so, which would not load elsewhere).
+  prebuild:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    container: node:18-bullseye
+    steps:
+      - uses: actions/checkout@v7
+      - run: npm install --build-from-source
+      - name: Package the binary as a prebuild
+        run: |
+          target="linux-$(node -p process.arch)"
+          mkdir -p "prebuilds/$target"
+          cp build/Release/x11dri.node "prebuilds/$target/"
+          strip "prebuilds/$target/x11dri.node"
+          rm -rf build
+          node -e "require('./index.js').probe()"   # loads via the prebuild
+          node -e "const l=require('fs').readFileSync('prebuilds/'+process.argv[1]+'/x11dri.node'); if (l.includes('libnode.so')) { console.error('prebuild links libnode.so — not portable'); process.exit(1) }" "$target"
+          ls -la "prebuilds/$target"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prebuild-linux-${{ matrix.os == 'ubuntu-24.04-arm' && 'arm64' || 'x64' }}
+          path: prebuilds/
+          if-no-files-found: error
