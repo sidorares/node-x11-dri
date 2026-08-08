@@ -12,8 +12,10 @@ fills exactly that hole:
   node (GBM + EGL) whose finished frames are exportable as dma-buf fds:
   render → `swap()` → `{fd, stride, modifier}` → `DRI3.PixmapFromBuffer` →
   `Present.Pixmap`.
-- **`gl`** — a WebGL-flavored subset of GL ES 2.0 (shaders, buffers, draws,
-  readPixels) driving that context from JS.
+- **`gl`** — a WebGL-flavored subset of GL ES 2.0 driving that context from
+  JS: shaders and programs, buffers and vertex attributes, draws, textures,
+  blending, framebuffer objects for rendering to a texture, the uniform
+  setters, and `readPixels`.
 - **`createUdmabuf(size)`** — CPU memory turned into a dma-buf by the
   kernel's `/dev/udmabuf`, with the pixels mapped into JS as an
   `ArrayBuffer`: the GPU-less way to feed DRI3 (the same trick Xwayland
@@ -85,9 +87,34 @@ surface.destroy(); gpu.destroy();
 ```
 
 One EGL context per `Gpu`, one thread, GL calls valid between `makeCurrent`
-and `destroy` — deliberately no more machinery than the examples need. The
-`gl` namespace covers the ES 2.0 subset the samples use; extending it is a
-matter of adding one small wrapper per entry point in `src/x11dri.c`.
+and `destroy` — deliberately no more machinery than a renderer needs.
+
+### What `gl` covers
+
+Enough of ES 2.0 to drive a real renderer, in WebGL's spelling and argument
+order, so code and tutorials carry over:
+
+| area | entry points |
+| --- | --- |
+| programs | `createShader`, `shaderSource`, `compileShader`, `getShaderParameter`, `getShaderInfoLog`, `createProgram`, `attachShader`, `linkProgram`, `getProgramParameter`, `getProgramInfoLog`, `useProgram`, `bindAttribLocation`, deletes |
+| geometry | `createBuffer`, `bindBuffer`, `bufferData`, `bufferSubData`, `vertexAttribPointer`, `enableVertexAttribArray`, `disableVertexAttribArray`, `vertexAttrib1f`–`4f`, `drawArrays`, `drawElements` |
+| uniforms | `getUniformLocation`, `uniform1f`/`2f`/`3f`/`4f`, `uniform1i`/`2i`/`3i`/`4i`, `uniform1fv`–`4fv`, `uniform1iv`, `uniformMatrix2fv`/`3fv`/`4fv` |
+| textures | `createTexture`, `bindTexture`, `activeTexture`, `texImage2D`, `texSubImage2D`, `texParameteri`/`f`, `generateMipmap`, `deleteTexture` |
+| framebuffers | `createFramebuffer`, `bindFramebuffer`, `framebufferTexture2D`, `framebufferRenderbuffer`, `checkFramebufferStatus`, `createRenderbuffer`, `bindRenderbuffer`, `renderbufferStorage`, deletes |
+| per-fragment state | `blendFunc`, `blendFuncSeparate`, `blendEquation`, `blendEquationSeparate`, `blendColor`, `depthFunc`, `depthMask`, `depthRange`, `colorMask`, `scissor`, `polygonOffset`, `stencilFunc`, `stencilOp`, `stencilMask`, `clearStencil`, `cullFace`, `frontFace` |
+| the rest | `clear`, `clearColor`, `clearDepthf`, `viewport`, `enable`, `disable`, `lineWidth`, `pixelStorei`, `getParameter`, `getIntegerv`, `getFloatv`, `getBooleanv`, `getError`, `getString`, `readPixels`, `finish`, `flush` |
+
+`texImage2D` accepts `null` pixels, which is how a texture is allocated to be
+rendered into. `getParameter` answers in the type the parameter has — a
+number, a boolean, or an array for `VIEWPORT`, `SCISSOR_BOX`,
+`COLOR_CLEAR_VALUE` and `COLOR_WRITEMASK`; `getIntegerv`/`getFloatv`/
+`getBooleanv` are the raw single-value escape hatch.
+
+Not covered: vertex array objects, instancing, multiple render targets,
+3D/array textures and the rest of ES 3.0, `getActiveUniform`-style
+introspection, and compressed texture formats. Adding one is still a small
+wrapper per entry point in `src/x11dri.c` plus a line in the `EXPORT` block —
+the JS name is derived from the `glFoo` export automatically.
 
 ## How it fits together
 

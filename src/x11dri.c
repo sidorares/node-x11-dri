@@ -312,6 +312,66 @@ static struct {
     GLenum (*GetError)(void);
     const uint8_t *(*GetString)(GLenum);
     void (*ReadPixels)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void *);
+    // textures
+    void (*GenTextures)(GLsizei, GLuint *);
+    void (*DeleteTextures)(GLsizei, const GLuint *);
+    void (*BindTexture)(GLenum, GLuint);
+    void (*ActiveTexture)(GLenum);
+    void (*TexImage2D)(GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void *);
+    void (*TexSubImage2D)(GLenum, GLint, GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, const void *);
+    void (*TexParameteri)(GLenum, GLenum, GLint);
+    void (*TexParameterf)(GLenum, GLenum, GLfloat);
+    void (*GenerateMipmap)(GLenum);
+    // blending and the rest of the per-fragment state
+    void (*BlendFunc)(GLenum, GLenum);
+    void (*BlendFuncSeparate)(GLenum, GLenum, GLenum, GLenum);
+    void (*BlendEquation)(GLenum);
+    void (*BlendEquationSeparate)(GLenum, GLenum);
+    void (*BlendColor)(GLfloat, GLfloat, GLfloat, GLfloat);
+    void (*DepthMask)(GLboolean);
+    void (*DepthRangef)(GLfloat, GLfloat);
+    void (*ColorMask)(GLboolean, GLboolean, GLboolean, GLboolean);
+    void (*Scissor)(GLint, GLint, GLsizei, GLsizei);
+    void (*PolygonOffset)(GLfloat, GLfloat);
+    void (*StencilFunc)(GLenum, GLint, GLuint);
+    void (*StencilOp)(GLenum, GLenum, GLenum);
+    void (*StencilMask)(GLuint);
+    void (*ClearStencil)(GLint);
+    // the rest of the uniform setters
+    void (*Uniform2f)(GLint, GLfloat, GLfloat);
+    void (*Uniform2i)(GLint, GLint, GLint);
+    void (*Uniform3i)(GLint, GLint, GLint, GLint);
+    void (*Uniform4i)(GLint, GLint, GLint, GLint, GLint);
+    void (*Uniform1fv)(GLint, GLsizei, const GLfloat *);
+    void (*Uniform2fv)(GLint, GLsizei, const GLfloat *);
+    void (*Uniform3fv)(GLint, GLsizei, const GLfloat *);
+    void (*Uniform4fv)(GLint, GLsizei, const GLfloat *);
+    void (*Uniform1iv)(GLint, GLsizei, const GLint *);
+    void (*UniformMatrix2fv)(GLint, GLsizei, GLboolean, const GLfloat *);
+    void (*UniformMatrix3fv)(GLint, GLsizei, GLboolean, const GLfloat *);
+    // attributes and buffer updates
+    void (*DisableVertexAttribArray)(GLuint);
+    void (*BindAttribLocation)(GLuint, GLuint, const GLchar *);
+    void (*VertexAttrib1f)(GLuint, GLfloat);
+    void (*VertexAttrib2f)(GLuint, GLfloat, GLfloat);
+    void (*VertexAttrib3f)(GLuint, GLfloat, GLfloat, GLfloat);
+    void (*VertexAttrib4f)(GLuint, GLfloat, GLfloat, GLfloat, GLfloat);
+    void (*BufferSubData)(GLenum, GLintptr, GLsizeiptr, const void *);
+    // framebuffer and renderbuffer objects: render to texture
+    void (*GenFramebuffers)(GLsizei, GLuint *);
+    void (*DeleteFramebuffers)(GLsizei, const GLuint *);
+    void (*BindFramebuffer)(GLenum, GLuint);
+    void (*FramebufferTexture2D)(GLenum, GLenum, GLenum, GLuint, GLint);
+    void (*FramebufferRenderbuffer)(GLenum, GLenum, GLenum, GLuint);
+    GLenum (*CheckFramebufferStatus)(GLenum);
+    void (*GenRenderbuffers)(GLsizei, GLuint *);
+    void (*DeleteRenderbuffers)(GLsizei, const GLuint *);
+    void (*BindRenderbuffer)(GLenum, GLuint);
+    void (*RenderbufferStorage)(GLenum, GLenum, GLsizei, GLsizei);
+    // state queries
+    void (*GetIntegerv)(GLenum, GLint *);
+    void (*GetFloatv)(GLenum, GLfloat *);
+    void (*GetBooleanv)(GLenum, GLboolean *);
 } gl;
 
 static const char *load_gbm(void) {
@@ -419,6 +479,48 @@ static const char *load_gles(void) {
     S(Finish, "glFinish"); S(Flush, "glFlush");
     S(GetError, "glGetError"); S(GetString, "glGetString");
     S(ReadPixels, "glReadPixels");
+    // Everything below is core ES 2.0 as well, so a libGLESv2 that has the
+    // above has these too — a miss here means the library is not what it
+    // claims to be, which is worth failing the load over rather than
+    // discovering as a null call later.
+    S(GenTextures, "glGenTextures"); S(DeleteTextures, "glDeleteTextures");
+    S(BindTexture, "glBindTexture"); S(ActiveTexture, "glActiveTexture");
+    S(TexImage2D, "glTexImage2D"); S(TexSubImage2D, "glTexSubImage2D");
+    S(TexParameteri, "glTexParameteri"); S(TexParameterf, "glTexParameterf");
+    S(GenerateMipmap, "glGenerateMipmap");
+    S(BlendFunc, "glBlendFunc"); S(BlendFuncSeparate, "glBlendFuncSeparate");
+    S(BlendEquation, "glBlendEquation");
+    S(BlendEquationSeparate, "glBlendEquationSeparate");
+    S(BlendColor, "glBlendColor");
+    S(DepthMask, "glDepthMask"); S(DepthRangef, "glDepthRangef");
+    S(ColorMask, "glColorMask"); S(Scissor, "glScissor");
+    S(PolygonOffset, "glPolygonOffset");
+    S(StencilFunc, "glStencilFunc"); S(StencilOp, "glStencilOp");
+    S(StencilMask, "glStencilMask"); S(ClearStencil, "glClearStencil");
+    S(Uniform2f, "glUniform2f"); S(Uniform2i, "glUniform2i");
+    S(Uniform3i, "glUniform3i"); S(Uniform4i, "glUniform4i");
+    S(Uniform1fv, "glUniform1fv"); S(Uniform2fv, "glUniform2fv");
+    S(Uniform3fv, "glUniform3fv"); S(Uniform4fv, "glUniform4fv");
+    S(Uniform1iv, "glUniform1iv");
+    S(UniformMatrix2fv, "glUniformMatrix2fv");
+    S(UniformMatrix3fv, "glUniformMatrix3fv");
+    S(DisableVertexAttribArray, "glDisableVertexAttribArray");
+    S(BindAttribLocation, "glBindAttribLocation");
+    S(VertexAttrib1f, "glVertexAttrib1f"); S(VertexAttrib2f, "glVertexAttrib2f");
+    S(VertexAttrib3f, "glVertexAttrib3f"); S(VertexAttrib4f, "glVertexAttrib4f");
+    S(BufferSubData, "glBufferSubData");
+    S(GenFramebuffers, "glGenFramebuffers");
+    S(DeleteFramebuffers, "glDeleteFramebuffers");
+    S(BindFramebuffer, "glBindFramebuffer");
+    S(FramebufferTexture2D, "glFramebufferTexture2D");
+    S(FramebufferRenderbuffer, "glFramebufferRenderbuffer");
+    S(CheckFramebufferStatus, "glCheckFramebufferStatus");
+    S(GenRenderbuffers, "glGenRenderbuffers");
+    S(DeleteRenderbuffers, "glDeleteRenderbuffers");
+    S(BindRenderbuffer, "glBindRenderbuffer");
+    S(RenderbufferStorage, "glRenderbufferStorage");
+    S(GetIntegerv, "glGetIntegerv"); S(GetFloatv, "glGetFloatv");
+    S(GetBooleanv, "glGetBooleanv");
 #undef S
     gl.lib = h;
     return NULL;
@@ -1032,6 +1134,452 @@ static napi_value Gl_readPixels(napi_env env, napi_callback_info info) {
     return NULL;
 }
 
+// --- textures --------------------------------------------------------------
+
+// Pixel data for TexImage2D and friends. Null is legal and meaningful: it
+// allocates the level without initialising it, which is how a texture is made
+// to be rendered into.
+static bool pixels_arg(napi_env env, napi_value v, void **out) {
+    napi_valuetype type;
+    *out = NULL;
+    if (napi_typeof(env, v, &type) != napi_ok) return false;
+    if (type == napi_null || type == napi_undefined) return true;
+    size_t len;
+    return napi_get_typedarray_info(env, v, NULL, &len, out, NULL, NULL) == napi_ok;
+}
+
+static napi_value Gl_createTexture(napi_env env, napi_callback_info info) {
+    (void)info; NEED_GL(env);
+    GLuint t = 0;
+    gl.GenTextures(1, &t);
+    return mk_u32(env, t);
+}
+static napi_value Gl_deleteTexture(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 1); NEED_GL(env);
+    GLuint t = arg_u32(env, args[0]);
+    gl.DeleteTextures(1, &t);
+    return NULL;
+}
+static napi_value Gl_bindTexture(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 2); NEED_GL(env);
+    gl.BindTexture(arg_u32(env, args[0]), arg_u32(env, args[1]));
+    return NULL;
+}
+static napi_value Gl_activeTexture(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 1); NEED_GL(env);
+    gl.ActiveTexture(arg_u32(env, args[0]));
+    return NULL;
+}
+// texImage2D(target, level, internalformat, width, height, border, format,
+//            type, pixels|null)
+static napi_value Gl_texImage2D(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 9); NEED_GL(env);
+    void *data;
+    if (!pixels_arg(env, args[8], &data))
+        THROW(env, "texImage2D expects a TypedArray or null as its last argument");
+    gl.TexImage2D(arg_u32(env, args[0]), arg_i32(env, args[1]),
+                  arg_i32(env, args[2]), arg_i32(env, args[3]),
+                  arg_i32(env, args[4]), arg_i32(env, args[5]),
+                  arg_u32(env, args[6]), arg_u32(env, args[7]), data);
+    return NULL;
+}
+// texSubImage2D(target, level, xoffset, yoffset, width, height, format, type,
+//               pixels)
+static napi_value Gl_texSubImage2D(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 9); NEED_GL(env);
+    void *data;
+    if (!pixels_arg(env, args[8], &data) || !data)
+        THROW(env, "texSubImage2D expects a TypedArray of pixels");
+    gl.TexSubImage2D(arg_u32(env, args[0]), arg_i32(env, args[1]),
+                     arg_i32(env, args[2]), arg_i32(env, args[3]),
+                     arg_i32(env, args[4]), arg_i32(env, args[5]),
+                     arg_u32(env, args[6]), arg_u32(env, args[7]), data);
+    return NULL;
+}
+static napi_value Gl_texParameteri(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 3); NEED_GL(env);
+    gl.TexParameteri(arg_u32(env, args[0]), arg_u32(env, args[1]), arg_i32(env, args[2]));
+    return NULL;
+}
+static napi_value Gl_texParameterf(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 3); NEED_GL(env);
+    gl.TexParameterf(arg_u32(env, args[0]), arg_u32(env, args[1]),
+                     (GLfloat)arg_f64(env, args[2]));
+    return NULL;
+}
+static napi_value Gl_generateMipmap(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 1); NEED_GL(env);
+    gl.GenerateMipmap(arg_u32(env, args[0]));
+    return NULL;
+}
+
+// --- blending and per-fragment state ---------------------------------------
+
+static napi_value Gl_blendFunc(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 2); NEED_GL(env);
+    gl.BlendFunc(arg_u32(env, args[0]), arg_u32(env, args[1]));
+    return NULL;
+}
+static napi_value Gl_blendFuncSeparate(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 4); NEED_GL(env);
+    gl.BlendFuncSeparate(arg_u32(env, args[0]), arg_u32(env, args[1]),
+                         arg_u32(env, args[2]), arg_u32(env, args[3]));
+    return NULL;
+}
+static napi_value Gl_blendEquation(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 1); NEED_GL(env);
+    gl.BlendEquation(arg_u32(env, args[0]));
+    return NULL;
+}
+static napi_value Gl_blendEquationSeparate(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 2); NEED_GL(env);
+    gl.BlendEquationSeparate(arg_u32(env, args[0]), arg_u32(env, args[1]));
+    return NULL;
+}
+static napi_value Gl_blendColor(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 4); NEED_GL(env);
+    gl.BlendColor((GLfloat)arg_f64(env, args[0]), (GLfloat)arg_f64(env, args[1]),
+                  (GLfloat)arg_f64(env, args[2]), (GLfloat)arg_f64(env, args[3]));
+    return NULL;
+}
+static napi_value Gl_depthMask(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 1); NEED_GL(env);
+    gl.DepthMask(arg_bool(env, args[0]) ? 1 : 0);
+    return NULL;
+}
+static napi_value Gl_depthRange(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 2); NEED_GL(env);
+    gl.DepthRangef((GLfloat)arg_f64(env, args[0]), (GLfloat)arg_f64(env, args[1]));
+    return NULL;
+}
+static napi_value Gl_colorMask(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 4); NEED_GL(env);
+    gl.ColorMask(arg_bool(env, args[0]) ? 1 : 0, arg_bool(env, args[1]) ? 1 : 0,
+                 arg_bool(env, args[2]) ? 1 : 0, arg_bool(env, args[3]) ? 1 : 0);
+    return NULL;
+}
+static napi_value Gl_scissor(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 4); NEED_GL(env);
+    gl.Scissor(arg_i32(env, args[0]), arg_i32(env, args[1]),
+               arg_i32(env, args[2]), arg_i32(env, args[3]));
+    return NULL;
+}
+static napi_value Gl_polygonOffset(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 2); NEED_GL(env);
+    gl.PolygonOffset((GLfloat)arg_f64(env, args[0]), (GLfloat)arg_f64(env, args[1]));
+    return NULL;
+}
+static napi_value Gl_stencilFunc(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 3); NEED_GL(env);
+    gl.StencilFunc(arg_u32(env, args[0]), arg_i32(env, args[1]), arg_u32(env, args[2]));
+    return NULL;
+}
+static napi_value Gl_stencilOp(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 3); NEED_GL(env);
+    gl.StencilOp(arg_u32(env, args[0]), arg_u32(env, args[1]), arg_u32(env, args[2]));
+    return NULL;
+}
+static napi_value Gl_stencilMask(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 1); NEED_GL(env);
+    gl.StencilMask(arg_u32(env, args[0]));
+    return NULL;
+}
+static napi_value Gl_clearStencil(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 1); NEED_GL(env);
+    gl.ClearStencil(arg_i32(env, args[0]));
+    return NULL;
+}
+
+// --- uniforms --------------------------------------------------------------
+
+static napi_value Gl_uniform2f(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 3); NEED_GL(env);
+    gl.Uniform2f(arg_i32(env, args[0]), (GLfloat)arg_f64(env, args[1]),
+                 (GLfloat)arg_f64(env, args[2]));
+    return NULL;
+}
+static napi_value Gl_uniform2i(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 3); NEED_GL(env);
+    gl.Uniform2i(arg_i32(env, args[0]), arg_i32(env, args[1]), arg_i32(env, args[2]));
+    return NULL;
+}
+static napi_value Gl_uniform3i(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 4); NEED_GL(env);
+    gl.Uniform3i(arg_i32(env, args[0]), arg_i32(env, args[1]),
+                 arg_i32(env, args[2]), arg_i32(env, args[3]));
+    return NULL;
+}
+static napi_value Gl_uniform4i(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 5); NEED_GL(env);
+    gl.Uniform4i(arg_i32(env, args[0]), arg_i32(env, args[1]), arg_i32(env, args[2]),
+                 arg_i32(env, args[3]), arg_i32(env, args[4]));
+    return NULL;
+}
+
+// The *v setters all differ only in components-per-element and which entry
+// point they reach, so they share one body.
+static napi_value uniform_fv(napi_env env, napi_callback_info info, int components,
+                             void (*fn)(GLint, GLsizei, const GLfloat *), const char *what) {
+    GET_ARGS(env, info, 2); NEED_GL(env);
+    napi_typedarray_type type;
+    size_t len;
+    void *data;
+    if (napi_get_typedarray_info(env, args[1], &type, &len, &data, NULL, NULL) != napi_ok ||
+        type != napi_float32_array || len == 0 || len % (size_t)components != 0)
+        THROWF(env, "%s expects a Float32Array of %d*n floats", what, components);
+    fn(arg_i32(env, args[0]), (GLsizei)(len / (size_t)components), data);
+    return NULL;
+}
+static napi_value Gl_uniform1fv(napi_env env, napi_callback_info info) {
+    return uniform_fv(env, info, 1, gl.Uniform1fv, "uniform1fv");
+}
+static napi_value Gl_uniform2fv(napi_env env, napi_callback_info info) {
+    return uniform_fv(env, info, 2, gl.Uniform2fv, "uniform2fv");
+}
+static napi_value Gl_uniform3fv(napi_env env, napi_callback_info info) {
+    return uniform_fv(env, info, 3, gl.Uniform3fv, "uniform3fv");
+}
+static napi_value Gl_uniform4fv(napi_env env, napi_callback_info info) {
+    return uniform_fv(env, info, 4, gl.Uniform4fv, "uniform4fv");
+}
+// sampler arrays: one texture unit per element
+static napi_value Gl_uniform1iv(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 2); NEED_GL(env);
+    napi_typedarray_type type;
+    size_t len;
+    void *data;
+    if (napi_get_typedarray_info(env, args[1], &type, &len, &data, NULL, NULL) != napi_ok ||
+        type != napi_int32_array || len == 0)
+        THROW(env, "uniform1iv expects an Int32Array");
+    gl.Uniform1iv(arg_i32(env, args[0]), (GLsizei)len, data);
+    return NULL;
+}
+
+static napi_value uniform_matrix(napi_env env, napi_callback_info info, int order,
+                                 void (*fn)(GLint, GLsizei, GLboolean, const GLfloat *),
+                                 const char *what) {
+    GET_ARGS(env, info, 3); NEED_GL(env);
+    bool transpose = arg_bool(env, args[1]);
+    napi_typedarray_type type;
+    size_t len;
+    void *data;
+    size_t stride = (size_t)(order * order);
+    if (napi_get_typedarray_info(env, args[2], &type, &len, &data, NULL, NULL) != napi_ok ||
+        type != napi_float32_array || len == 0 || len % stride != 0)
+        THROWF(env, "%s expects a Float32Array of %zu*n floats", what, stride);
+    fn(arg_i32(env, args[0]), (GLsizei)(len / stride), transpose ? 1 : 0, data);
+    return NULL;
+}
+static napi_value Gl_uniformMatrix2fv(napi_env env, napi_callback_info info) {
+    return uniform_matrix(env, info, 2, gl.UniformMatrix2fv, "uniformMatrix2fv");
+}
+static napi_value Gl_uniformMatrix3fv(napi_env env, napi_callback_info info) {
+    return uniform_matrix(env, info, 3, gl.UniformMatrix3fv, "uniformMatrix3fv");
+}
+
+// --- attributes and buffer updates -----------------------------------------
+
+static napi_value Gl_disableVertexAttribArray(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 1); NEED_GL(env);
+    gl.DisableVertexAttribArray(arg_u32(env, args[0]));
+    return NULL;
+}
+static napi_value Gl_bindAttribLocation(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 3); NEED_GL(env);
+    char name[256];
+    size_t n = 0;
+    if (napi_get_value_string_utf8(env, args[2], name, sizeof(name), &n) != napi_ok)
+        THROW(env, "bindAttribLocation expects an attribute name");
+    gl.BindAttribLocation(arg_u32(env, args[0]), arg_u32(env, args[1]), name);
+    return NULL;
+}
+static napi_value Gl_vertexAttrib1f(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 2); NEED_GL(env);
+    gl.VertexAttrib1f(arg_u32(env, args[0]), (GLfloat)arg_f64(env, args[1]));
+    return NULL;
+}
+static napi_value Gl_vertexAttrib2f(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 3); NEED_GL(env);
+    gl.VertexAttrib2f(arg_u32(env, args[0]), (GLfloat)arg_f64(env, args[1]),
+                      (GLfloat)arg_f64(env, args[2]));
+    return NULL;
+}
+static napi_value Gl_vertexAttrib3f(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 4); NEED_GL(env);
+    gl.VertexAttrib3f(arg_u32(env, args[0]), (GLfloat)arg_f64(env, args[1]),
+                      (GLfloat)arg_f64(env, args[2]), (GLfloat)arg_f64(env, args[3]));
+    return NULL;
+}
+static napi_value Gl_vertexAttrib4f(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 5); NEED_GL(env);
+    gl.VertexAttrib4f(arg_u32(env, args[0]), (GLfloat)arg_f64(env, args[1]),
+                      (GLfloat)arg_f64(env, args[2]), (GLfloat)arg_f64(env, args[3]),
+                      (GLfloat)arg_f64(env, args[4]));
+    return NULL;
+}
+// bufferSubData(target, offset, data) — update part of a buffer in place,
+// which is how a geometry that changes every frame avoids a reallocation
+static napi_value Gl_bufferSubData(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 3); NEED_GL(env);
+    size_t len;
+    void *data;
+    napi_typedarray_type type;
+    if (napi_get_typedarray_info(env, args[2], &type, &len, &data, NULL, NULL) != napi_ok)
+        THROW(env, "bufferSubData expects a TypedArray");
+    size_t elem = (type == napi_float32_array || type == napi_int32_array ||
+                   type == napi_uint32_array) ? 4
+                : (type == napi_int16_array || type == napi_uint16_array) ? 2 : 1;
+    gl.BufferSubData(arg_u32(env, args[0]), (GLintptr)arg_i32(env, args[1]),
+                     (GLsizeiptr)(len * elem), data);
+    return NULL;
+}
+
+// --- framebuffer objects ---------------------------------------------------
+
+static napi_value Gl_createFramebuffer(napi_env env, napi_callback_info info) {
+    (void)info; NEED_GL(env);
+    GLuint f = 0;
+    gl.GenFramebuffers(1, &f);
+    return mk_u32(env, f);
+}
+static napi_value Gl_deleteFramebuffer(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 1); NEED_GL(env);
+    GLuint f = arg_u32(env, args[0]);
+    gl.DeleteFramebuffers(1, &f);
+    return NULL;
+}
+// bindFramebuffer(target, framebuffer) — 0 is the window's own framebuffer,
+// the one whose buffer gets presented
+static napi_value Gl_bindFramebuffer(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 2); NEED_GL(env);
+    gl.BindFramebuffer(arg_u32(env, args[0]), arg_u32(env, args[1]));
+    return NULL;
+}
+static napi_value Gl_framebufferTexture2D(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 5); NEED_GL(env);
+    gl.FramebufferTexture2D(arg_u32(env, args[0]), arg_u32(env, args[1]),
+                            arg_u32(env, args[2]), arg_u32(env, args[3]),
+                            arg_i32(env, args[4]));
+    return NULL;
+}
+static napi_value Gl_framebufferRenderbuffer(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 4); NEED_GL(env);
+    gl.FramebufferRenderbuffer(arg_u32(env, args[0]), arg_u32(env, args[1]),
+                               arg_u32(env, args[2]), arg_u32(env, args[3]));
+    return NULL;
+}
+static napi_value Gl_checkFramebufferStatus(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 1); NEED_GL(env);
+    return mk_u32(env, gl.CheckFramebufferStatus(arg_u32(env, args[0])));
+}
+static napi_value Gl_createRenderbuffer(napi_env env, napi_callback_info info) {
+    (void)info; NEED_GL(env);
+    GLuint r = 0;
+    gl.GenRenderbuffers(1, &r);
+    return mk_u32(env, r);
+}
+static napi_value Gl_deleteRenderbuffer(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 1); NEED_GL(env);
+    GLuint r = arg_u32(env, args[0]);
+    gl.DeleteRenderbuffers(1, &r);
+    return NULL;
+}
+static napi_value Gl_bindRenderbuffer(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 2); NEED_GL(env);
+    gl.BindRenderbuffer(arg_u32(env, args[0]), arg_u32(env, args[1]));
+    return NULL;
+}
+static napi_value Gl_renderbufferStorage(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 4); NEED_GL(env);
+    gl.RenderbufferStorage(arg_u32(env, args[0]), arg_u32(env, args[1]),
+                           arg_i32(env, args[2]), arg_i32(env, args[3]));
+    return NULL;
+}
+
+// --- state queries ---------------------------------------------------------
+
+// getParameter(pname) — a number, a boolean, or an array, per what ES 2.0
+// says that parameter is. The three raw getters below are the escape hatch
+// for anything this does not know about.
+static napi_value Gl_getParameter(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 1); NEED_GL(env);
+    GLenum pname = arg_u32(env, args[0]);
+    napi_value out;
+    switch (pname) {
+        // booleans
+        case 0x0B44: case 0x0BE2: case 0x0B71: case 0x0C11: // CULL_FACE, BLEND, DEPTH_TEST, SCISSOR_TEST
+        case 0x0B90: case 0x0BD0: case 0x0B72: { // STENCIL_TEST, DITHER, DEPTH_WRITEMASK
+            GLboolean b = 0;
+            gl.GetBooleanv(pname, &b);
+            return mk_bool(env, b != 0);
+        }
+        // floats
+        case 0x0B21: case 0x0B73: case 0x2A00: case 0x8038: { // LINE_WIDTH, DEPTH_CLEAR_VALUE, POLYGON_OFFSET_UNITS, POLYGON_OFFSET_FACTOR
+            GLfloat f = 0;
+            gl.GetFloatv(pname, &f);
+            NAPI_CALL(env, napi_create_double(env, f, &out));
+            return out;
+        }
+        // four floats
+        case 0x0C22: case 0x0C01: { // COLOR_CLEAR_VALUE, BLEND_COLOR
+            GLfloat v[4] = { 0, 0, 0, 0 };
+            gl.GetFloatv(pname, v);
+            NAPI_CALL(env, napi_create_array_with_length(env, 4, &out));
+            for (uint32_t i = 0; i < 4; i++) {
+                napi_value e;
+                NAPI_CALL(env, napi_create_double(env, v[i], &e));
+                NAPI_CALL(env, napi_set_element(env, out, i, e));
+            }
+            return out;
+        }
+        // four ints
+        case 0x0BA2: case 0x0C10: { // VIEWPORT, SCISSOR_BOX
+            GLint v[4] = { 0, 0, 0, 0 };
+            gl.GetIntegerv(pname, v);
+            NAPI_CALL(env, napi_create_array_with_length(env, 4, &out));
+            for (uint32_t i = 0; i < 4; i++) {
+                NAPI_CALL(env, napi_set_element(env, out, i, mk_i32(env, v[i])));
+            }
+            return out;
+        }
+        // four booleans
+        case 0x0C23: { // COLOR_WRITEMASK
+            GLboolean v[4] = { 0, 0, 0, 0 };
+            gl.GetBooleanv(pname, v);
+            NAPI_CALL(env, napi_create_array_with_length(env, 4, &out));
+            for (uint32_t i = 0; i < 4; i++) {
+                NAPI_CALL(env, napi_set_element(env, out, i, mk_bool(env, v[i] != 0)));
+            }
+            return out;
+        }
+        default: {
+            GLint v = 0;
+            gl.GetIntegerv(pname, &v);
+            return mk_i32(env, v);
+        }
+    }
+}
+static napi_value Gl_getIntegerv(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 1); NEED_GL(env);
+    GLint v = 0;
+    gl.GetIntegerv(arg_u32(env, args[0]), &v);
+    return mk_i32(env, v);
+}
+static napi_value Gl_getFloatv(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 1); NEED_GL(env);
+    GLfloat v = 0;
+    napi_value out;
+    gl.GetFloatv(arg_u32(env, args[0]), &v);
+    NAPI_CALL(env, napi_create_double(env, v, &out));
+    return out;
+}
+static napi_value Gl_getBooleanv(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 1); NEED_GL(env);
+    GLboolean v = 0;
+    gl.GetBooleanv(arg_u32(env, args[0]), &v);
+    return mk_bool(env, v != 0);
+}
+
 // ---------------------------------------------------------------------------
 // dma-buf plumbing: udmabuf, DMA_BUF_IOCTL_SYNC, dup
 //
@@ -1245,6 +1793,67 @@ NAPI_MODULE_INIT() {
     EXPORT("glGetError", Gl_getError);
     EXPORT("glGetString", Gl_getString);
     EXPORT("glReadPixels", Gl_readPixels);
+
+    EXPORT("glCreateTexture", Gl_createTexture);
+    EXPORT("glDeleteTexture", Gl_deleteTexture);
+    EXPORT("glBindTexture", Gl_bindTexture);
+    EXPORT("glActiveTexture", Gl_activeTexture);
+    EXPORT("glTexImage2D", Gl_texImage2D);
+    EXPORT("glTexSubImage2D", Gl_texSubImage2D);
+    EXPORT("glTexParameteri", Gl_texParameteri);
+    EXPORT("glTexParameterf", Gl_texParameterf);
+    EXPORT("glGenerateMipmap", Gl_generateMipmap);
+
+    EXPORT("glBlendFunc", Gl_blendFunc);
+    EXPORT("glBlendFuncSeparate", Gl_blendFuncSeparate);
+    EXPORT("glBlendEquation", Gl_blendEquation);
+    EXPORT("glBlendEquationSeparate", Gl_blendEquationSeparate);
+    EXPORT("glBlendColor", Gl_blendColor);
+    EXPORT("glDepthMask", Gl_depthMask);
+    EXPORT("glDepthRange", Gl_depthRange);
+    EXPORT("glColorMask", Gl_colorMask);
+    EXPORT("glScissor", Gl_scissor);
+    EXPORT("glPolygonOffset", Gl_polygonOffset);
+    EXPORT("glStencilFunc", Gl_stencilFunc);
+    EXPORT("glStencilOp", Gl_stencilOp);
+    EXPORT("glStencilMask", Gl_stencilMask);
+    EXPORT("glClearStencil", Gl_clearStencil);
+
+    EXPORT("glUniform2f", Gl_uniform2f);
+    EXPORT("glUniform2i", Gl_uniform2i);
+    EXPORT("glUniform3i", Gl_uniform3i);
+    EXPORT("glUniform4i", Gl_uniform4i);
+    EXPORT("glUniform1fv", Gl_uniform1fv);
+    EXPORT("glUniform2fv", Gl_uniform2fv);
+    EXPORT("glUniform3fv", Gl_uniform3fv);
+    EXPORT("glUniform4fv", Gl_uniform4fv);
+    EXPORT("glUniform1iv", Gl_uniform1iv);
+    EXPORT("glUniformMatrix2fv", Gl_uniformMatrix2fv);
+    EXPORT("glUniformMatrix3fv", Gl_uniformMatrix3fv);
+
+    EXPORT("glDisableVertexAttribArray", Gl_disableVertexAttribArray);
+    EXPORT("glBindAttribLocation", Gl_bindAttribLocation);
+    EXPORT("glVertexAttrib1f", Gl_vertexAttrib1f);
+    EXPORT("glVertexAttrib2f", Gl_vertexAttrib2f);
+    EXPORT("glVertexAttrib3f", Gl_vertexAttrib3f);
+    EXPORT("glVertexAttrib4f", Gl_vertexAttrib4f);
+    EXPORT("glBufferSubData", Gl_bufferSubData);
+
+    EXPORT("glCreateFramebuffer", Gl_createFramebuffer);
+    EXPORT("glDeleteFramebuffer", Gl_deleteFramebuffer);
+    EXPORT("glBindFramebuffer", Gl_bindFramebuffer);
+    EXPORT("glFramebufferTexture2D", Gl_framebufferTexture2D);
+    EXPORT("glFramebufferRenderbuffer", Gl_framebufferRenderbuffer);
+    EXPORT("glCheckFramebufferStatus", Gl_checkFramebufferStatus);
+    EXPORT("glCreateRenderbuffer", Gl_createRenderbuffer);
+    EXPORT("glDeleteRenderbuffer", Gl_deleteRenderbuffer);
+    EXPORT("glBindRenderbuffer", Gl_bindRenderbuffer);
+    EXPORT("glRenderbufferStorage", Gl_renderbufferStorage);
+
+    EXPORT("glGetParameter", Gl_getParameter);
+    EXPORT("glGetIntegerv", Gl_getIntegerv);
+    EXPORT("glGetFloatv", Gl_getFloatv);
+    EXPORT("glGetBooleanv", Gl_getBooleanv);
 #undef EXPORT
     return exports;
 }
