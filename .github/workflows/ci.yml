@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  # Build the addon and run the self-check. Hosted runners have no GPU and
+  # no /dev/udmabuf, so test.js exercises the build, the dlopen probing and
+  # the fd utilities, and reports the rest as skipped — which is exactly the
+  # degradation contract this package promises on minimal hosts. The Mesa
+  # runtime libraries are installed so probe() exercises real dlopen paths.
+  build-test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+        node-version: [18, 22, 26]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node-version }}
+      - name: Install Mesa runtime libraries (dlopen targets)
+        run: sudo apt-get update && sudo apt-get install -y libgbm1 libegl1 libgles2
+      - run: npm install
+      - run: npm test

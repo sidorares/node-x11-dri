@@ -1,0 +1,45 @@
+{
+  "name": "x11-dri",
+  "version": "0.0.0",
+  "description": "Optional native companion to the pure-JS x11 package: direct OpenGL ES rendering (GBM/EGL, dlopen'd at runtime) and dma-buf plumbing (udmabuf, DMA_BUF sync, dup) for the DRI3 + Present path. Linux only.",
+  "author": "Andrey Sidorov <andrey.sidorov@gmail.com>",
+  "license": "MIT",
+  "main": "index.js",
+  "homepage": "https://github.com/sidorares/node-x11-dri",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sidorares/node-x11-dri.git"
+  },
+  "bugs": {
+    "url": "https://github.com/sidorares/node-x11-dri/issues"
+  },
+  "keywords": [
+    "x11",
+    "dri3",
+    "present",
+    "dma-buf",
+    "gbm",
+    "egl",
+    "opengl",
+    "gles",
+    "udmabuf",
+    "direct rendering"
+  ],
+  "os": [
+    "linux"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "index.js",
+    "binding.gyp",
+    "src/",
+    "test.js"
+  ],
+  "scripts": {
+    "install": "node-gyp rebuild",
+    "test": "node test.js"
+  },
+  "gypfile": true
+}
