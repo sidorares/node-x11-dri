@@ -32,8 +32,10 @@
   "engines": {
     "node": ">=18"
   },
+  "types": "index.d.ts",
   "files": [
     "index.js",
+    "index.d.ts",
     "binding.gyp",
     "src/",
     "scripts/",
@@ -42,7 +44,11 @@
   ],
   "scripts": {
     "install": "node scripts/install.js",
-    "test": "node test.js"
+    "test": "node test.js",
+    "test:types": "tsc -p tsconfig.json"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
   },
   "gypfile": true
 }

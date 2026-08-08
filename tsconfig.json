@@ -1,0 +1,22 @@
+{
+  "// ": [
+    "Only for checking the shipped declarations: `npm run test:types` compiles",
+    "test-types.ts against index.d.ts and emits nothing. The package itself is",
+    "plain JavaScript and is not built by this.",
+    "",
+    "`types: []` keeps @types/node out of it — the declarations lean on nothing",
+    "but the standard library, and that is worth keeping true."
+  ],
+  "compilerOptions": {
+    "strict": true,
+    "noEmit": true,
+    "target": "es2020",
+    "lib": ["es2020"],
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "types": [],
+    "exactOptionalPropertyTypes": false,
+    "forceConsistentCasingInFileNames": true
+  },
+  "files": ["index.d.ts", "test-types.ts"]
+}

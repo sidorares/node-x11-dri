@@ -33,6 +33,20 @@ jobs:
       - run: npm install
       - run: npm test
 
+  # The shipped declarations, compiled against a file that uses them. This is
+  # the half `npm test` cannot do: that one checks the names still line up
+  # with the addon, this one checks the signatures. Needs no GPU and no
+  # native build, so it runs once rather than across the matrix.
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - run: npm install --ignore-scripts
+      - run: npm run test:types
+
   # Same steps the release workflow uses to produce the prebuilt binaries
   # bundled into the npm tarball — run on every change so a broken pipeline
   # is discovered now, not at release time. Debian 11 (glibc 2.31) is the

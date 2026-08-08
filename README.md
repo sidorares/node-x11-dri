@@ -95,6 +95,46 @@ surface.destroy(); gpu.destroy();
 One EGL context per `Gpu`, one thread, GL calls valid between `makeCurrent`
 and `destroy` — deliberately no more machinery than a renderer needs.
 
+### TypeScript
+
+Declarations ship with the package (`index.d.ts`), so there is nothing to
+install and no `@types` entry to look for. The runtime is CommonJS, so they
+are named exports — `import { Gpu } from 'x11-dri'` — with no default export,
+because there is no `.default` at runtime.
+
+They describe the binding rather than WebGL, and the differences are the
+useful part:
+
+```ts
+import { Gpu, GLContext } from 'x11-dri';
+
+const gpu = new Gpu({ glVersion: 3 });
+const surface = gpu.createSurface(1024, 768);
+gpu.makeCurrent(surface);
+
+const out = surface.swap();
+if (out?.isNew) {
+    const fd: number = out.fd;   // only in scope because isNew narrowed it
+}
+
+if (gpu.features?.instancedArrays)
+    gpu.gl.drawArraysInstanced(gpu.gl.TRIANGLE_STRIP, 0, 4, 1000);
+```
+
+`swap()` returns a union discriminated on `isNew`, so the dma-buf fields are
+reachable exactly where they exist. `features` and `glVersion` are optional
+until `makeCurrent` has run, which is when they become knowable. GL objects
+are plain numbers, `getUniformLocation` answers `-1` rather than `null`, and
+`getShaderParameter` answers a number — all as the binding does, not as
+WebGL's typings do.
+
+Two checks keep the declarations honest: `npm test` compares every declared
+name against the addon's actual exports in both directions (no GPU and no
+TypeScript needed, so it runs everywhere), and `npm run test:types` compiles
+`test-types.ts` against them under `strict`, where a row of
+`@ts-expect-error` lines fail the build if the mistakes below them stop being
+mistakes.
+
 ### Which ES version
 
 `glVersion` defaults to `'auto'`: ask EGL for ES 3.0, and fall back to ES 2.0
