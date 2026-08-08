@@ -15,7 +15,9 @@ fills exactly that hole:
 - **`gl`** — a WebGL-flavored subset of GL ES 2.0 driving that context from
   JS: shaders and programs, buffers and vertex attributes, draws, textures
   (including compressed uploads), blending, framebuffer objects for rendering
-  to a texture, the uniform setters, program introspection, and `readPixels`.
+  to a texture, the uniform setters, program introspection, and `readPixels`
+  — plus vertex array objects, instanced drawing and multiple render targets
+  where the driver has them.
 - **`createUdmabuf(size)`** — CPU memory turned into a dma-buf by the
   kernel's `/dev/udmabuf`, with the pixels mapped into JS as an
   `ArrayBuffer`: the GPU-less way to feed DRI3 (the same trick Xwayland
@@ -106,6 +108,7 @@ order, so code and tutorials carry over:
 | framebuffers | `createFramebuffer`, `bindFramebuffer`, `framebufferTexture2D`, `framebufferRenderbuffer`, `checkFramebufferStatus`, `createRenderbuffer`, `bindRenderbuffer`, `renderbufferStorage`, deletes |
 | per-fragment state | `blendFunc`, `blendFuncSeparate`, `blendEquation`, `blendEquationSeparate`, `blendColor`, `depthFunc`, `depthMask`, `depthRange`, `colorMask`, `scissor`, `polygonOffset`, `stencilFunc`, `stencilOp`, `stencilMask`, `clearStencil`, `cullFace`, `frontFace` |
 | introspection | `getActiveUniform`, `getActiveAttrib`, `getUniform`, `getAttachedShaders`, `getShaderSource`, `getShaderPrecisionFormat`, `getVertexAttrib`, `getVertexAttribOffset`, `getBufferParameter`, `getTexParameter`, `getFramebufferAttachmentParameter`, `getRenderbufferParameter`, `getSupportedExtensions`, `validateProgram`, `isBuffer`/`isProgram`/`isShader`/`isTexture`/`isFramebuffer`/`isRenderbuffer`/`isEnabled` |
+| optional (see `gpu.features`) | `createVertexArray`, `bindVertexArray`, `deleteVertexArray`, `isVertexArray`; `drawArraysInstanced`, `drawElementsInstanced`, `vertexAttribDivisor`; `drawBuffers` |
 | the rest | `clear`, `clearColor`, `clearDepthf`, `viewport`, `enable`, `disable`, `lineWidth`, `pixelStorei`, `getParameter`, `getIntegerv`, `getFloatv`, `getBooleanv`, `getError`, `getString`, `readPixels`, `finish`, `flush` |
 
 `texImage2D` accepts `null` pixels, which is how a texture is allocated to be
@@ -130,10 +133,41 @@ belongs to the format, and the byte count comes from the TypedArray. Which
 enumerates the enums. `examples/compressed-texture.js` encodes DXT1 blocks by
 hand and renders the result beside the uncompressed original.
 
-Not covered: vertex array objects, instancing, multiple render targets, and
-3D/array textures with the rest of ES 3.0. Adding one is still a small
-wrapper per entry point in `src/x11dri.c` plus a line in the `EXPORT` block —
-the JS name is derived from the `glFoo` export automatically.
+### What is optional, and how to ask
+
+Vertex array objects, instanced drawing and multiple render targets are core
+in ES 3.0 and extensions before it, so whether they exist at all is a
+property of the driver and the context rather than of this build. They are
+resolved separately from everything else, against a live context, and
+reported per feature:
+
+```js
+gpu.makeCurrent(surface);
+gpu.features            // { vertexArrayObject, instancedArrays, drawBuffers }
+if (gpu.features.instancedArrays)
+    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, count);
+```
+
+`features` appears on `makeCurrent` because that is the first moment the
+answer is knowable, and it is refreshed on each call. A feature is `true`
+only when every entry point it needs resolved, so a driver offering half an
+extension reports it absent rather than throwing partway through a frame.
+Calling one that is missing throws a message naming the feature — the
+wrappers never call through a null pointer.
+
+Two details this hides. Mesa exports the whole ES 3.2 symbol set from
+`libGLESv2.so.2` whatever the context supports, so finding
+`glDrawArraysInstanced` there says nothing about being allowed to call it —
+the core spellings are gated on the context reporting ES 3.0. And drivers
+that have the extension but not the core function often export neither,
+offering `glDrawArraysInstancedEXT` (or `…ANGLE`, or `…NV`) through
+`eglGetProcAddress` alone — so each feature carries a list of candidate
+spellings and takes the first that both resolves and is advertised.
+
+Not covered: 3D and array textures with the rest of ES 3.0. Adding one is
+still a small wrapper per entry point in `src/x11dri.c` plus a line in the
+`EXPORT` block — the JS name is derived from the `glFoo` export
+automatically.
 
 ## How it fits together
 

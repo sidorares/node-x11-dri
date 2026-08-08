@@ -420,6 +420,16 @@ static struct {
     // formats they accept is per-driver, from the extension string)
     void (*CompressedTexImage2D)(GLenum, GLint, GLenum, GLsizei, GLsizei, GLint, GLsizei, const void *);
     void (*CompressedTexSubImage2D)(GLenum, GLint, GLint, GLint, GLsizei, GLsizei, GLenum, GLsizei, const void *);
+    // Optional: core in ES 3.0, extensions before it, absent on drivers with
+    // neither. Null is a legal state for these — see resolve_optional_gl.
+    void (*GenVertexArrays)(GLsizei, GLuint *);
+    void (*DeleteVertexArrays)(GLsizei, const GLuint *);
+    void (*BindVertexArray)(GLuint);
+    GLboolean (*IsVertexArray)(GLuint);
+    void (*DrawArraysInstanced)(GLenum, GLint, GLsizei, GLsizei);
+    void (*DrawElementsInstanced)(GLenum, GLsizei, GLenum, const void *, GLsizei);
+    void (*VertexAttribDivisor)(GLuint, GLuint);
+    void (*DrawBuffers)(GLsizei, const GLenum *);
 } gl;
 
 static const char *load_gbm(void) {
@@ -592,6 +602,119 @@ static const char *load_gles(void) {
 #undef S
     gl.lib = h;
     return NULL;
+}
+
+// ---------------------------------------------------------------------------
+// Optional GL entry points
+//
+// Vertex array objects, instanced drawing and multiple render targets are
+// core in ES 3.0 and extensions before it, so which spelling exists — and
+// whether either does — is a property of the driver and of the context, not
+// of this build. They are resolved apart from the mandatory table above: a
+// miss leaves a null slot and makes the wrapper throw, where S() would have
+// failed the whole module load.
+//
+// Two things make this more than a dlsym. Mesa exports the entire ES 3.2
+// symbol set from libGLESv2.so.2 whatever the context actually supports, so
+// finding glDrawArraysInstanced there proves nothing about being allowed to
+// call it — hence the version gate on the core spelling. And a driver that
+// has the extension but not the core function commonly exports neither,
+// offering the suffixed name through eglGetProcAddress alone — hence the
+// second lookup. Both facts need a live context, so this runs from
+// makeCurrent rather than at load time.
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    const char *name;
+    const char *ext; // NULL means the core spelling, which needs ES 3.0
+} GlCandidate;
+
+typedef struct {
+    void **slot;
+    const char *feature; // the name this is reported and complained about under
+    GlCandidate cand[4];
+} GlOptional;
+
+static const GlOptional gl_optional[] = {
+    { (void **)&gl.GenVertexArrays, "vertexArrayObject", {
+        { "glGenVertexArrays", NULL },
+        { "glGenVertexArraysOES", "GL_OES_vertex_array_object" } } },
+    { (void **)&gl.DeleteVertexArrays, "vertexArrayObject", {
+        { "glDeleteVertexArrays", NULL },
+        { "glDeleteVertexArraysOES", "GL_OES_vertex_array_object" } } },
+    { (void **)&gl.BindVertexArray, "vertexArrayObject", {
+        { "glBindVertexArray", NULL },
+        { "glBindVertexArrayOES", "GL_OES_vertex_array_object" } } },
+    { (void **)&gl.IsVertexArray, "vertexArrayObject", {
+        { "glIsVertexArray", NULL },
+        { "glIsVertexArrayOES", "GL_OES_vertex_array_object" } } },
+    { (void **)&gl.DrawArraysInstanced, "instancedArrays", {
+        { "glDrawArraysInstanced", NULL },
+        { "glDrawArraysInstancedEXT", "GL_EXT_instanced_arrays" },
+        { "glDrawArraysInstancedANGLE", "GL_ANGLE_instanced_arrays" },
+        { "glDrawArraysInstancedNV", "GL_NV_instanced_arrays" } } },
+    { (void **)&gl.DrawElementsInstanced, "instancedArrays", {
+        { "glDrawElementsInstanced", NULL },
+        { "glDrawElementsInstancedEXT", "GL_EXT_instanced_arrays" },
+        { "glDrawElementsInstancedANGLE", "GL_ANGLE_instanced_arrays" },
+        { "glDrawElementsInstancedNV", "GL_NV_instanced_arrays" } } },
+    { (void **)&gl.VertexAttribDivisor, "instancedArrays", {
+        { "glVertexAttribDivisor", NULL },
+        { "glVertexAttribDivisorEXT", "GL_EXT_instanced_arrays" },
+        { "glVertexAttribDivisorANGLE", "GL_ANGLE_instanced_arrays" },
+        { "glVertexAttribDivisorNV", "GL_NV_instanced_arrays" } } },
+    { (void **)&gl.DrawBuffers, "drawBuffers", {
+        { "glDrawBuffers", NULL },
+        { "glDrawBuffersEXT", "GL_EXT_draw_buffers" },
+        { "glDrawBuffersNV", "GL_NV_draw_buffers" } } }
+};
+
+// GL's extension string is space-separated, and one name can be a prefix of
+// another (GL_EXT_draw_buffers / GL_EXT_draw_buffers_indexed), so match on
+// whole words.
+static int has_gl_ext(const char *list, const char *want) {
+    if (!list || !want) return 0;
+    size_t n = strlen(want);
+    for (const char *p = strstr(list, want); p; p = strstr(p + n, want))
+        if ((p == list || p[-1] == ' ') && (p[n] == ' ' || p[n] == '\0'))
+            return 1;
+    return 0;
+}
+
+// Which context the table was last resolved against, so switching contexts
+// re-resolves and destroying one forces it.
+static EGLContext optional_ctx;
+
+static void resolve_optional_gl(EGLContext ctx) {
+    if (optional_ctx == ctx)
+        return;
+    optional_ctx = ctx;
+
+    // "OpenGL ES N.M <driver>" — the major version is what gates the core
+    // spellings. Anything unparseable is treated as ES 2.0, which only ever
+    // costs an extension lookup that would have worked anyway.
+    int major = 2;
+    const char *version = (const char *)gl.GetString(0x1F02 /* GL_VERSION */);
+    const char *es = version ? strstr(version, "ES ") : NULL;
+    if (es && es[3] >= '0' && es[3] <= '9')
+        major = es[3] - '0';
+    const char *exts = (const char *)gl.GetString(0x1F03 /* GL_EXTENSIONS */);
+
+    for (size_t i = 0; i < sizeof(gl_optional) / sizeof(gl_optional[0]); i++) {
+        const GlOptional *o = &gl_optional[i];
+        *o->slot = NULL;
+        for (int c = 0; c < 4 && o->cand[c].name; c++) {
+            if (o->cand[c].ext ? !has_gl_ext(exts, o->cand[c].ext) : major < 3)
+                continue;
+            void *fn = gl.lib ? dlsym(gl.lib, o->cand[c].name) : NULL;
+            if (!fn && egl.GetProcAddress)
+                fn = egl.GetProcAddress(o->cand[c].name);
+            if (fn) {
+                *o->slot = fn;
+                break;
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -792,6 +915,9 @@ static napi_value MakeCurrent(napi_env env, napi_callback_info info) {
     if (s) {
         egl.SwapInterval(g->dpy, 0); // gbm surfaces have no vblank; Present paces us
         has_current = 1;
+        // Only now can the optional entry points be settled: it takes
+        // glGetString, which takes a current context.
+        resolve_optional_gl(g->ctx);
     } else {
         has_current = 0;
     }
@@ -904,6 +1030,8 @@ static napi_value DestroyGpu(napi_env env, napi_callback_info info) {
     if (!g->destroyed) {
         egl.MakeCurrent(g->dpy, NULL, NULL, NULL);
         has_current = 0;
+        if (optional_ctx == g->ctx)
+            optional_ctx = NULL; // a later context could land on this address
         egl.DestroyContext(g->dpy, g->ctx);
         egl.Terminate(g->dpy);
         gbm.device_destroy(g->gbm);
@@ -1922,6 +2050,128 @@ IS_FN(Gl_isShader, IsShader)
 IS_FN(Gl_isTexture, IsTexture)
 #undef IS_FN
 
+// --- vertex array objects, instancing, multiple render targets -------------
+//
+// Everything below can be missing, so every wrapper says so in terms of the
+// feature rather than the symbol — a caller that wants to branch instead of
+// catch should read glFeatures().
+
+#define NEED_FN(env, field, feature)                                          \
+    do {                                                                      \
+        if (!gl.field)                                                        \
+            THROW(env, feature " is not available here: the context is not "  \
+                               "ES 3.0 and the driver offers no equivalent "  \
+                               "extension (see gpu.features)");               \
+    } while (0)
+
+static napi_value Gl_createVertexArray(napi_env env, napi_callback_info info) {
+    (void)info; NEED_GL(env);
+    NEED_FN(env, GenVertexArrays, "vertex array objects");
+    GLuint v = 0;
+    gl.GenVertexArrays(1, &v);
+    return mk_u32(env, v);
+}
+static napi_value Gl_deleteVertexArray(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 1); NEED_GL(env);
+    NEED_FN(env, DeleteVertexArrays, "vertex array objects");
+    GLuint v = arg_u32(env, args[0]);
+    gl.DeleteVertexArrays(1, &v);
+    return NULL;
+}
+static napi_value Gl_bindVertexArray(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 1); NEED_GL(env);
+    NEED_FN(env, BindVertexArray, "vertex array objects");
+    gl.BindVertexArray(arg_u32(env, args[0]));
+    return NULL;
+}
+static napi_value Gl_isVertexArray(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 1); NEED_GL(env);
+    NEED_FN(env, IsVertexArray, "vertex array objects");
+    return mk_bool(env, gl.IsVertexArray(arg_u32(env, args[0])) != 0);
+}
+
+// drawArraysInstanced(mode, first, count, instanceCount)
+static napi_value Gl_drawArraysInstanced(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 4); NEED_GL(env);
+    NEED_FN(env, DrawArraysInstanced, "instanced drawing");
+    gl.DrawArraysInstanced(arg_u32(env, args[0]), arg_i32(env, args[1]),
+                           arg_i32(env, args[2]), arg_i32(env, args[3]));
+    return NULL;
+}
+// drawElementsInstanced(mode, count, type, offset, instanceCount)
+static napi_value Gl_drawElementsInstanced(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 5); NEED_GL(env);
+    NEED_FN(env, DrawElementsInstanced, "instanced drawing");
+    gl.DrawElementsInstanced(arg_u32(env, args[0]), arg_i32(env, args[1]),
+                             arg_u32(env, args[2]),
+                             (const void *)(intptr_t)arg_i32(env, args[3]),
+                             arg_i32(env, args[4]));
+    return NULL;
+}
+// vertexAttribDivisor(index, divisor) — 0 advances the attribute per vertex,
+// 1 per instance, n every n instances
+static napi_value Gl_vertexAttribDivisor(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 2); NEED_GL(env);
+    NEED_FN(env, VertexAttribDivisor, "instanced drawing");
+    gl.VertexAttribDivisor(arg_u32(env, args[0]), arg_u32(env, args[1]));
+    return NULL;
+}
+
+// drawBuffers([COLOR_ATTACHMENT0, NONE, COLOR_ATTACHMENT2, ...]) — which
+// attachment each fragment output writes to, by position. Takes a plain
+// array or a Uint32Array.
+static napi_value Gl_drawBuffers(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 1); NEED_GL(env);
+    NEED_FN(env, DrawBuffers, "multiple render targets");
+    GLenum bufs[16];
+    uint32_t n = 0;
+    bool is_array = false;
+    napi_is_array(env, args[0], &is_array);
+    if (is_array) {
+        NAPI_CALL(env, napi_get_array_length(env, args[0], &n));
+        if (n > 16)
+            THROW(env, "drawBuffers: at most 16 attachments");
+        for (uint32_t i = 0; i < n; i++) {
+            napi_value e;
+            NAPI_CALL(env, napi_get_element(env, args[0], i, &e));
+            bufs[i] = arg_u32(env, e);
+        }
+    } else {
+        void *data;
+        size_t nbytes;
+        if (!typed_bytes(env, args[0], &data, &nbytes))
+            THROW(env, "drawBuffers expects an array of attachment enums");
+        n = (uint32_t)(nbytes / sizeof(GLenum));
+        if (n > 16)
+            THROW(env, "drawBuffers: at most 16 attachments");
+        memcpy(bufs, data, n * sizeof(GLenum));
+    }
+    gl.DrawBuffers((GLsizei)n, bufs);
+    return NULL;
+}
+
+// getFeatures() -> { vertexArrayObject, instancedArrays, drawBuffers }
+//
+// A feature is present only when every entry point it needs resolved, so a
+// driver offering half an extension reports it as absent rather than
+// throwing partway through a frame.
+static napi_value GlFeatures(napi_env env, napi_callback_info info) {
+    (void)info; NEED_GL(env);
+    napi_value obj;
+    NAPI_CALL(env, napi_create_object(env, &obj));
+    for (size_t i = 0; i < sizeof(gl_optional) / sizeof(gl_optional[0]); i++) {
+        const GlOptional *o = &gl_optional[i];
+        napi_value prev;
+        bool ok = true;
+        napi_valuetype t = napi_undefined;
+        if (napi_get_named_property(env, obj, o->feature, &prev) == napi_ok &&
+            napi_typeof(env, prev, &t) == napi_ok && t == napi_boolean)
+            napi_get_value_bool(env, prev, &ok);
+        obj_set(env, obj, o->feature, mk_bool(env, ok && *o->slot != NULL));
+    }
+    return obj;
+}
+
 // ---------------------------------------------------------------------------
 // dma-buf plumbing: udmabuf, DMA_BUF_IOCTL_SYNC, dup
 //
@@ -2221,6 +2471,16 @@ NAPI_MODULE_INIT() {
     EXPORT("glIsRenderbuffer", Gl_isRenderbuffer);
     EXPORT("glIsShader", Gl_isShader);
     EXPORT("glIsTexture", Gl_isTexture);
+
+    EXPORT("glCreateVertexArray", Gl_createVertexArray);
+    EXPORT("glDeleteVertexArray", Gl_deleteVertexArray);
+    EXPORT("glBindVertexArray", Gl_bindVertexArray);
+    EXPORT("glIsVertexArray", Gl_isVertexArray);
+    EXPORT("glDrawArraysInstanced", Gl_drawArraysInstanced);
+    EXPORT("glDrawElementsInstanced", Gl_drawElementsInstanced);
+    EXPORT("glVertexAttribDivisor", Gl_vertexAttribDivisor);
+    EXPORT("glDrawBuffers", Gl_drawBuffers);
+    EXPORT("glGetFeatures", GlFeatures);
 #undef EXPORT
     return exports;
 }
