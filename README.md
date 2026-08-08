@@ -21,10 +21,10 @@ fills exactly that hole:
 - **`dup(fd)`**, **`dmabufSync(fd, flags)`** — descriptor plumbing (DRI3
   sends consume their fds; `dup` keeps a copy) and CPU-access bracketing.
 
-Complete samples live in the main repo:
-[`examples/opengl/dri3-cube.js`](https://github.com/sidorares/node-x11/blob/master/examples/opengl/dri3-cube.js)
+Complete samples live in the main repo — a self-contained folder you can `npm install && npm start`:
+[`examples/dri3/cube.js`](https://github.com/sidorares/node-x11/blob/master/examples/dri3/cube.js)
 (spinning GPU cube) and
-[`examples/opengl/dri3-software.js`](https://github.com/sidorares/node-x11/blob/master/examples/opengl/dri3-software.js).
+[`examples/dri3/software.js`](https://github.com/sidorares/node-x11/blob/master/examples/dri3/software.js).
 
 ## Installing
 

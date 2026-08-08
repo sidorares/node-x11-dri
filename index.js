@@ -9,7 +9,7 @@
 //
 // The fds go to the X server through the x11 package's DRI3 extension
 // (X.require('dri3') -> PixmapFromBuffer) and on screen with Present.
-// See https://github.com/sidorares/node-x11/blob/master/examples/opengl/dri3-cube.js
+// See https://github.com/sidorares/node-x11/blob/master/examples/dri3/cube.js
 // for the complete picture.
 
 const fs = require('fs');
