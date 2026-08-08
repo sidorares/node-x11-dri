@@ -133,7 +133,68 @@ const GL = {
     SAMPLE_ALPHA_TO_COVERAGE: 0x809E, SAMPLE_COVERAGE: 0x80A0,
     MAX_VERTEX_ATTRIBS: 0x8869, MAX_VARYING_VECTORS: 0x8DFC,
     MAX_VERTEX_UNIFORM_VECTORS: 0x8DFB, MAX_FRAGMENT_UNIFORM_VECTORS: 0x8DFD,
-    VALIDATE_STATUS: 0x8B83, DELETE_STATUS: 0x8B80, SHADER_TYPE: 0x8B4F
+    VALIDATE_STATUS: 0x8B83, DELETE_STATUS: 0x8B80, SHADER_TYPE: 0x8B4F,
+
+    // the types getActiveUniform/getActiveAttrib report
+    FLOAT_VEC2: 0x8B50, FLOAT_VEC3: 0x8B51, FLOAT_VEC4: 0x8B52,
+    INT_VEC2: 0x8B53, INT_VEC3: 0x8B54, INT_VEC4: 0x8B55,
+    BOOL: 0x8B56, BOOL_VEC2: 0x8B57, BOOL_VEC3: 0x8B58, BOOL_VEC4: 0x8B59,
+    FLOAT_MAT2: 0x8B5A, FLOAT_MAT3: 0x8B5B, FLOAT_MAT4: 0x8B5C,
+    SAMPLER_2D: 0x8B5E, SAMPLER_CUBE: 0x8B60,
+
+    // program and shader properties
+    ACTIVE_UNIFORMS: 0x8B86, ACTIVE_UNIFORM_MAX_LENGTH: 0x8B87,
+    ACTIVE_ATTRIBUTES: 0x8B89, ACTIVE_ATTRIBUTE_MAX_LENGTH: 0x8B8A,
+    ATTACHED_SHADERS: 0x8B85, SHADER_SOURCE_LENGTH: 0x8B88,
+    SHADER_COMPILER: 0x8DFA,
+    LOW_FLOAT: 0x8DF0, MEDIUM_FLOAT: 0x8DF1, HIGH_FLOAT: 0x8DF2,
+    LOW_INT: 0x8DF3, MEDIUM_INT: 0x8DF4, HIGH_INT: 0x8DF5,
+
+    // vertex attribute state, for getVertexAttrib
+    VERTEX_ATTRIB_ARRAY_ENABLED: 0x8622, VERTEX_ATTRIB_ARRAY_SIZE: 0x8623,
+    VERTEX_ATTRIB_ARRAY_STRIDE: 0x8624, VERTEX_ATTRIB_ARRAY_TYPE: 0x8625,
+    VERTEX_ATTRIB_ARRAY_NORMALIZED: 0x886A,
+    VERTEX_ATTRIB_ARRAY_POINTER: 0x8645,
+    VERTEX_ATTRIB_ARRAY_BUFFER_BINDING: 0x889F,
+    CURRENT_VERTEX_ATTRIB: 0x8626,
+
+    // what is bound, and what the bound thing is made of
+    ARRAY_BUFFER_BINDING: 0x8894, ELEMENT_ARRAY_BUFFER_BINDING: 0x8895,
+    FRAMEBUFFER_BINDING: 0x8CA6, RENDERBUFFER_BINDING: 0x8CA7,
+    CURRENT_PROGRAM: 0x8B8D,
+    TEXTURE_BINDING_2D: 0x8069, TEXTURE_BINDING_CUBE_MAP: 0x8514,
+    BUFFER_SIZE: 0x8764, BUFFER_USAGE: 0x8765,
+    FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE: 0x8CD0,
+    FRAMEBUFFER_ATTACHMENT_OBJECT_NAME: 0x8CD1,
+    FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL: 0x8CD2,
+    FRAMEBUFFER_ATTACHMENT_TEXTURE_CUBE_MAP_FACE: 0x8CD3,
+    RENDERBUFFER_WIDTH: 0x8D42, RENDERBUFFER_HEIGHT: 0x8D43,
+    RENDERBUFFER_INTERNAL_FORMAT: 0x8D44,
+    RENDERBUFFER_RED_SIZE: 0x8D50, RENDERBUFFER_GREEN_SIZE: 0x8D51,
+    RENDERBUFFER_BLUE_SIZE: 0x8D52, RENDERBUFFER_ALPHA_SIZE: 0x8D53,
+    RENDERBUFFER_DEPTH_SIZE: 0x8D54, RENDERBUFFER_STENCIL_SIZE: 0x8D55,
+
+    // compressed textures. The entry points are core ES 2.0 but every format
+    // below is an extension: check getSupportedExtensions() or
+    // getParameter(COMPRESSED_TEXTURE_FORMATS) before uploading one.
+    EXTENSIONS: 0x1F03,
+    NUM_COMPRESSED_TEXTURE_FORMATS: 0x86A2, COMPRESSED_TEXTURE_FORMATS: 0x86A3,
+    ETC1_RGB8_OES: 0x8D64,
+    COMPRESSED_RGB_S3TC_DXT1_EXT: 0x83F0, COMPRESSED_RGBA_S3TC_DXT1_EXT: 0x83F1,
+    COMPRESSED_RGBA_S3TC_DXT3_EXT: 0x83F2, COMPRESSED_RGBA_S3TC_DXT5_EXT: 0x83F3,
+    COMPRESSED_R11_EAC: 0x9270, COMPRESSED_SIGNED_R11_EAC: 0x9271,
+    COMPRESSED_RG11_EAC: 0x9272, COMPRESSED_SIGNED_RG11_EAC: 0x9273,
+    COMPRESSED_RGB8_ETC2: 0x9274, COMPRESSED_SRGB8_ETC2: 0x9275,
+    COMPRESSED_RGB8_PUNCHTHROUGH_ALPHA1_ETC2: 0x9276,
+    COMPRESSED_SRGB8_PUNCHTHROUGH_ALPHA1_ETC2: 0x9277,
+    COMPRESSED_RGBA8_ETC2_EAC: 0x9278, COMPRESSED_SRGB8_ALPHA8_ETC2_EAC: 0x9279,
+    COMPRESSED_RGBA_ASTC_4x4_KHR: 0x93B0, COMPRESSED_RGBA_ASTC_5x4_KHR: 0x93B1,
+    COMPRESSED_RGBA_ASTC_5x5_KHR: 0x93B2, COMPRESSED_RGBA_ASTC_6x5_KHR: 0x93B3,
+    COMPRESSED_RGBA_ASTC_6x6_KHR: 0x93B4, COMPRESSED_RGBA_ASTC_8x5_KHR: 0x93B5,
+    COMPRESSED_RGBA_ASTC_8x6_KHR: 0x93B6, COMPRESSED_RGBA_ASTC_8x8_KHR: 0x93B7,
+    COMPRESSED_RGBA_ASTC_10x5_KHR: 0x93B8, COMPRESSED_RGBA_ASTC_10x6_KHR: 0x93B9,
+    COMPRESSED_RGBA_ASTC_10x8_KHR: 0x93BA, COMPRESSED_RGBA_ASTC_10x10_KHR: 0x93BB,
+    COMPRESSED_RGBA_ASTC_12x10_KHR: 0x93BC, COMPRESSED_RGBA_ASTC_12x12_KHR: 0x93BD
 };
 
 // WebGL-flavored view over the flat native functions ("gl.clearColor" etc).
@@ -145,6 +206,64 @@ for (const k of Object.keys(native)) {
     }
 }
 Object.assign(gl, GL);
+
+// The component count and reading of every uniform type ES 2.0 can declare:
+// [components, 'f'loat | 'i'nt | 'b'ool].
+const UNIFORM_SHAPE = {
+    [GL.FLOAT]: [1, 'f'],
+    [GL.FLOAT_VEC2]: [2, 'f'], [GL.FLOAT_VEC3]: [3, 'f'], [GL.FLOAT_VEC4]: [4, 'f'],
+    [GL.FLOAT_MAT2]: [4, 'f'], [GL.FLOAT_MAT3]: [9, 'f'], [GL.FLOAT_MAT4]: [16, 'f'],
+    [GL.INT]: [1, 'i'],
+    [GL.INT_VEC2]: [2, 'i'], [GL.INT_VEC3]: [3, 'i'], [GL.INT_VEC4]: [4, 'i'],
+    [GL.BOOL]: [1, 'b'],
+    [GL.BOOL_VEC2]: [2, 'b'], [GL.BOOL_VEC3]: [3, 'b'], [GL.BOOL_VEC4]: [4, 'b'],
+    [GL.SAMPLER_2D]: [1, 'i'], [GL.SAMPLER_CUBE]: [1, 'i']
+};
+
+// WebGL's getUniform(program, location). GL will write as many components as
+// the uniform has and offers no way to ask how many that is, so the raw
+// getUniformfv/getUniformiv take a count — and only the program knows it.
+// Finding the uniform means walking its active uniforms for the one whose
+// location matches, freshly each call: a cache would go stale the moment the
+// program is relinked, and this is a debug-path call where that trade runs
+// the wrong way.
+function getUniform(program, location) {
+    if (location == null || location < 0)
+        return null;
+    const count = gl.getProgramParameter(program, GL.ACTIVE_UNIFORMS);
+    for (let i = 0; i < count; i++) {
+        const info = gl.getActiveUniform(program, i);
+        const shape = info && UNIFORM_SHAPE[info.type];
+        if (!shape)
+            continue;
+        // An array uniform is reported once, as "u[0]" with size N, but every
+        // element has a location of its own.
+        const base = info.name.replace(/\[0\]$/, '');
+        for (let e = 0; e < info.size; e++) {
+            const name = info.size > 1 ? `${base}[${e}]` : base;
+            if (gl.getUniformLocation(program, name) !== location)
+                continue;
+            const [n, kind] = shape;
+            const raw = kind === 'f' ? gl.getUniformfv(program, location, n)
+                                     : gl.getUniformiv(program, location, n);
+            if (kind === 'b')
+                return n === 1 ? raw[0] !== 0 : raw.map(v => v !== 0);
+            if (n === 1)
+                return raw[0];
+            return kind === 'f' ? Float32Array.from(raw) : Int32Array.from(raw);
+        }
+    }
+    return null;
+}
+
+// The driver's extension list, split — which is how you find out whether a
+// compressed format, or anything else optional, is there to be used.
+function getSupportedExtensions() {
+    return gl.getString(GL.EXTENSIONS).split(/\s+/).filter(Boolean);
+}
+
+gl.getUniform = getUniform;
+gl.getSupportedExtensions = getSupportedExtensions;
 
 // ---- buffer layout constants ----
 const FORMAT = {

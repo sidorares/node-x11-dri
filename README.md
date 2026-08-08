@@ -13,9 +13,9 @@ fills exactly that hole:
   render → `swap()` → `{fd, stride, modifier}` → `DRI3.PixmapFromBuffer` →
   `Present.Pixmap`.
 - **`gl`** — a WebGL-flavored subset of GL ES 2.0 driving that context from
-  JS: shaders and programs, buffers and vertex attributes, draws, textures,
-  blending, framebuffer objects for rendering to a texture, the uniform
-  setters, and `readPixels`.
+  JS: shaders and programs, buffers and vertex attributes, draws, textures
+  (including compressed uploads), blending, framebuffer objects for rendering
+  to a texture, the uniform setters, program introspection, and `readPixels`.
 - **`createUdmabuf(size)`** — CPU memory turned into a dma-buf by the
   kernel's `/dev/udmabuf`, with the pixels mapped into JS as an
   `ArrayBuffer`: the GPU-less way to feed DRI3 (the same trick Xwayland
@@ -27,6 +27,9 @@ Complete samples live in the main repo — a self-contained folder you can `npm 
 [`examples/dri3/cube.js`](https://github.com/sidorares/node-x11/blob/master/examples/dri3/cube.js)
 (spinning GPU cube) and
 [`examples/dri3/software.js`](https://github.com/sidorares/node-x11/blob/master/examples/dri3/software.js).
+The [`examples/`](examples) folder here is the other half of that: no X server
+and no DRI3, one GL feature per file, rendering off-screen and writing a PNG
+you can open.
 
 ## Installing
 
@@ -99,20 +102,36 @@ order, so code and tutorials carry over:
 | programs | `createShader`, `shaderSource`, `compileShader`, `getShaderParameter`, `getShaderInfoLog`, `createProgram`, `attachShader`, `linkProgram`, `getProgramParameter`, `getProgramInfoLog`, `useProgram`, `bindAttribLocation`, deletes |
 | geometry | `createBuffer`, `bindBuffer`, `bufferData`, `bufferSubData`, `vertexAttribPointer`, `enableVertexAttribArray`, `disableVertexAttribArray`, `vertexAttrib1f`–`4f`, `drawArrays`, `drawElements` |
 | uniforms | `getUniformLocation`, `uniform1f`/`2f`/`3f`/`4f`, `uniform1i`/`2i`/`3i`/`4i`, `uniform1fv`–`4fv`, `uniform1iv`, `uniformMatrix2fv`/`3fv`/`4fv` |
-| textures | `createTexture`, `bindTexture`, `activeTexture`, `texImage2D`, `texSubImage2D`, `texParameteri`/`f`, `generateMipmap`, `deleteTexture` |
+| textures | `createTexture`, `bindTexture`, `activeTexture`, `texImage2D`, `texSubImage2D`, `compressedTexImage2D`, `compressedTexSubImage2D`, `texParameteri`/`f`, `generateMipmap`, `deleteTexture` |
 | framebuffers | `createFramebuffer`, `bindFramebuffer`, `framebufferTexture2D`, `framebufferRenderbuffer`, `checkFramebufferStatus`, `createRenderbuffer`, `bindRenderbuffer`, `renderbufferStorage`, deletes |
 | per-fragment state | `blendFunc`, `blendFuncSeparate`, `blendEquation`, `blendEquationSeparate`, `blendColor`, `depthFunc`, `depthMask`, `depthRange`, `colorMask`, `scissor`, `polygonOffset`, `stencilFunc`, `stencilOp`, `stencilMask`, `clearStencil`, `cullFace`, `frontFace` |
+| introspection | `getActiveUniform`, `getActiveAttrib`, `getUniform`, `getAttachedShaders`, `getShaderSource`, `getShaderPrecisionFormat`, `getVertexAttrib`, `getVertexAttribOffset`, `getBufferParameter`, `getTexParameter`, `getFramebufferAttachmentParameter`, `getRenderbufferParameter`, `getSupportedExtensions`, `validateProgram`, `isBuffer`/`isProgram`/`isShader`/`isTexture`/`isFramebuffer`/`isRenderbuffer`/`isEnabled` |
 | the rest | `clear`, `clearColor`, `clearDepthf`, `viewport`, `enable`, `disable`, `lineWidth`, `pixelStorei`, `getParameter`, `getIntegerv`, `getFloatv`, `getBooleanv`, `getError`, `getString`, `readPixels`, `finish`, `flush` |
 
 `texImage2D` accepts `null` pixels, which is how a texture is allocated to be
 rendered into. `getParameter` answers in the type the parameter has — a
 number, a boolean, or an array for `VIEWPORT`, `SCISSOR_BOX`,
-`COLOR_CLEAR_VALUE` and `COLOR_WRITEMASK`; `getIntegerv`/`getFloatv`/
-`getBooleanv` are the raw single-value escape hatch.
+`COLOR_CLEAR_VALUE`, `COLOR_WRITEMASK` and `COMPRESSED_TEXTURE_FORMATS`;
+`getIntegerv`/`getFloatv`/`getBooleanv` are the raw single-value escape hatch.
 
-Not covered: vertex array objects, instancing, multiple render targets,
-3D/array textures and the rest of ES 3.0, `getActiveUniform`-style
-introspection, and compressed texture formats. Adding one is still a small
+Introspection is how code that did not write the shader drives it anyway.
+`getActiveUniform(program, i)` walks the uniforms a linked program actually
+kept, answering `{ name, size, type }` (and `null` past the end, so a loop
+can stop without disturbing `getError()`); arrays appear once, as `u[0]` with
+their length. `getUniform(program, location)` reads a value back in its own
+type — a `Float32Array` for a vec, a boolean for a `bool` — by asking the
+program what that uniform is; `getUniformfv`/`getUniformiv` are the raw form
+that takes a component count instead.
+
+Compressed uploads pass their bytes to the driver untouched: the block layout
+belongs to the format, and the byte count comes from the TypedArray. Which
+`internalformat` values are legal is per-driver, so ask first —
+`getSupportedExtensions()` names the formats, `getParameter(gl.COMPRESSED_TEXTURE_FORMATS)`
+enumerates the enums. `examples/compressed-texture.js` encodes DXT1 blocks by
+hand and renders the result beside the uncompressed original.
+
+Not covered: vertex array objects, instancing, multiple render targets, and
+3D/array textures with the rest of ES 3.0. Adding one is still a small
 wrapper per entry point in `src/x11dri.c` plus a line in the `EXPORT` block —
 the JS name is derived from the `glFoo` export automatically.
 
