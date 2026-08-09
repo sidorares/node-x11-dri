@@ -350,8 +350,20 @@ class Surface {
     }
 }
 
+// "OpenGL ES 3.0 Mesa 26.0.3" -> { major: 3, minor: 0, string: '...' }.
+// Anything that does not parse reports 2.0, which is the floor for a context
+// this package can create at all.
+function parseGlVersion(string) {
+    const m = /OpenGL ES(?:-\w+)?\s+(\d+)\.(\d+)/.exec(string || '');
+    return {
+        major: m ? Number(m[1]) : 2,
+        minor: m ? Number(m[2]) : 0,
+        string: string || ''
+    };
+}
+
 class Gpu {
-    // opts: { devicePath?, fd?, format?, depthSize? }
+    // opts: { devicePath?, fd?, format?, depthSize?, glVersion? }
     constructor(opts) {
         opts = opts || {};
         this.devicePath = null;
@@ -382,7 +394,15 @@ class Gpu {
             this._ownFd = true;
         }
         this.format = opts.format || FORMAT.XRGB8888;
-        this._handle = native.createGpu(this._fd, this.format, opts.depthSize != null ? opts.depthSize : 16);
+        // glVersion: 2 or 3 to insist, 'auto' (the default) to take the
+        // highest the driver offers and fall back rather than fail.
+        const wantEs = opts.glVersion == null || opts.glVersion === 'auto'
+            ? 0 : opts.glVersion;
+        this._handle = native.createGpu(this._fd, this.format,
+            opts.depthSize != null ? opts.depthSize : 16, wantEs);
+        // adds eglVendor, eglVersion, contextVersion (the ES version EGL was
+        // asked for and granted — see glVersion after makeCurrent for what
+        // the driver actually gave)
         Object.assign(this, native.gpuInfo(this._handle));
         this.gl = gl;
     }
@@ -393,12 +413,15 @@ class Gpu {
         const handle = native.createSurface(this._handle, width, height, use);
         return new Surface(this, handle, width, height);
     }
-    // Optional entry points can only be settled against a live context, so
-    // `features` appears here rather than in the constructor: which of vertex
-    // array objects, instanced drawing and multiple render targets this
-    // driver actually offers.
+    // Two things can only be settled against a live context, so they appear
+    // here rather than in the constructor: `glVersion`, what the driver
+    // actually gave (which can be higher than `contextVersion` — Mesa answers
+    // an ES 2.0 request with an ES 3.0 context), and `features`, which of
+    // vertex array objects, instanced drawing and multiple render targets
+    // this driver offers.
     makeCurrent(surface) {
         native.makeCurrent(this._handle, surface ? surface._handle : null);
+        this.glVersion = surface ? parseGlVersion(gl.getString(GL.VERSION)) : null;
         this.features = surface ? native.glGetFeatures() : null;
     }
     destroy() {
