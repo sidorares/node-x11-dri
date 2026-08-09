@@ -194,7 +194,21 @@ const GL = {
     COMPRESSED_RGBA_ASTC_8x6_KHR: 0x93B6, COMPRESSED_RGBA_ASTC_8x8_KHR: 0x93B7,
     COMPRESSED_RGBA_ASTC_10x5_KHR: 0x93B8, COMPRESSED_RGBA_ASTC_10x6_KHR: 0x93B9,
     COMPRESSED_RGBA_ASTC_10x8_KHR: 0x93BA, COMPRESSED_RGBA_ASTC_10x10_KHR: 0x93BB,
-    COMPRESSED_RGBA_ASTC_12x10_KHR: 0x93BC, COMPRESSED_RGBA_ASTC_12x12_KHR: 0x93BD
+    COMPRESSED_RGBA_ASTC_12x10_KHR: 0x93BC, COMPRESSED_RGBA_ASTC_12x12_KHR: 0x93BD,
+
+    // vertex array objects, instancing and multiple render targets. These
+    // three are core in ES 3.0 and extensions before it, so the entry points
+    // may be missing — gpu.features says which of them this driver has.
+    VERTEX_ARRAY_BINDING: 0x85B5,
+    VERTEX_ATTRIB_ARRAY_DIVISOR: 0x88FE,
+    MAX_DRAW_BUFFERS: 0x8824, MAX_COLOR_ATTACHMENTS: 0x8CDF, NONE: 0,
+    DRAW_BUFFER0: 0x8825, DRAW_BUFFER1: 0x8826, DRAW_BUFFER2: 0x8827,
+    DRAW_BUFFER3: 0x8828, DRAW_BUFFER4: 0x8829, DRAW_BUFFER5: 0x882A,
+    DRAW_BUFFER6: 0x882B, DRAW_BUFFER7: 0x882C,
+    COLOR_ATTACHMENT1: 0x8CE1, COLOR_ATTACHMENT2: 0x8CE2,
+    COLOR_ATTACHMENT3: 0x8CE3, COLOR_ATTACHMENT4: 0x8CE4,
+    COLOR_ATTACHMENT5: 0x8CE5, COLOR_ATTACHMENT6: 0x8CE6,
+    COLOR_ATTACHMENT7: 0x8CE7
 };
 
 // WebGL-flavored view over the flat native functions ("gl.clearColor" etc).
@@ -379,8 +393,13 @@ class Gpu {
         const handle = native.createSurface(this._handle, width, height, use);
         return new Surface(this, handle, width, height);
     }
+    // Optional entry points can only be settled against a live context, so
+    // `features` appears here rather than in the constructor: which of vertex
+    // array objects, instanced drawing and multiple render targets this
+    // driver actually offers.
     makeCurrent(surface) {
         native.makeCurrent(this._handle, surface ? surface._handle : null);
+        this.features = surface ? native.glGetFeatures() : null;
     }
     destroy() {
         native.destroyGpu(this._handle);

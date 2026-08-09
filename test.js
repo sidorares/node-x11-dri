@@ -609,5 +609,230 @@ report('GL introspection and compressed textures', () => {
     return `${exts.length} extensions, ${note}`;
 });
 
+// The three optional features. Each may be absent — that is the whole point
+// of resolving them separately — so each is checked against gpu.features
+// first and noted as skipped rather than failing the run. What is NOT
+// optional is the contract: when features says false the wrapper throws a
+// message rather than jumping through a null pointer.
+report('GL vertex arrays, instancing and multiple render targets', () => {
+    const W = 64;
+    const { gpu, surf, gl } = glSurface(W, { format: dri.FORMAT.ARGB8888, depthSize: 24 });
+    const glOk = what => {
+        const e = gl.getError();
+        assert.strictEqual(e, gl.NO_ERROR, `${what}: GL error 0x${e.toString(16)}`);
+    };
+    const px = new Uint8Array(W * W * 4);
+    const read = () => gl.readPixels(0, 0, W, W, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    const at = (x, y) => {
+        const o = (y * W + x) * 4;
+        return [px[o], px[o + 1], px[o + 2]];
+    };
+    const near = (got, want, tol) => got.every((c, i) => Math.abs(c - want[i]) <= (tol || 4));
+
+    const features = gpu.features;
+    assert.ok(features && typeof features.vertexArrayObject === 'boolean',
+        `makeCurrent reports features: ${JSON.stringify(features)}`);
+    // whatever is missing must say so, not crash
+    if (!features.vertexArrayObject)
+        assert.throws(() => gl.createVertexArray(), /not available/);
+    if (!features.instancedArrays)
+        assert.throws(() => gl.vertexAttribDivisor(0, 1), /not available/);
+    if (!features.drawBuffers)
+        assert.throws(() => gl.drawBuffers([gl.COLOR_ATTACHMENT0]), /not available/);
+
+    const quadData = new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]);
+    const quad = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, quad);
+    gl.bufferData(gl.ARRAY_BUFFER, quadData, gl.STATIC_DRAW);
+
+    const done = [];
+
+    // A vertex array object captures the attribute state set while it is
+    // bound, so tearing that state down afterwards and rebinding the object
+    // has to bring it back — which is what the second draw proves.
+    if (features.vertexArrayObject) {
+        const p = buildProgram(gl,
+            'attribute vec2 position;\nvoid main() { gl_Position = vec4(position * 0.5, 0.0, 1.0); }',
+            'precision mediump float;\nvoid main() { gl_FragColor = vec4(0.0, 1.0, 0.0, 1.0); }');
+        gl.useProgram(p);
+        const loc = gl.getAttribLocation(p, 'position');
+        const vao = gl.createVertexArray();
+        assert.strictEqual(gl.isVertexArray(vao), false, 'a name is not an object until bound');
+        gl.bindVertexArray(vao);
+        gl.bindBuffer(gl.ARRAY_BUFFER, quad);
+        gl.enableVertexAttribArray(loc);
+        gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+        assert.strictEqual(gl.isVertexArray(vao), true);
+        assert.strictEqual(gl.getParameter(gl.VERTEX_ARRAY_BINDING), vao);
+        gl.bindVertexArray(0);
+        assert.strictEqual(gl.getParameter(gl.VERTEX_ARRAY_BINDING), 0);
+        // dismantle the default vertex array's state, so a rebind is the only
+        // thing that could make the draw work
+        gl.disableVertexAttribArray(loc);
+        gl.bindBuffer(gl.ARRAY_BUFFER, 0);
+        gl.clearColor(0, 0, 0, 1);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        gl.bindVertexArray(vao);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        read();
+        assert.ok(near(at(32, 32), [0, 255, 0]), `the object restored its state: ${at(32, 32)}`);
+        assert.ok(near(at(4, 4), [0, 0, 0]), `and only where it should: ${at(4, 4)}`);
+        gl.bindVertexArray(0);
+        gl.deleteVertexArray(vao);
+        assert.strictEqual(gl.isVertexArray(vao), false, 'deleted');
+        glOk('vertex array objects');
+        done.push('VAO');
+    }
+
+    // One draw call, four quads, differing only by attributes marked as
+    // advancing per instance rather than per vertex.
+    if (features.instancedArrays) {
+        const p = buildProgram(gl,
+            'attribute vec2 position;\nattribute vec2 aOffset;\nattribute vec3 aColor;\n' +
+            'varying vec3 vColor;\n' +
+            'void main() {\n' +
+            '  vColor = aColor;\n' +
+            '  gl_Position = vec4(position * 0.2 + aOffset, 0.0, 1.0);\n}',
+            'precision mediump float;\nvarying vec3 vColor;\n' +
+            'void main() { gl_FragColor = vec4(vColor, 1.0); }');
+        gl.useProgram(p);
+        const pos = gl.getAttribLocation(p, 'position');
+        gl.bindBuffer(gl.ARRAY_BUFFER, quad);
+        gl.enableVertexAttribArray(pos);
+        gl.vertexAttribPointer(pos, 2, gl.FLOAT, false, 0, 0);
+        gl.vertexAttribDivisor(pos, 0);
+
+        const corners = [[-0.5, -0.5], [0.5, -0.5], [-0.5, 0.5], [0.5, 0.5]];
+        const colors = [[1, 0, 0], [0, 1, 0], [0, 0, 1], [1, 1, 0]];
+        const perInstance = (data, name, size) => {
+            const b = gl.createBuffer();
+            gl.bindBuffer(gl.ARRAY_BUFFER, b);
+            gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(data.flat()), gl.STATIC_DRAW);
+            const l = gl.getAttribLocation(p, name);
+            gl.enableVertexAttribArray(l);
+            gl.vertexAttribPointer(l, size, gl.FLOAT, false, 0, 0);
+            gl.vertexAttribDivisor(l, 1);
+            assert.strictEqual(gl.getVertexAttrib(l, gl.VERTEX_ATTRIB_ARRAY_DIVISOR), 1);
+            return l;
+        };
+        const offLoc = perInstance(corners, 'aOffset', 2);
+        const colLoc = perInstance(colors, 'aColor', 3);
+        gl.clearColor(0, 0, 0, 1);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, 4);
+        read();
+        // NDC (-0.5,-0.5) is a quarter across and a quarter up, and readPixels
+        // is bottom-up, so instance 0 sits at (16,16)
+        assert.ok(near(at(16, 16), colors[0].map(c => c * 255)), `instance 0: ${at(16, 16)}`);
+        assert.ok(near(at(48, 16), colors[1].map(c => c * 255)), `instance 1: ${at(48, 16)}`);
+        assert.ok(near(at(16, 48), colors[2].map(c => c * 255)), `instance 2: ${at(16, 48)}`);
+        assert.ok(near(at(48, 48), colors[3].map(c => c * 255)), `instance 3: ${at(48, 48)}`);
+        assert.ok(near(at(32, 32), [0, 0, 0]), `and nothing between them: ${at(32, 32)}`);
+
+        // fewer instances than there are offsets: only the first two draw
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, 2);
+        read();
+        assert.ok(near(at(16, 16), [255, 0, 0]), 'instance 0 still there');
+        assert.ok(near(at(16, 48), [0, 0, 0]), 'instance 2 was not asked for');
+
+        // indexed instancing draws the same thing through an index buffer
+        const idx = gl.createBuffer();
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idx);
+        gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array([0, 1, 2, 2, 1, 3]),
+            gl.STATIC_DRAW);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        gl.drawElementsInstanced(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0, 4);
+        read();
+        assert.ok(near(at(48, 48), [255, 255, 0]), `indexed instance 3: ${at(48, 48)}`);
+        glOk('instanced drawing');
+
+        gl.vertexAttribDivisor(offLoc, 0);
+        gl.vertexAttribDivisor(colLoc, 0);
+        gl.disableVertexAttribArray(offLoc);
+        gl.disableVertexAttribArray(colLoc);
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, 0);
+        done.push('instancing');
+    }
+
+    // Two colour attachments written by one fragment shader in one pass.
+    // ES 2.0 has no glReadBuffer, so each attachment is read back through a
+    // framebuffer that has only that texture on attachment 0.
+    if (features.drawBuffers) {
+        assert.ok(gl.getParameter(gl.MAX_DRAW_BUFFERS) >= 2,
+            'a driver with drawBuffers has at least two of them');
+        const S = 32;
+        const targets = [0, 1].map(() => {
+            const t = gl.createTexture();
+            gl.bindTexture(gl.TEXTURE_2D, t);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, S, S, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+            return t;
+        });
+        const fbo = gl.createFramebuffer();
+        gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, targets[0], 0);
+        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1, gl.TEXTURE_2D, targets[1], 0);
+        assert.strictEqual(gl.checkFramebufferStatus(gl.FRAMEBUFFER), gl.FRAMEBUFFER_COMPLETE);
+        gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1]);
+
+        const p = buildProgram(gl,
+            'attribute vec2 position;\nvoid main() { gl_Position = vec4(position, 0.0, 1.0); }',
+            '#extension GL_EXT_draw_buffers : require\n' +
+            'precision mediump float;\n' +
+            'void main() {\n' +
+            '  gl_FragData[0] = vec4(1.0, 0.0, 0.0, 1.0);\n' +
+            '  gl_FragData[1] = vec4(0.0, 0.0, 1.0, 1.0);\n}');
+        gl.useProgram(p);
+        gl.bindBuffer(gl.ARRAY_BUFFER, quad);
+        const loc = gl.getAttribLocation(p, 'position');
+        gl.enableVertexAttribArray(loc);
+        gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+        gl.viewport(0, 0, S, S);
+        gl.clearColor(0, 0, 0, 1);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        glOk('drawBuffers');
+
+        const one = gl.createFramebuffer();
+        const readTarget = t => {
+            gl.bindFramebuffer(gl.FRAMEBUFFER, one);
+            gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
+            const out = new Uint8Array(S * S * 4);
+            gl.readPixels(0, 0, S, S, gl.RGBA, gl.UNSIGNED_BYTE, out);
+            return [out[0], out[1], out[2]];
+        };
+        assert.ok(near(readTarget(targets[0]), [255, 0, 0]),
+            `attachment 0 took gl_FragData[0]: ${readTarget(targets[0])}`);
+        assert.ok(near(readTarget(targets[1]), [0, 0, 255]),
+            `attachment 1 took gl_FragData[1]: ${readTarget(targets[1])}`);
+
+        // NONE in a slot takes that attachment out of the pass entirely: not
+        // just the draw, but the clear too, so attachment 1 comes through
+        // holding what the previous pass left in it.
+        gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+        gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.NONE]);
+        gl.clearColor(0, 1, 0, 1);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        assert.ok(near(readTarget(targets[0]), [255, 0, 0]), 'attachment 0 was still written');
+        assert.ok(near(readTarget(targets[1]), [0, 0, 255]),
+            `attachment 1 was left alone: ${readTarget(targets[1])}`);
+        glOk('drawBuffers with NONE');
+
+        gl.bindFramebuffer(gl.FRAMEBUFFER, 0);
+        gl.viewport(0, 0, W, W);
+        gl.deleteFramebuffer(fbo);
+        gl.deleteFramebuffer(one);
+        targets.forEach(t => gl.deleteTexture(t));
+        done.push('MRT');
+    }
+
+    surf.destroy();
+    gpu.destroy();
+    return done.length ? done.join(', ') : 'none of the three offered by this driver';
+});
+
 process.exitCode = failures ? 1 : 0;
 console.log(failures ? `${failures} failure(s)` : 'all good');
