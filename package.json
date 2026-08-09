@@ -1,6 +1,6 @@
 {
   "name": "x11-dri",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Optional native companion to the pure-JS x11 package: direct OpenGL ES rendering (GBM/EGL, dlopen'd at runtime) and dma-buf plumbing (udmabuf, DMA_BUF sync, dup) for the DRI3 + Present path. The rendering and dma-buf paths are Linux-only; builds and loads on macOS, where it reports them unavailable.",
   "author": "Andrey Sidorov <andrey.sidorov@gmail.com>",
   "license": "MIT",
