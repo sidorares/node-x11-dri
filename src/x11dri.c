@@ -163,6 +163,27 @@ static void obj_set(napi_env env, napi_value obj, const char *k, napi_value v) {
     napi_set_named_property(env, obj, k, v);
 }
 
+// A TypedArray as raw bytes. GL sizes its buffer and pixel uploads in bytes,
+// while napi reports a length in elements, so the view's element size has to
+// come back into it — getting that wrong uploads a fraction of the data.
+static bool typed_bytes(napi_env env, napi_value v, void **data, size_t *nbytes) {
+    napi_typedarray_type type;
+    size_t len;
+    if (napi_get_typedarray_info(env, v, &type, &len, data, NULL, NULL) != napi_ok)
+        return false;
+    size_t elem;
+    switch (type) {
+        case napi_float64_array: case napi_bigint64_array:
+        case napi_biguint64_array:                            elem = 8; break;
+        case napi_float32_array: case napi_int32_array:
+        case napi_uint32_array:                               elem = 4; break;
+        case napi_int16_array: case napi_uint16_array:        elem = 2; break;
+        default:                                              elem = 1; break;
+    }
+    *nbytes = len * elem;
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Minimal GBM / EGL / GLES declarations (stable ABI, from gbm.h / egl.h / gl2.h)
 // ---------------------------------------------------------------------------
@@ -372,6 +393,33 @@ static struct {
     void (*GetIntegerv)(GLenum, GLint *);
     void (*GetFloatv)(GLenum, GLfloat *);
     void (*GetBooleanv)(GLenum, GLboolean *);
+    // introspection: what a linked program declares, and what an object holds
+    void (*GetActiveUniform)(GLuint, GLuint, GLsizei, GLsizei *, GLint *, GLenum *, GLchar *);
+    void (*GetActiveAttrib)(GLuint, GLuint, GLsizei, GLsizei *, GLint *, GLenum *, GLchar *);
+    void (*GetUniformfv)(GLuint, GLint, GLfloat *);
+    void (*GetUniformiv)(GLuint, GLint, GLint *);
+    void (*GetVertexAttribfv)(GLuint, GLenum, GLfloat *);
+    void (*GetVertexAttribiv)(GLuint, GLenum, GLint *);
+    void (*GetVertexAttribPointerv)(GLuint, GLenum, void **);
+    void (*GetBufferParameteriv)(GLenum, GLenum, GLint *);
+    void (*GetTexParameteriv)(GLenum, GLenum, GLint *);
+    void (*GetAttachedShaders)(GLuint, GLsizei, GLsizei *, GLuint *);
+    void (*GetShaderPrecisionFormat)(GLenum, GLenum, GLint *, GLint *);
+    void (*GetShaderSource)(GLuint, GLsizei, GLsizei *, GLchar *);
+    void (*GetFramebufferAttachmentParameteriv)(GLenum, GLenum, GLenum, GLint *);
+    void (*GetRenderbufferParameteriv)(GLenum, GLenum, GLint *);
+    void (*ValidateProgram)(GLuint);
+    GLboolean (*IsBuffer)(GLuint);
+    GLboolean (*IsEnabled)(GLenum);
+    GLboolean (*IsFramebuffer)(GLuint);
+    GLboolean (*IsProgram)(GLuint);
+    GLboolean (*IsRenderbuffer)(GLuint);
+    GLboolean (*IsShader)(GLuint);
+    GLboolean (*IsTexture)(GLuint);
+    // compressed texture images (the entry points are core ES 2.0; which
+    // formats they accept is per-driver, from the extension string)
+    void (*CompressedTexImage2D)(GLenum, GLint, GLenum, GLsizei, GLsizei, GLint, GLsizei, const void *);
+    void (*CompressedTexSubImage2D)(GLenum, GLint, GLint, GLint, GLsizei, GLsizei, GLenum, GLsizei, const void *);
 } gl;
 
 static const char *load_gbm(void) {
@@ -521,6 +569,26 @@ static const char *load_gles(void) {
     S(RenderbufferStorage, "glRenderbufferStorage");
     S(GetIntegerv, "glGetIntegerv"); S(GetFloatv, "glGetFloatv");
     S(GetBooleanv, "glGetBooleanv");
+    S(GetActiveUniform, "glGetActiveUniform");
+    S(GetActiveAttrib, "glGetActiveAttrib");
+    S(GetUniformfv, "glGetUniformfv"); S(GetUniformiv, "glGetUniformiv");
+    S(GetVertexAttribfv, "glGetVertexAttribfv");
+    S(GetVertexAttribiv, "glGetVertexAttribiv");
+    S(GetVertexAttribPointerv, "glGetVertexAttribPointerv");
+    S(GetBufferParameteriv, "glGetBufferParameteriv");
+    S(GetTexParameteriv, "glGetTexParameteriv");
+    S(GetAttachedShaders, "glGetAttachedShaders");
+    S(GetShaderPrecisionFormat, "glGetShaderPrecisionFormat");
+    S(GetShaderSource, "glGetShaderSource");
+    S(GetFramebufferAttachmentParameteriv, "glGetFramebufferAttachmentParameteriv");
+    S(GetRenderbufferParameteriv, "glGetRenderbufferParameteriv");
+    S(ValidateProgram, "glValidateProgram");
+    S(IsBuffer, "glIsBuffer"); S(IsEnabled, "glIsEnabled");
+    S(IsFramebuffer, "glIsFramebuffer"); S(IsProgram, "glIsProgram");
+    S(IsRenderbuffer, "glIsRenderbuffer"); S(IsShader, "glIsShader");
+    S(IsTexture, "glIsTexture");
+    S(CompressedTexImage2D, "glCompressedTexImage2D");
+    S(CompressedTexSubImage2D, "glCompressedTexSubImage2D");
 #undef S
     gl.lib = h;
     return NULL;
@@ -1062,15 +1130,11 @@ static napi_value Gl_bindBuffer(napi_env env, napi_callback_info info) {
 }
 static napi_value Gl_bufferData(napi_env env, napi_callback_info info) {
     GET_ARGS(env, info, 3); NEED_GL(env);
-    size_t len;
     void *data;
-    napi_typedarray_type type;
-    if (napi_get_typedarray_info(env, args[1], &type, &len, &data, NULL, NULL) != napi_ok)
+    size_t nbytes;
+    if (!typed_bytes(env, args[1], &data, &nbytes))
         THROW(env, "bufferData expects a TypedArray");
-    size_t elem = (type == napi_float32_array || type == napi_int32_array ||
-                   type == napi_uint32_array) ? 4
-                : (type == napi_int16_array || type == napi_uint16_array) ? 2 : 1;
-    gl.BufferData(arg_u32(env, args[0]), (GLsizeiptr)(len * elem), data,
+    gl.BufferData(arg_u32(env, args[0]), (GLsizeiptr)nbytes, data,
                   arg_u32(env, args[2]));
     return NULL;
 }
@@ -1210,6 +1274,41 @@ static napi_value Gl_texParameterf(napi_env env, napi_callback_info info) {
 static napi_value Gl_generateMipmap(napi_env env, napi_callback_info info) {
     GET_ARGS(env, info, 1); NEED_GL(env);
     gl.GenerateMipmap(arg_u32(env, args[0]));
+    return NULL;
+}
+
+// Compressed texture images. The data is passed through to the driver
+// untouched — the block layout is the format's business, not ours, and the
+// byte count comes from the view rather than from a size computed here.
+// Which `internalformat` values are legal is a per-driver list; ask
+// getSupportedExtensions()/COMPRESSED_TEXTURE_FORMATS before uploading one.
+//
+// compressedTexImage2D(target, level, internalformat, width, height, border,
+//                      data)
+static napi_value Gl_compressedTexImage2D(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 7); NEED_GL(env);
+    void *data;
+    size_t nbytes;
+    if (!typed_bytes(env, args[6], &data, &nbytes))
+        THROW(env, "compressedTexImage2D expects a TypedArray of compressed data");
+    gl.CompressedTexImage2D(arg_u32(env, args[0]), arg_i32(env, args[1]),
+                            arg_u32(env, args[2]), arg_i32(env, args[3]),
+                            arg_i32(env, args[4]), arg_i32(env, args[5]),
+                            (GLsizei)nbytes, data);
+    return NULL;
+}
+// compressedTexSubImage2D(target, level, xoffset, yoffset, width, height,
+//                         format, data)
+static napi_value Gl_compressedTexSubImage2D(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 8); NEED_GL(env);
+    void *data;
+    size_t nbytes;
+    if (!typed_bytes(env, args[7], &data, &nbytes))
+        THROW(env, "compressedTexSubImage2D expects a TypedArray of compressed data");
+    gl.CompressedTexSubImage2D(arg_u32(env, args[0]), arg_i32(env, args[1]),
+                               arg_i32(env, args[2]), arg_i32(env, args[3]),
+                               arg_i32(env, args[4]), arg_i32(env, args[5]),
+                               arg_u32(env, args[6]), (GLsizei)nbytes, data);
     return NULL;
 }
 
@@ -1421,16 +1520,12 @@ static napi_value Gl_vertexAttrib4f(napi_env env, napi_callback_info info) {
 // which is how a geometry that changes every frame avoids a reallocation
 static napi_value Gl_bufferSubData(napi_env env, napi_callback_info info) {
     GET_ARGS(env, info, 3); NEED_GL(env);
-    size_t len;
     void *data;
-    napi_typedarray_type type;
-    if (napi_get_typedarray_info(env, args[2], &type, &len, &data, NULL, NULL) != napi_ok)
+    size_t nbytes;
+    if (!typed_bytes(env, args[2], &data, &nbytes))
         THROW(env, "bufferSubData expects a TypedArray");
-    size_t elem = (type == napi_float32_array || type == napi_int32_array ||
-                   type == napi_uint32_array) ? 4
-                : (type == napi_int16_array || type == napi_uint16_array) ? 2 : 1;
     gl.BufferSubData(arg_u32(env, args[0]), (GLintptr)arg_i32(env, args[1]),
-                     (GLsizeiptr)(len * elem), data);
+                     (GLsizeiptr)nbytes, data);
     return NULL;
 }
 
@@ -1542,6 +1637,21 @@ static napi_value Gl_getParameter(napi_env env, napi_callback_info info) {
             }
             return out;
         }
+        // a run of ints whose length only the driver knows
+        case 0x86A3: { // COMPRESSED_TEXTURE_FORMATS
+            GLint n = 0;
+            gl.GetIntegerv(0x86A2 /* NUM_COMPRESSED_TEXTURE_FORMATS */, &n);
+            if (n < 0) n = 0;
+            GLint *v = calloc((size_t)n + 1, sizeof(GLint));
+            if (!v) THROW(env, "getParameter: out of memory");
+            if (n) gl.GetIntegerv(pname, v);
+            out = NULL; // see getAttachedShaders on the unchecked statuses
+            napi_create_array_with_length(env, (size_t)n, &out);
+            for (GLint i = 0; i < n; i++)
+                napi_set_element(env, out, (uint32_t)i, mk_i32(env, v[i]));
+            free(v);
+            return out;
+        }
         // four booleans
         case 0x0C23: { // COLOR_WRITEMASK
             GLboolean v[4] = { 0, 0, 0, 0 };
@@ -1579,6 +1689,238 @@ static napi_value Gl_getBooleanv(napi_env env, napi_callback_info info) {
     gl.GetBooleanv(arg_u32(env, args[0]), &v);
     return mk_bool(env, v != 0);
 }
+
+// --- introspection ---------------------------------------------------------
+//
+// What a linked program declares, and what an object currently holds. All of
+// it is core ES 2.0; the shapes follow WebGL, so `getActiveUniform` answers
+// { name, size, type } rather than filling caller-supplied out-parameters.
+
+// getActiveUniform and getActiveAttrib differ only in which entry point and
+// which pair of program properties they read. Both size the name buffer from
+// the program's own longest name, and both answer null for an out-of-range
+// index rather than raising GL_INVALID_VALUE — walking indices upward until
+// null is a natural way to enumerate, and it should not disturb getError().
+static napi_value active_var(napi_env env, napi_callback_info info, int uniform) {
+    GET_ARGS(env, info, 2); NEED_GL(env);
+    GLuint program = arg_u32(env, args[0]);
+    GLuint index = arg_u32(env, args[1]);
+    GLint count = 0, maxlen = 0;
+    gl.GetProgramiv(program, uniform ? 0x8B86 /* ACTIVE_UNIFORMS */
+                                     : 0x8B89 /* ACTIVE_ATTRIBUTES */, &count);
+    if (count <= 0 || index >= (GLuint)count) {
+        napi_value nul;
+        NAPI_CALL(env, napi_get_null(env, &nul));
+        return nul;
+    }
+    gl.GetProgramiv(program, uniform ? 0x8B87 /* ACTIVE_UNIFORM_MAX_LENGTH */
+                                     : 0x8B8A /* ACTIVE_ATTRIBUTE_MAX_LENGTH */,
+                    &maxlen);
+    if (maxlen < 1) maxlen = 1;
+    char *buf = calloc(1, (size_t)maxlen + 1);
+    if (!buf) THROW(env, "getActive*: out of memory");
+    GLint size = 0;
+    GLenum type = 0;
+    if (uniform)
+        gl.GetActiveUniform(program, index, maxlen + 1, NULL, &size, &type, buf);
+    else
+        gl.GetActiveAttrib(program, index, maxlen + 1, NULL, &size, &type, buf);
+    napi_value obj;
+    if (napi_create_object(env, &obj) != napi_ok) {
+        free(buf);
+        THROW(env, "napi_create_object failed");
+    }
+    obj_set(env, obj, "name", mk_str(env, buf));
+    obj_set(env, obj, "size", mk_i32(env, size));
+    obj_set(env, obj, "type", mk_u32(env, type));
+    free(buf);
+    return obj;
+}
+static napi_value Gl_getActiveUniform(napi_env env, napi_callback_info info) {
+    return active_var(env, info, 1);
+}
+static napi_value Gl_getActiveAttrib(napi_env env, napi_callback_info info) {
+    return active_var(env, info, 0);
+}
+
+// getUniformfv/getUniformiv(program, location, count) -> [numbers]
+//
+// GL writes as many components as the uniform has and offers no way to ask
+// first, so the destination here is always wide enough for the largest thing
+// ES 2.0 can name (mat4, 16 floats) and `count` says how many of them to
+// hand back. index.js builds WebGL's getUniform() on top by asking the
+// program for the uniform's type.
+static napi_value uniform_value(napi_env env, napi_callback_info info, int as_float) {
+    GET_ARGS(env, info, 3); NEED_GL(env);
+    GLuint program = arg_u32(env, args[0]);
+    GLint location = arg_i32(env, args[1]);
+    uint32_t count = arg_u32(env, args[2]);
+    if (count < 1 || count > 16)
+        THROW(env, "getUniform*: count must be between 1 and 16");
+    GLfloat fv[16] = { 0 };
+    GLint iv[16] = { 0 };
+    if (as_float) gl.GetUniformfv(program, location, fv);
+    else          gl.GetUniformiv(program, location, iv);
+    napi_value out;
+    NAPI_CALL(env, napi_create_array_with_length(env, count, &out));
+    for (uint32_t i = 0; i < count; i++) {
+        napi_value e;
+        if (as_float)
+            NAPI_CALL(env, napi_create_double(env, fv[i], &e));
+        else
+            e = mk_i32(env, iv[i]);
+        NAPI_CALL(env, napi_set_element(env, out, i, e));
+    }
+    return out;
+}
+static napi_value Gl_getUniformfv(napi_env env, napi_callback_info info) {
+    return uniform_value(env, info, 1);
+}
+static napi_value Gl_getUniformiv(napi_env env, napi_callback_info info) {
+    return uniform_value(env, info, 0);
+}
+
+// getVertexAttrib(index, pname) — typed the way the attribute state is:
+// booleans for the flags, four floats for the current generic value, and a
+// plain integer (buffer name, size, stride, type) for the rest.
+static napi_value Gl_getVertexAttrib(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 2); NEED_GL(env);
+    GLuint index = arg_u32(env, args[0]);
+    GLenum pname = arg_u32(env, args[1]);
+    switch (pname) {
+        case 0x8626: { // CURRENT_VERTEX_ATTRIB
+            GLfloat v[4] = { 0, 0, 0, 0 };
+            gl.GetVertexAttribfv(index, pname, v);
+            napi_value out;
+            NAPI_CALL(env, napi_create_array_with_length(env, 4, &out));
+            for (uint32_t i = 0; i < 4; i++) {
+                napi_value e;
+                NAPI_CALL(env, napi_create_double(env, v[i], &e));
+                NAPI_CALL(env, napi_set_element(env, out, i, e));
+            }
+            return out;
+        }
+        case 0x8622: case 0x886A: { // ARRAY_ENABLED, ARRAY_NORMALIZED
+            GLint v = 0;
+            gl.GetVertexAttribiv(index, pname, &v);
+            return mk_bool(env, v != 0);
+        }
+        default: {
+            GLint v = 0;
+            gl.GetVertexAttribiv(index, pname, &v);
+            return mk_i32(env, v);
+        }
+    }
+}
+// getVertexAttribOffset(index, pname) -> byte offset into the bound buffer
+// (client-side arrays do not exist here, so the pointer is always an offset)
+static napi_value Gl_getVertexAttribOffset(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 2); NEED_GL(env);
+    void *p = NULL;
+    gl.GetVertexAttribPointerv(arg_u32(env, args[0]), arg_u32(env, args[1]), &p);
+    return mk_i32(env, (int32_t)(intptr_t)p);
+}
+
+static napi_value Gl_getBufferParameter(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 2); NEED_GL(env);
+    GLint v = 0;
+    gl.GetBufferParameteriv(arg_u32(env, args[0]), arg_u32(env, args[1]), &v);
+    return mk_i32(env, v);
+}
+static napi_value Gl_getTexParameter(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 2); NEED_GL(env);
+    GLint v = 0;
+    gl.GetTexParameteriv(arg_u32(env, args[0]), arg_u32(env, args[1]), &v);
+    return mk_i32(env, v);
+}
+static napi_value Gl_getFramebufferAttachmentParameter(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 3); NEED_GL(env);
+    GLint v = 0;
+    gl.GetFramebufferAttachmentParameteriv(arg_u32(env, args[0]), arg_u32(env, args[1]),
+                                           arg_u32(env, args[2]), &v);
+    return mk_i32(env, v);
+}
+static napi_value Gl_getRenderbufferParameter(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 2); NEED_GL(env);
+    GLint v = 0;
+    gl.GetRenderbufferParameteriv(arg_u32(env, args[0]), arg_u32(env, args[1]), &v);
+    return mk_i32(env, v);
+}
+
+// getAttachedShaders(program) -> [shader, ...]
+static napi_value Gl_getAttachedShaders(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 1); NEED_GL(env);
+    GLuint program = arg_u32(env, args[0]);
+    GLint n = 0;
+    gl.GetProgramiv(program, 0x8B85 /* ATTACHED_SHADERS */, &n);
+    if (n < 0) n = 0;
+    GLuint *list = calloc((size_t)n + 1, sizeof(GLuint));
+    if (!list) THROW(env, "getAttachedShaders: out of memory");
+    GLsizei got = 0;
+    if (n) gl.GetAttachedShaders(program, n, &got, list);
+    // Nothing below can fail except under OOM, and the buffer has to be freed
+    // on the way out either way, so the statuses go unchecked here rather than
+    // through NAPI_CALL's early return.
+    napi_value out = NULL;
+    napi_create_array_with_length(env, (size_t)got, &out);
+    for (GLsizei i = 0; i < got; i++)
+        napi_set_element(env, out, (uint32_t)i, mk_u32(env, list[i]));
+    free(list);
+    return out;
+}
+
+// getShaderPrecisionFormat(shaderType, precisionType) ->
+//     { rangeMin, rangeMax, precision }
+static napi_value Gl_getShaderPrecisionFormat(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 2); NEED_GL(env);
+    GLint range[2] = { 0, 0 };
+    GLint precision = 0;
+    gl.GetShaderPrecisionFormat(arg_u32(env, args[0]), arg_u32(env, args[1]),
+                                range, &precision);
+    napi_value obj;
+    NAPI_CALL(env, napi_create_object(env, &obj));
+    obj_set(env, obj, "rangeMin", mk_i32(env, range[0]));
+    obj_set(env, obj, "rangeMax", mk_i32(env, range[1]));
+    obj_set(env, obj, "precision", mk_i32(env, precision));
+    return obj;
+}
+
+// getShaderSource(shader) -> the source GL kept, which is what it compiled
+static napi_value Gl_getShaderSource(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 1); NEED_GL(env);
+    GLuint shader = arg_u32(env, args[0]);
+    GLint len = 0;
+    gl.GetShaderiv(shader, 0x8B88 /* SHADER_SOURCE_LENGTH */, &len);
+    if (len < 0) len = 0;
+    char *buf = calloc(1, (size_t)len + 1);
+    if (!buf) THROW(env, "getShaderSource: out of memory");
+    gl.GetShaderSource(shader, len + 1, NULL, buf);
+    napi_value out = mk_str(env, buf);
+    free(buf);
+    return out;
+}
+
+static napi_value Gl_validateProgram(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 1); NEED_GL(env);
+    gl.ValidateProgram(arg_u32(env, args[0]));
+    return NULL;
+}
+
+// is*(object) — whether the name is live in this context. Every one of them
+// takes a single name, except isEnabled which takes a capability.
+#define IS_FN(jsname, glfn)                                                   \
+    static napi_value jsname(napi_env env, napi_callback_info info) {         \
+        GET_ARGS(env, info, 1); NEED_GL(env);                                 \
+        return mk_bool(env, gl.glfn(arg_u32(env, args[0])) != 0);             \
+    }
+IS_FN(Gl_isBuffer, IsBuffer)
+IS_FN(Gl_isEnabled, IsEnabled)
+IS_FN(Gl_isFramebuffer, IsFramebuffer)
+IS_FN(Gl_isProgram, IsProgram)
+IS_FN(Gl_isRenderbuffer, IsRenderbuffer)
+IS_FN(Gl_isShader, IsShader)
+IS_FN(Gl_isTexture, IsTexture)
+#undef IS_FN
 
 // ---------------------------------------------------------------------------
 // dma-buf plumbing: udmabuf, DMA_BUF_IOCTL_SYNC, dup
@@ -1854,6 +2196,31 @@ NAPI_MODULE_INIT() {
     EXPORT("glGetIntegerv", Gl_getIntegerv);
     EXPORT("glGetFloatv", Gl_getFloatv);
     EXPORT("glGetBooleanv", Gl_getBooleanv);
+
+    EXPORT("glCompressedTexImage2D", Gl_compressedTexImage2D);
+    EXPORT("glCompressedTexSubImage2D", Gl_compressedTexSubImage2D);
+
+    EXPORT("glGetActiveUniform", Gl_getActiveUniform);
+    EXPORT("glGetActiveAttrib", Gl_getActiveAttrib);
+    EXPORT("glGetUniformfv", Gl_getUniformfv);
+    EXPORT("glGetUniformiv", Gl_getUniformiv);
+    EXPORT("glGetVertexAttrib", Gl_getVertexAttrib);
+    EXPORT("glGetVertexAttribOffset", Gl_getVertexAttribOffset);
+    EXPORT("glGetBufferParameter", Gl_getBufferParameter);
+    EXPORT("glGetTexParameter", Gl_getTexParameter);
+    EXPORT("glGetFramebufferAttachmentParameter", Gl_getFramebufferAttachmentParameter);
+    EXPORT("glGetRenderbufferParameter", Gl_getRenderbufferParameter);
+    EXPORT("glGetAttachedShaders", Gl_getAttachedShaders);
+    EXPORT("glGetShaderPrecisionFormat", Gl_getShaderPrecisionFormat);
+    EXPORT("glGetShaderSource", Gl_getShaderSource);
+    EXPORT("glValidateProgram", Gl_validateProgram);
+    EXPORT("glIsBuffer", Gl_isBuffer);
+    EXPORT("glIsEnabled", Gl_isEnabled);
+    EXPORT("glIsFramebuffer", Gl_isFramebuffer);
+    EXPORT("glIsProgram", Gl_isProgram);
+    EXPORT("glIsRenderbuffer", Gl_isRenderbuffer);
+    EXPORT("glIsShader", Gl_isShader);
+    EXPORT("glIsTexture", Gl_isTexture);
 #undef EXPORT
     return exports;
 }
