@@ -915,5 +915,237 @@ report('GL ES 3.0 context selection', () => {
     return note;
 });
 
+// 3D textures, array textures and immutable storage. The distinction the
+// pixels have to show is that TEXTURE_3D filters across its third axis while
+// TEXTURE_2D_ARRAY does not — same call, same data, different target, and a
+// wrapper that mixed the two up would still run.
+report('GL 3D textures, array textures and immutable storage', () => {
+    const W = 64;
+    const { gpu, surf, gl } = glSurface(W, { format: dri.FORMAT.ARGB8888, depthSize: 24 });
+    const glOk = what => {
+        const e = gl.getError();
+        assert.strictEqual(e, gl.NO_ERROR, `${what}: GL error 0x${e.toString(16)}`);
+    };
+    const px = new Uint8Array(W * W * 4);
+    const read = () => gl.readPixels(0, 0, W, W, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    const at = (x, y) => {
+        const o = (y * W + x) * 4;
+        return [px[o], px[o + 1], px[o + 2]];
+    };
+    const near = (got, want, tol) => got.every((c, i) => Math.abs(c - want[i]) <= (tol || 4));
+
+    if (!gpu.features.texture3D) {
+        assert.throws(() => gl.texImage3D(gl.TEXTURE_3D, 0, gl.RGBA, 1, 1, 1, 0,
+            gl.RGBA, gl.UNSIGNED_BYTE, null), /not available/);
+        surf.destroy();
+        gpu.destroy();
+        return 'no 3D textures on this driver';
+    }
+    // The sampler side needs GLSL ES 3.00: sampler2DArray does not exist in
+    // ES 1.00, and GL_OES_texture_3D only brings the 3D half.
+    if (gpu.glVersion.major < 3) {
+        surf.destroy();
+        gpu.destroy();
+        return 'entry points present, but no GLSL ES 3.00 to sample them with';
+    }
+
+    const VS = '#version 300 es\n' +
+        'layout(location = 0) in vec2 position;\n' +
+        'out vec2 vUv;\n' +
+        'void main() { vUv = position * 0.5 + 0.5; gl_Position = vec4(position, 0.0, 1.0); }';
+    const quad = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, quad);
+    gl.bufferData(gl.ARRAY_BUFFER,
+        new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+
+    const solidLayers = colors => {
+        const out = new Uint8Array(colors.length * 4 * 4); // 2x2 RGBA per layer
+        colors.forEach(([r, g, b], i) => {
+            for (let t = 0; t < 4; t++) {
+                const o = (i * 4 + t) * 4;
+                out[o] = r; out[o + 1] = g; out[o + 2] = b; out[o + 3] = 255;
+            }
+        });
+        return out;
+    };
+    const red = [255, 0, 0], green = [0, 255, 0], blue = [0, 0, 255], yellow = [255, 255, 0];
+
+    // --- a 2D array texture: four layers, addressed by index ---------------
+    const arrayProgram = buildProgram(gl, VS, '#version 300 es\n' +
+        'precision mediump float;\nprecision mediump sampler2DArray;\n' +
+        'uniform sampler2DArray uTex;\nuniform float uLayer;\n' +
+        'in vec2 vUv;\nlayout(location = 0) out vec4 fragColor;\n' +
+        'void main() { fragColor = texture(uTex, vec3(vUv, uLayer)); }');
+    gl.useProgram(arrayProgram);
+    const arr = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, arr);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    gl.texImage3D(gl.TEXTURE_2D_ARRAY, 0, gl.RGBA, 2, 2, 4, 0, gl.RGBA, gl.UNSIGNED_BYTE,
+        solidLayers([red, green, blue, yellow]));
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    glOk('texImage3D(TEXTURE_2D_ARRAY)');
+    assert.strictEqual(gl.getParameter(gl.TEXTURE_BINDING_2D_ARRAY), arr);
+
+    gl.uniform1i(gl.getUniformLocation(arrayProgram, 'uTex'), 0);
+    const uLayer = gl.getUniformLocation(arrayProgram, 'uLayer');
+    const drawLayer = (layer, x, y) => {
+        gl.viewport(x, y, 32, 32);
+        gl.uniform1f(uLayer, layer);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    };
+    gl.clearColor(0, 0, 0, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    drawLayer(0, 0, 0);
+    drawLayer(1, 32, 0);
+    drawLayer(2, 0, 32);
+    drawLayer(3, 32, 32);
+    read();
+    assert.ok(near(at(16, 16), red), `layer 0: ${at(16, 16)}`);
+    assert.ok(near(at(48, 16), green), `layer 1: ${at(48, 16)}`);
+    assert.ok(near(at(16, 48), blue), `layer 2: ${at(16, 48)}`);
+    assert.ok(near(at(48, 48), yellow), `layer 3: ${at(48, 48)}`);
+
+    // The defining property: layers are not filtered between. A fractional
+    // index rounds to one layer rather than blending two.
+    gl.viewport(0, 0, W, W);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.uniform1f(uLayer, 0.4);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    read();
+    assert.ok(near(at(32, 32), red), `layer 0.4 rounds to layer 0, unblended: ${at(32, 32)}`);
+    glOk('array layer selection');
+
+    // one layer replaced in place
+    gl.texSubImage3D(gl.TEXTURE_2D_ARRAY, 0, 0, 0, 1, 2, 2, 1, gl.RGBA, gl.UNSIGNED_BYTE,
+        solidLayers([[255, 0, 255]]));
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.uniform1f(uLayer, 1);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    read();
+    assert.ok(near(at(32, 32), [255, 0, 255]), `after texSubImage3D: ${at(32, 32)}`);
+    glOk('texSubImage3D');
+
+    // --- a 3D texture: the third axis filters ------------------------------
+    const volumeProgram = buildProgram(gl, VS, '#version 300 es\n' +
+        'precision mediump float;\nprecision mediump sampler3D;\n' +
+        'uniform sampler3D uTex;\nuniform float uR;\n' +
+        'in vec2 vUv;\nlayout(location = 0) out vec4 fragColor;\n' +
+        'void main() { fragColor = texture(uTex, vec3(vUv, uR)); }');
+    gl.useProgram(volumeProgram);
+    const vol = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_3D, vol);
+    gl.texImage3D(gl.TEXTURE_3D, 0, gl.RGBA, 2, 2, 2, 0, gl.RGBA, gl.UNSIGNED_BYTE,
+        solidLayers([red, blue]));
+    gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE);
+    glOk('texImage3D(TEXTURE_3D)');
+    gl.uniform1i(gl.getUniformLocation(volumeProgram, 'uTex'), 0);
+    const uR = gl.getUniformLocation(volumeProgram, 'uR');
+    const sampleAt = r => {
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        gl.uniform1f(uR, r);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        read();
+        return at(32, 32);
+    };
+    assert.ok(near(sampleAt(0.0), red), `the near slice: ${sampleAt(0.0)}`);
+    assert.ok(near(sampleAt(1.0), blue), `the far slice: ${sampleAt(1.0)}`);
+    // texel centres sit at r = 0.25 and 0.75, so the midpoint is an even mix
+    assert.ok(near(sampleAt(0.5), [128, 0, 128], 6),
+        `halfway is a blend, which an array texture would not do: ${sampleAt(0.5)}`);
+    glOk('3D filtering');
+
+    // --- rendering into one layer ------------------------------------------
+    const flat = buildProgram(gl, VS, '#version 300 es\n' +
+        'precision mediump float;\nuniform vec4 uColor;\n' +
+        'in vec2 vUv;\nlayout(location = 0) out vec4 fragColor;\n' +
+        'void main() { fragColor = uColor; }');
+    const rt = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, rt);
+    gl.texImage3D(gl.TEXTURE_2D_ARRAY, 0, gl.RGBA, 32, 32, 3, 0, gl.RGBA,
+        gl.UNSIGNED_BYTE, new Uint8Array(32 * 32 * 3 * 4));
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    const fbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, rt, 0, 1);
+    assert.strictEqual(gl.checkFramebufferStatus(gl.FRAMEBUFFER), gl.FRAMEBUFFER_COMPLETE,
+        'one layer of an array texture is a complete attachment');
+    gl.useProgram(flat);
+    gl.uniform4f(gl.getUniformLocation(flat, 'uColor'), 0, 1, 1, 1);
+    gl.viewport(0, 0, 32, 32);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, 0);
+    gl.viewport(0, 0, W, W);
+    glOk('framebufferTextureLayer');
+
+    gl.useProgram(arrayProgram);
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, rt);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.uniform1f(uLayer, 1);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    read();
+    assert.ok(near(at(32, 32), [0, 255, 255]), `layer 1 was drawn into: ${at(32, 32)}`);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.uniform1f(uLayer, 0);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    read();
+    assert.ok(near(at(32, 32), [0, 0, 0]), `and layer 0 was not: ${at(32, 32)}`);
+    glOk('rendering to a layer');
+
+    // --- immutable storage --------------------------------------------------
+    let storageNote = 'no texStorage';
+    if (gpu.features.textureStorage) {
+        const imm = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, imm);
+        gl.texStorage2D(gl.TEXTURE_2D, 3, gl.RGBA8, 4, 4);
+        glOk('texStorage2D');
+        assert.strictEqual(gl.getTexParameter(gl.TEXTURE_2D, gl.TEXTURE_IMMUTABLE_FORMAT), 1,
+            'the texture reports itself immutable');
+        // contents still change; shape does not
+        gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE,
+            new Uint8Array([1, 2, 3, 4]));
+        glOk('texSubImage2D into immutable storage');
+        gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, 8, 8);
+        assert.strictEqual(gl.getError(), gl.INVALID_OPERATION,
+            'a second allocation is refused, which is the whole point');
+
+        const immArray = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D_ARRAY, immArray);
+        gl.texStorage3D(gl.TEXTURE_2D_ARRAY, 1, gl.RGBA8, 2, 2, 4);
+        gl.texSubImage3D(gl.TEXTURE_2D_ARRAY, 0, 0, 0, 0, 2, 2, 4, gl.RGBA,
+            gl.UNSIGNED_BYTE, solidLayers([red, green, blue, yellow]));
+        gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+        glOk('texStorage3D + texSubImage3D');
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        gl.uniform1f(uLayer, 2);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        read();
+        assert.ok(near(at(32, 32), blue), `immutable array layer 2: ${at(32, 32)}`);
+        gl.deleteTexture(imm);
+        gl.deleteTexture(immArray);
+        storageNote = 'immutable storage';
+    }
+
+    const maxLayers = gl.getParameter(gl.MAX_ARRAY_TEXTURE_LAYERS);
+    const max3d = gl.getParameter(gl.MAX_3D_TEXTURE_SIZE);
+    gl.deleteFramebuffer(fbo);
+    gl.deleteTexture(arr);
+    gl.deleteTexture(vol);
+    gl.deleteTexture(rt);
+    surf.destroy();
+    gpu.destroy();
+    return `${maxLayers} layers, ${max3d}px volumes, ${storageNote}`;
+});
+
 process.exitCode = failures ? 1 : 0;
 console.log(failures ? `${failures} failure(s)` : 'all good');
