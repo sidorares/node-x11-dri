@@ -11,12 +11,16 @@ jobs:
   # the fd utilities, and reports the rest as skipped — which is exactly the
   # degradation contract this package promises on minimal hosts. The Mesa
   # runtime libraries are installed so probe() exercises real dlopen paths.
+  #
+  # macOS runs the same self-check for the other half of that contract: no
+  # dma-buf ABI at all, so the addon must still build, load, and explain
+  # itself rather than fail to install.
   build-test:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm]
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
         node-version: [18, 22, 26]
     steps:
       - uses: actions/checkout@v7
@@ -24,6 +28,7 @@ jobs:
         with:
           node-version: ${{ matrix.node-version }}
       - name: Install Mesa runtime libraries (dlopen targets)
+        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libgbm1 libegl1 libgles2
       - run: npm install
       - run: npm test
@@ -34,7 +39,7 @@ jobs:
   # compatibility baseline: binaries built there load on every current
   # distro. Official Node images link addons against libc only (distro
   # node-gyp setups may link libnode.so, which would not load elsewhere).
-  prebuild:
+  prebuild-linux:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -57,5 +62,39 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: prebuild-linux-${{ matrix.os == 'ubuntu-24.04-arm' && 'arm64' || 'x64' }}
+          path: prebuilds/
+          if-no-files-found: error
+
+  # The macOS prebuild. macos-latest is Apple Silicon, so this produces
+  # prebuilds/darwin-arm64. binding.gyp pins MACOSX_DEPLOYMENT_TARGET=11.0
+  # (the arm64 floor), and the addon links nothing but libSystem/libc++, so
+  # one Node-API binary covers every supported Node and macOS 11+.
+  prebuild-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 18
+      - run: npm install --build-from-source
+      - name: Package the binary as a prebuild
+        run: |
+          target="darwin-$(node -p process.arch)"
+          mkdir -p "prebuilds/$target"
+          cp build/Release/x11dri.node "prebuilds/$target/"
+          strip -x "prebuilds/$target/x11dri.node"   # -x: keep the exported symbols
+          rm -rf build
+          node -e "require('./index.js').probe()"    # loads via the prebuild
+          # A prebuild that pulled in a Node library, Homebrew, or XQuartz
+          # would only load on the machine that built it.
+          otool -L "prebuilds/$target/x11dri.node"
+          if otool -L "prebuilds/$target/x11dri.node" | grep -qE 'libnode|/opt/homebrew|/usr/local/lib|/opt/X11'; then
+            echo "prebuild links a non-system library — not portable"; exit 1
+          fi
+          lipo -archs "prebuilds/$target/x11dri.node"
+          ls -la "prebuilds/$target"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prebuild-darwin-arm64
           path: prebuilds/
           if-no-files-found: error

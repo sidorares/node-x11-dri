@@ -29,26 +29,33 @@ Complete samples live in the main repo — a self-contained folder you can `npm 
 ## Installing
 
 ```sh
-npm install x11-dri       # no toolchain needed on linux x64/arm64
+npm install x11-dri       # no toolchain needed on linux x64/arm64, macOS arm64
 ```
 
-The npm tarball bundles **prebuilt binaries** for `linux-x64` and
+The npm tarball bundles **prebuilt binaries** for `linux-x64`,
 `linux-arm64` (glibc ≥ 2.31 — Debian 11 / Ubuntu 20.04 and everything
-newer), built in CI from the released tag. The install script just verifies
-the matching one loads, so a box with no build tools installs from the
-tarball alone — and because the loader also resolves the prebuild at
-`require()` time, the package keeps working under
-`npm install --ignore-scripts`. The addon is Node-API, so one binary per
-arch covers every supported Node (and Electron) version.
+newer) and `darwin-arm64` (macOS 11+, Apple Silicon), built in CI from the
+released tag. The install script just verifies the matching one loads, so a
+box with no build tools installs from the tarball alone — and because the
+loader also resolves the prebuild at `require()` time, the package keeps
+working under `npm install --ignore-scripts`. The addon is Node-API, so one
+binary per platform/arch covers every supported Node (and Electron)
+version.
 
-Anything else (musl/Alpine, armv7, riscv64, forced rebuilds with
-`--build-from-source`) compiles automatically with node-gyp, and that needs
-only a C toolchain: the addon has **no build-time dependency** on
+Anything else (musl/Alpine, armv7, riscv64, Intel Macs, forced rebuilds
+with `--build-from-source`) compiles automatically with node-gyp, and that
+needs only a C toolchain: the addon has **no build-time dependency** on
 gbm/EGL/GLES — `libgbm.so.1`, `libEGL.so.1` and `libGLESv2.so.2` are
 `dlopen()`ed at runtime (Mesa's ABI is stable) and it degrades with clear
 errors where a library or device is missing. `probe()` reports what is
 available; `npm test` runs a self-check that skips whatever this machine
-lacks. Linux only.
+lacks.
+
+**The rendering and dma-buf features are Linux-only.** The package builds
+and loads on macOS so cross-platform code can `require()` it
+unconditionally, but there it reports every GPU capability as unavailable —
+see below for why that is a property of the platform and not a missing
+port.
 
 ## API sketch
 
@@ -99,6 +106,64 @@ implemented in pure JS by the main package; see
 [docs/ext/dri3.md](https://github.com/sidorares/node-x11/blob/master/docs/ext/dri3.md)
 and
 [docs/ext/present.md](https://github.com/sidorares/node-x11/blob/master/docs/ext/present.md).
+
+## macOS / XQuartz
+
+Short answer: **the DRI3 path does not work under XQuartz, and cannot be
+made to.** Present does work, so the display half of the pipeline is
+available on a Mac — but this package supplies the *other* half, and every
+mechanism it depends on is Linux-specific. The addon builds and loads on
+macOS (Apple Silicon prebuild included) purely so that `require('x11-dri')`
+and `probe()` are safe to call from portable code.
+
+Measured against XQuartz 21.1.23 (X.Org 21.1.23) on macOS 15.2, Apple
+Silicon:
+
+| Piece | On XQuartz | Consequence |
+| --- | --- | --- |
+| `Present` | **v1.2, works** — `Present.Pixmap` accepted, `PresentCompleteNotify` *and* `PresentIdleNotify` both delivered | the pacing/buffer-recycling loop from the samples runs unchanged |
+| `DRI3` | **not implemented** — `QueryExtension` says absent, `X.require('dri3')` fails | no `PixmapFromBuffer`, so no way to turn a buffer fd into a pixmap |
+| dma-buf | no such kernel object on Darwin | nothing to export, and nothing to send |
+| GBM | no `libgbm` on macOS | `Gpu` cannot allocate exportable buffers |
+| EGL | XQuartz ships Mesa's `libGLESv2`/`libOSMesa` but **no `libEGL`** | no way to create the ES context, even ignoring the above |
+| udmabuf | `/dev/udmabuf` is a Linux driver | the CPU-memory fallback is out too |
+
+The two gaps compound: even with a GPU context, there is no dma-buf to
+export; even with a dma-buf, there is no DRI3 request to hand it to.
+
+What that leaves on a Mac, using the pure-JS `x11` package alone and no
+native code at all: fill an ordinary pixmap with `CreatePixmap` +
+`PutImage`, then display it with `Present.Pixmap` and pace off
+`PresentCompleteNotify`. That is a copy per frame rather than DRI3's zero
+copy, but it is the same protocol shape as the samples and needs nothing
+from this package. (`MIT-SHM` is also advertised by XQuartz and would save
+the socket copy, though creating the segment needs native code, and macOS
+ships very small SysV limits by default — `kern.sysv.shmmax` is 4 MiB, less
+than one 1080p frame, and raising it requires a `sysctl`.)
+
+For reference, XQuartz's own direct-rendering mechanism is the `Apple-DRI`
+extension, which its `libGL` uses to bind a GLX drawable to a CoreGraphics
+surface via Apple's private `Xplugin` API. That is a genuine zero-copy path,
+but it shares no protocol, buffer type, or API with DRI3 — supporting it
+would be a separate addon, not a port of this one.
+
+`probe()` reports all of the above at runtime:
+
+```js
+require('x11-dri').probe();
+// {
+//   platform: 'darwin',
+//   dmabuf: false,                 // false => no library will fix this
+//   gbm:  'GBM needs Linux DRM/dma-buf — no equivalent on darwin',
+//   egl:  'dlopen(libEGL.dylib) ... no such file',
+//   gles: true,                    // XQuartz's Mesa, found under /opt/X11/lib
+//   udmabuf: 'dma-buf is a Linux kernel facility with no darwin equivalent ...'
+// }
+```
+
+Every capability is `true` when usable or a string explaining why not, and
+`dmabuf: false` is the one to branch on: it means the host itself, not the
+installation, is the limit.
 
 ## Why not `DRI3.Open`?
 

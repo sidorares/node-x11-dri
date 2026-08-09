@@ -14,6 +14,13 @@
 // declared below — they are stable ABI). The addon therefore builds on any
 // Linux box with a compiler and degrades at runtime with clear errors when a
 // library or device is missing.
+//
+// It also builds on macOS, where the same degradation contract does the whole
+// job: dma-buf, GBM and udmabuf are Linux kernel facilities with no Darwin
+// equivalent, and XQuartz does not implement the DRI3 extension that would
+// consume them — so probe() reports them unavailable, the buffer-producing
+// entry points throw explanatory errors, and the portable descriptor helper
+// (dup) still works. See the "macOS / XQuartz" section of the README.
 
 #define _GNU_SOURCE
 #include <node_api.h>
@@ -24,9 +31,60 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+
+#if defined(__linux__)
+#include <sys/ioctl.h>
+#endif
+
+// ---------------------------------------------------------------------------
+// Platform traits
+// ---------------------------------------------------------------------------
+//
+// HAVE_DMABUF gates everything that speaks the Linux dma-buf ABI: udmabuf
+// (memfd + UDMABUF_CREATE) and DMA_BUF_IOCTL_SYNC. Where it is 0 those entry
+// points still exist and still throw a message that says why.
+//
+// The library names are the runtime dlopen targets. On Darwin the Mach-O
+// names are tried both bare (honouring DYLD_* and the standard search path)
+// and under /opt/X11/lib, where XQuartz keeps its Mesa build — that makes
+// probe() tell the truth about a machine instead of always reporting "not
+// found" for libraries that are installed but off the default path.
+
+#if defined(__linux__)
+#define HAVE_DMABUF 1
+#define PLATFORM_NAME "linux"
+#define LIB_GBM  "libgbm.so.1"
+#define LIB_EGL  "libEGL.so.1"
+#define LIB_GLES "libGLESv2.so.2"
+#elif defined(__APPLE__)
+#define HAVE_DMABUF 0
+#define PLATFORM_NAME "darwin"
+#define LIB_GBM  "libgbm.dylib"
+#define LIB_EGL  "libEGL.dylib"
+#define LIB_GLES "libGLESv2.dylib"
+#else
+#define HAVE_DMABUF 0
+#define PLATFORM_NAME "unknown"
+#define LIB_GBM  "libgbm.so.1"
+#define LIB_EGL  "libEGL.so.1"
+#define LIB_GLES "libGLESv2.so.2"
+#endif
+
+// dlopen `name`, then the same name under any extra search directories this
+// platform is known to hide graphics libraries in.
+static void *dlopen_lib(const char *name) {
+    void *h = dlopen(name, RTLD_NOW | RTLD_GLOBAL);
+#if defined(__APPLE__)
+    if (!h) {
+        char path[256];
+        snprintf(path, sizeof(path), "/opt/X11/lib/%s", name);
+        h = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
+    }
+#endif
+    return h;
+}
 
 // ---------------------------------------------------------------------------
 // napi helpers
@@ -258,12 +316,17 @@ static struct {
 
 static const char *load_gbm(void) {
     if (gbm.lib) return NULL;
-    void *h = dlopen("libgbm.so.1", RTLD_NOW | RTLD_GLOBAL);
+#if !HAVE_DMABUF
+    // GBM allocates dma-buf-backed buffer objects on a DRM device. Neither
+    // exists here, so say so plainly rather than reporting a dlopen miss.
+    return "GBM needs Linux DRM/dma-buf — no equivalent on " PLATFORM_NAME;
+#else
+    void *h = dlopen_lib(LIB_GBM);
     if (!h) return dlerror();
 #define S(field, name)                                                        \
     do {                                                                      \
         *(void **)&gbm.field = dlsym(h, name);                                \
-        if (!gbm.field) return "libgbm.so.1 is missing " name;                \
+        if (!gbm.field) return LIB_GBM " is missing " name;                   \
     } while (0)
     S(create_device, "gbm_create_device");
     S(device_destroy, "gbm_device_destroy");
@@ -282,16 +345,17 @@ static const char *load_gbm(void) {
     *(void **)&gbm.bo_get_offset = dlsym(h, "gbm_bo_get_offset");
     gbm.lib = h;
     return NULL;
+#endif
 }
 
 static const char *load_egl(void) {
     if (egl.lib) return NULL;
-    void *h = dlopen("libEGL.so.1", RTLD_NOW | RTLD_GLOBAL);
+    void *h = dlopen_lib(LIB_EGL);
     if (!h) return dlerror();
 #define S(field, name)                                                        \
     do {                                                                      \
         *(void **)&egl.field = dlsym(h, name);                                \
-        if (!egl.field) return "libEGL.so.1 is missing " name;                \
+        if (!egl.field) return LIB_EGL " is missing " name;                   \
     } while (0)
     S(GetError, "eglGetError");
     S(Initialize, "eglInitialize");
@@ -322,12 +386,12 @@ static const char *load_egl(void) {
 
 static const char *load_gles(void) {
     if (gl.lib) return NULL;
-    void *h = dlopen("libGLESv2.so.2", RTLD_NOW | RTLD_GLOBAL);
+    void *h = dlopen_lib(LIB_GLES);
     if (!h) return dlerror();
 #define S(field, name)                                                        \
     do {                                                                      \
         *(void **)&gl.field = dlsym(h, name);                                 \
-        if (!gl.field) return "libGLESv2.so.2 is missing " name;              \
+        if (!gl.field) return LIB_GLES " is missing " name;                   \
     } while (0)
     S(ClearColor, "glClearColor"); S(ClearDepthf, "glClearDepthf");
     S(Clear, "glClear"); S(Viewport, "glViewport");
@@ -970,7 +1034,13 @@ static napi_value Gl_readPixels(napi_env env, napi_callback_info info) {
 
 // ---------------------------------------------------------------------------
 // dma-buf plumbing: udmabuf, DMA_BUF_IOCTL_SYNC, dup
+//
+// The first two are the Linux dma-buf ABI itself and are compiled out where
+// the kernel has no such thing; the exported functions remain, and throw a
+// message naming the reason. dup() is plain POSIX and works everywhere.
 // ---------------------------------------------------------------------------
+
+#if HAVE_DMABUF
 
 struct udmabuf_create_args {
     uint32_t memfd;
@@ -1054,6 +1124,23 @@ static napi_value DmabufSync(napi_env env, napi_callback_info info) {
     return NULL;
 }
 
+#else // !HAVE_DMABUF
+
+#define NO_DMABUF                                                             \
+    "dma-buf is a Linux kernel facility with no " PLATFORM_NAME " equivalent" \
+    " (and XQuartz implements no DRI3 extension to receive one)"
+
+static napi_value UdmabufCreate(napi_env env, napi_callback_info info) {
+    (void)info;
+    THROW(env, "udmabufCreate: " NO_DMABUF);
+}
+static napi_value DmabufSync(napi_env env, napi_callback_info info) {
+    (void)info;
+    THROW(env, "dmabufSync: " NO_DMABUF);
+}
+
+#endif // HAVE_DMABUF
+
 // dup(fd) -> fd (CLOEXEC). For "send a copy, keep mine" descriptor passing.
 static napi_value Dup(napi_env env, napi_callback_info info) {
     GET_ARGS(env, info, 1);
@@ -1063,19 +1150,28 @@ static napi_value Dup(napi_env env, napi_callback_info info) {
     return mk_i32(env, nfd);
 }
 
-// probe() -> availability report, never throws
+// probe() -> availability report, never throws.
+// Each capability is `true` when usable, or a string saying why it is not.
+// `platform` and `dmabuf` describe the host itself: dmabuf === false means no
+// amount of installing libraries will make the DRI3 path work here.
 static napi_value Probe(napi_env env, napi_callback_info info) {
     (void)info;
     napi_value obj;
     NAPI_CALL(env, napi_create_object(env, &obj));
     const char *e;
+    obj_set(env, obj, "platform", mk_str(env, PLATFORM_NAME));
+    obj_set(env, obj, "dmabuf", mk_bool(env, HAVE_DMABUF));
     e = load_gbm();
     obj_set(env, obj, "gbm", e ? mk_str(env, e) : mk_bool(env, true));
     e = load_egl();
     obj_set(env, obj, "egl", e ? mk_str(env, e) : mk_bool(env, true));
     e = load_gles();
     obj_set(env, obj, "gles", e ? mk_str(env, e) : mk_bool(env, true));
+#if HAVE_DMABUF
     obj_set(env, obj, "udmabuf", mk_bool(env, access("/dev/udmabuf", W_OK) == 0));
+#else
+    obj_set(env, obj, "udmabuf", mk_str(env, NO_DMABUF));
+#endif
     return obj;
 }
 

@@ -100,6 +100,14 @@ const DMABUF_SYNC = {
     START: 0, END: 1 << 2
 };
 
+// The GPU/dma-buf half of this package is Linux-only, and not for want of a
+// port: it produces dma-buf descriptors for DRI3, and neither the buffer type
+// nor the extension that consumes it exists elsewhere. On macOS the X server
+// (XQuartz) offers Present but no DRI3 — see the README. Everything else in
+// here (dup, probe) is portable, so `require('x11-dri')` stays safe to do
+// from cross-platform code.
+const DMABUF_PLATFORM = process.platform === 'linux';
+
 // Render nodes need no authentication and no window system — the standard
 // substitute for DRI3's Open request (whose fd-carrying reply a pure-JS
 // client cannot receive; see x11's lib/ext/dri3.js).
@@ -152,7 +160,11 @@ class Gpu {
         } else {
             const nodes = opts.devicePath ? [opts.devicePath] : listRenderNodes();
             if (nodes.length === 0)
-                throw new Error('no DRM render nodes (/dev/dri/renderD*) available');
+                throw new Error(DMABUF_PLATFORM
+                    ? 'no DRM render nodes (/dev/dri/renderD*) available'
+                    : `GPU rendering needs Linux DRM render nodes, which ${process.platform} does not have` +
+                      ' — and the DRI3 extension that would consume the exported buffers is not' +
+                      ' implemented by this platform\'s X server either (see the x11-dri README)');
             let lastErr = null;
             this._fd = null;
             for (const path of nodes) {
