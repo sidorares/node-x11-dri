@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.4.0](https://github.com/sidorares/node-x11-dri/compare/v0.3.0...v0.4.0) (2026-08-09)
+
+
+### Features
+
+* **gl:** 3D textures, array textures and immutable storage ([0dee228](https://github.com/sidorares/node-x11-dri/commit/0dee228e25329a0d4f849049254f1603a0ce35c1))
+* **gl:** program introspection and compressed texture uploads ([dfb8f72](https://github.com/sidorares/node-x11-dri/commit/dfb8f72e84e0748456d12a6b962f79ddf8ec1ad6))
+* **gl:** request an ES 3.0 context, falling back to ES 2.0 ([bcafd63](https://github.com/sidorares/node-x11-dri/commit/bcafd635ea25761ca81f04bbce4c6a3470fab7df))
+* **gl:** vertex array objects, instancing and multiple render targets ([023422d](https://github.com/sidorares/node-x11-dri/commit/023422dd72933cbf9155ba6e76f5107a6dc62235))
+* ship TypeScript declarations ([#11](https://github.com/sidorares/node-x11-dri/issues/11)) ([16c6e5c](https://github.com/sidorares/node-x11-dri/commit/16c6e5c2b96269f6f69f636c51570dd0c93b5458))
+
 ## [0.3.0](https://github.com/sidorares/node-x11-dri/compare/v0.2.0...v0.3.0) (2026-08-09)
 
 
