@@ -35,9 +35,22 @@ report('dup', () => {
     fs.closeSync(d);
 });
 
+// The degradation contract on hosts with no dma-buf ABI (macOS and friends):
+// the entry points exist and throw something that explains itself, rather
+// than being absent or crashing. Loading the addon at all is half the test.
+report('non-dma-buf platform degrades cleanly', () => {
+    if (caps.dmabuf !== false)
+        skip('this host has dma-buf');
+    assert.strictEqual(dri.listRenderNodes().length, 0, 'no render nodes off Linux');
+    assert.throws(() => dri.createUdmabuf(4096), /dma-buf/, 'udmabufCreate explains itself');
+    assert.throws(() => dri.dmabufSync(0, 0), /dma-buf/, 'dmabufSync explains itself');
+    assert.throws(() => new dri.Gpu({}), /DRI3|DRM/, 'Gpu explains itself');
+    return `${caps.platform}: gbm/dma-buf reported unavailable`;
+});
+
 report('udmabuf create/write/sync', () => {
     if (caps.udmabuf !== true)
-        skip('/dev/udmabuf not accessible');
+        skip(typeof caps.udmabuf === 'string' ? caps.udmabuf : '/dev/udmabuf not accessible');
     const ud = dri.createUdmabuf(4096);
     const px = new Uint32Array(ud.buffer);
     ud.sync(dri.DMABUF_SYNC.START | dri.DMABUF_SYNC.WRITE);
@@ -50,8 +63,9 @@ report('udmabuf create/write/sync', () => {
 });
 
 report('GPU render + readback + dma-buf export', () => {
-    if (caps.gbm !== true || caps.egl !== true || caps.gles !== true)
-        skip('GL stack not loadable');
+    for (const [name, cap] of [['gbm', caps.gbm], ['egl', caps.egl], ['gles', caps.gles]])
+        if (cap !== true)
+            skip(`${name}: ${cap}`);
     if (dri.listRenderNodes().length === 0)
         skip('no /dev/dri/renderD*');
     let gpu;
