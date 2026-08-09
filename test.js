@@ -5,6 +5,7 @@
 
 const assert = require('assert');
 const fs = require('fs');
+const path = require('path');
 const dri = require('./');
 
 let failures = 0;
@@ -72,6 +73,60 @@ report('dup', () => {
     fs.closeSync(fd);
     fs.fstatSync(d); // still open
     fs.closeSync(d);
+});
+
+// index.d.ts is hand-written, and the addon it describes grows entry points,
+// so something has to hold the two together. This reads the declarations as
+// text and compares names against the objects actually exported — no GPU and
+// no TypeScript needed, which makes it the one GL-surface check that runs on
+// every machine. `npm run test:types` is the other half: this says the names
+// match, that says the signatures compile.
+report('index.d.ts covers the runtime surface', () => {
+    const dts = fs.readFileSync(path.join(__dirname, 'index.d.ts'), 'utf8');
+    // members of one `export interface Name {` block, by their declaring line:
+    // `readonly FOO: GLenum;` or `bar(...)`. Continuation lines of a wrapped
+    // signature are indented further and so cannot match.
+    const membersOf = name => {
+        const block = new RegExp(`^export interface ${name}[^{]*\\{\\n([\\s\\S]*?)^\\}`, 'm').exec(dts);
+        assert.ok(block, `index.d.ts declares interface ${name}`);
+        return new Set([...block[1].matchAll(/^ {4}(?:readonly )?(\w+)\??\s*[:(]/gm)].map(m => m[1]));
+    };
+    // top-level declarations only — matching anywhere in the file would let a
+    // missing export pass because some interface happens to have a member of
+    // the same name
+    const exported = new Set([...dts.matchAll(
+        /^export (?:declare )?(?:const|function|class|interface|type) (\w+)/gm)].map(m => m[1]));
+    for (const name of Object.keys(dri))
+        assert.ok(exported.has(name), `index.d.ts declares the ${name} export`);
+
+    // the two halves of `gl`: constants and entry points
+    const constants = membersOf('GLConstants');
+    const methods = membersOf('GLContext');
+    const both = new Set([...constants, ...methods]);
+
+    for (const name of Object.keys(dri.GL))
+        assert.ok(constants.has(name), `index.d.ts declares GL.${name}`);
+    for (const name of Object.keys(dri.gl))
+        assert.ok(both.has(name), `index.d.ts declares gl.${name}`);
+
+    // and nothing declared has gone away — a typo here would otherwise be a
+    // method consumers can call and the addon does not have
+    for (const name of both)
+        assert.ok(name in dri.gl, `gl.${name} is declared but does not exist`);
+    for (const name of constants)
+        assert.ok(name in dri.GL, `GL.${name} is declared but does not exist`);
+
+    // the small constant objects, checked the same way
+    for (const [group, values] of [['FORMAT', dri.FORMAT], ['GBM_USE', dri.GBM_USE],
+        ['MODIFIER', dri.MODIFIER], ['DMABUF_SYNC', dri.DMABUF_SYNC]]) {
+        const block = new RegExp(`export declare const ${group}: \\{\\n([\\s\\S]*?)^\\};`, 'm').exec(dts);
+        assert.ok(block, `index.d.ts declares ${group}`);
+        const names = new Set([...block[1].matchAll(/^ {4}readonly (\w+):/gm)].map(m => m[1]));
+        assert.deepStrictEqual([...names].sort(), Object.keys(values).sort(),
+            `${group} matches its declaration`);
+    }
+
+    return `${constants.size} constants, ${methods.size} entry points`;
 });
 
 // The degradation contract on hosts with no dma-buf ABI (macOS and friends):
