@@ -45,15 +45,16 @@ npm install x11-dri       # no toolchain needed on linux x64/arm64, macOS arm64
 
 The npm tarball bundles **prebuilt binaries** for `linux-x64`,
 `linux-arm64` (glibc ≥ 2.31 — Debian 11 / Ubuntu 20.04 and everything
-newer) and `darwin-arm64` (macOS 11+, Apple Silicon), built in CI from the
-released tag. The install script just verifies the matching one loads, so a
-box with no build tools installs from the tarball alone — and because the
-loader also resolves the prebuild at `require()` time, the package keeps
+newer), `darwin-arm64` and `darwin-x64` (macOS 11+, Apple Silicon and
+Intel), built in CI from the released tag. The install script just verifies
+the matching one loads, so a box with no build tools installs from the
+tarball alone — and because the loader also resolves the prebuild for
+`process.platform`-`process.arch` at `require()` time, the package keeps
 working under `npm install --ignore-scripts`. The addon is Node-API, so one
 binary per platform/arch covers every supported Node (and Electron)
 version.
 
-Anything else (musl/Alpine, armv7, riscv64, Intel Macs, forced rebuilds
+Anything else (musl/Alpine, armv7, riscv64, forced rebuilds
 with `--build-from-source`) compiles automatically with node-gyp, and that
 needs only a C toolchain: the addon has **no build-time dependency** on
 gbm/EGL/GLES — `libgbm.so.1`, `libEGL.so.1` and `libGLESv2.so.2` are

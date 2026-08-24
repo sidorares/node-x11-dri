@@ -79,10 +79,13 @@ jobs:
           path: prebuilds/
           if-no-files-found: error
 
-  # The macOS prebuild. macos-latest is Apple Silicon, so this produces
-  # prebuilds/darwin-arm64. binding.gyp pins MACOSX_DEPLOYMENT_TARGET=11.0
-  # (the arm64 floor), and the addon links nothing but libSystem/libc++, so
-  # one Node-API binary covers every supported Node and macOS 11+.
+  # The macOS prebuilds: darwin-arm64 built natively (macos-latest is Apple
+  # Silicon), darwin-x64 cross-compiled on the same runner — the addon is
+  # Node-API and macOS links addons with `-undefined dynamic_lookup`, so no
+  # x86_64 Node is needed, only the toolchain. binding.gyp pins
+  # MACOSX_DEPLOYMENT_TARGET=11.0, so both slices cover macOS 11+, and the
+  # addon links nothing but libSystem/libc++, so one Node-API binary per
+  # arch covers every supported Node.
   prebuild-macos:
     runs-on: macos-latest
     steps:
@@ -91,24 +94,31 @@ jobs:
         with:
           node-version: 18
       - run: npm install --build-from-source
-      - name: Package the binary as a prebuild
+      - name: Package the binaries as prebuilds (native arm64 + cross x64)
         run: |
-          target="darwin-$(node -p process.arch)"
-          mkdir -p "prebuilds/$target"
-          cp build/Release/x11dri.node "prebuilds/$target/"
-          strip -x "prebuilds/$target/x11dri.node"   # -x: keep the exported symbols
+          test "$(node -p process.arch)" = arm64   # the native build below is host-arch
+          mkdir -p prebuilds/darwin-arm64 prebuilds/darwin-x64
+          cp build/Release/x11dri.node prebuilds/darwin-arm64/
+          npx node-gyp rebuild --arch=x64
+          cp build/Release/x11dri.node prebuilds/darwin-x64/
+          strip -x prebuilds/darwin-arm64/x11dri.node prebuilds/darwin-x64/x11dri.node   # -x: keep the exported symbols
           rm -rf build
-          node -e "require('./index.js').probe()"    # loads via the prebuild
+          node -e "require('./index.js').probe()"    # loads via the arm64 prebuild
+          # the x64 slice cannot be load-tested on this runner; hold it to the
+          # static checks instead
+          test "$(lipo -archs prebuilds/darwin-arm64/x11dri.node)" = arm64
+          test "$(lipo -archs prebuilds/darwin-x64/x11dri.node)" = x86_64
           # A prebuild that pulled in a Node library, Homebrew, or XQuartz
           # would only load on the machine that built it.
-          otool -L "prebuilds/$target/x11dri.node"
-          if otool -L "prebuilds/$target/x11dri.node" | grep -qE 'libnode|/opt/homebrew|/usr/local/lib|/opt/X11'; then
-            echo "prebuild links a non-system library — not portable"; exit 1
-          fi
-          lipo -archs "prebuilds/$target/x11dri.node"
-          ls -la "prebuilds/$target"
+          for f in prebuilds/darwin-arm64/x11dri.node prebuilds/darwin-x64/x11dri.node; do
+            otool -L "$f"
+            if otool -L "$f" | grep -qE 'libnode|/opt/homebrew|/usr/local/lib|/opt/X11'; then
+              echo "prebuild links a non-system library — not portable"; exit 1
+            fi
+          done
+          ls -la prebuilds/darwin-arm64 prebuilds/darwin-x64
       - uses: actions/upload-artifact@v4
         with:
-          name: prebuild-darwin-arm64
+          name: prebuild-darwin
           path: prebuilds/
           if-no-files-found: error

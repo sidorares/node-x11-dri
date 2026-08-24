@@ -49,10 +49,13 @@ jobs:
           path: prebuilds/
           if-no-files-found: error
 
-  # The Apple Silicon prebuild (macos-latest is arm64). macOS gets no GPU or
-  # dma-buf support — there is none to have — but shipping the binary means
-  # `npm install x11-dri` on a Mac needs no Xcode toolchain either, and
-  # cross-platform code can require() the package unconditionally.
+  # The macOS prebuilds: darwin-arm64 built natively (macos-latest is arm64),
+  # darwin-x64 cross-compiled on the same runner — the addon is Node-API and
+  # macOS links addons with `-undefined dynamic_lookup`, so no x86_64 Node is
+  # needed. On Apple Silicon the addon carries the Apple-DRI/CGL accelerated
+  # path for XQuartz; on both arches shipping the binary means `npm install
+  # x11-dri` needs no Xcode toolchain, and cross-platform code can require()
+  # the package unconditionally.
   prebuild-macos:
     needs: release-please
     if: ${{ needs.release-please.outputs.release_created == 'true' }}
@@ -65,20 +68,26 @@ jobs:
         with:
           node-version: 18
       - run: npm install --build-from-source
-      - name: Package the binary as a prebuild
+      - name: Package the binaries as prebuilds (native arm64 + cross x64)
         run: |
-          target="darwin-$(node -p process.arch)"
-          mkdir -p "prebuilds/$target"
-          cp build/Release/x11dri.node "prebuilds/$target/"
-          strip -x "prebuilds/$target/x11dri.node"
+          test "$(node -p process.arch)" = arm64   # the native build below is host-arch
+          mkdir -p prebuilds/darwin-arm64 prebuilds/darwin-x64
+          cp build/Release/x11dri.node prebuilds/darwin-arm64/
+          npx node-gyp rebuild --arch=x64
+          cp build/Release/x11dri.node prebuilds/darwin-x64/
+          strip -x prebuilds/darwin-arm64/x11dri.node prebuilds/darwin-x64/x11dri.node
           rm -rf build
-          node -e "require('./index.js').probe()"   # loads via the prebuild
-          if otool -L "prebuilds/$target/x11dri.node" | grep -qE 'libnode|/opt/homebrew|/usr/local/lib|/opt/X11'; then
-            echo "prebuild links a non-system library — not portable"; exit 1
-          fi
+          node -e "require('./index.js').probe()"   # loads via the arm64 prebuild
+          test "$(lipo -archs prebuilds/darwin-arm64/x11dri.node)" = arm64
+          test "$(lipo -archs prebuilds/darwin-x64/x11dri.node)" = x86_64
+          for f in prebuilds/darwin-arm64/x11dri.node prebuilds/darwin-x64/x11dri.node; do
+            if otool -L "$f" | grep -qE 'libnode|/opt/homebrew|/usr/local/lib|/opt/X11'; then
+              echo "prebuild links a non-system library — not portable"; exit 1
+            fi
+          done
       - uses: actions/upload-artifact@v4
         with:
-          name: prebuild-darwin-arm64
+          name: prebuild-darwin
           path: prebuilds/
           if-no-files-found: error
 
@@ -88,7 +97,7 @@ jobs:
   # credentials from the id-token below. Requires npm >= 11.5.1.
   # The tarball carries the prebuilds assembled above; `npm install x11-dri`
   # therefore needs no toolchain (and no network beyond the tarball) on
-  # linux x64/arm64 glibc systems and on macOS 11+ Apple Silicon.
+  # linux x64/arm64 glibc systems and on macOS 11+, Apple Silicon and Intel.
   publish:
     needs: [release-please, prebuild-linux, prebuild-macos]
     if: ${{ needs.release-please.outputs.release_created == 'true' }}
@@ -113,4 +122,5 @@ jobs:
           test -f prebuilds/linux-x64/x11dri.node
           test -f prebuilds/linux-arm64/x11dri.node
           test -f prebuilds/darwin-arm64/x11dri.node
+          test -f prebuilds/darwin-x64/x11dri.node
       - run: npm publish
