@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/sidorares/node-x11-dri/compare/v0.4.0...v0.5.0) (2026-08-24)
+
+
+### Features
+
+* accelerated rendering on macOS/XQuartz via Apple-DRI (dri.apple) + cross-platform GL area integration map ([#12](https://github.com/sidorares/node-x11-dri/issues/12)) ([58edf3b](https://github.com/sidorares/node-x11-dri/commit/58edf3bb33fe08b3e7863d24850b567845dbbe0c))
+
 ## [0.4.0](https://github.com/sidorares/node-x11-dri/compare/v0.3.0...v0.4.0) (2026-08-09)
 
 
