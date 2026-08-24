@@ -11,7 +11,11 @@ fills exactly that hole:
 - **`Gpu` / `Surface`** — an OpenGL ES 2.0 or 3.0 rendering context on a DRM render
   node (GBM + EGL) whose finished frames are exportable as dma-buf fds:
   render → `swap()` → `{fd, stride, modifier}` → `DRI3.PixmapFromBuffer` →
-  `Present.Pixmap`.
+  `Present.Pixmap`. (Linux)
+- **`apple.Context`** — on macOS, the client half of XQuartz's `Apple-DRI`
+  direct rendering: import the WindowServer surface the X server exported
+  for a window and bind a real-GPU CGL context to it, driven by the same
+  `gl` below — see the macOS section.
 - **`gl`** — a WebGL-flavored subset of GL ES 2.0 driving that context from
   JS: shaders and programs, buffers and vertex attributes, draws, textures
   (including compressed uploads), blending, framebuffer objects for rendering
@@ -58,11 +62,14 @@ errors where a library or device is missing. `probe()` reports what is
 available; `npm test` runs a self-check that skips whatever this machine
 lacks.
 
-**The rendering and dma-buf features are Linux-only.** The package builds
-and loads on macOS so cross-platform code can `require()` it
-unconditionally, but there it reports every GPU capability as unavailable —
-see below for why that is a property of the platform and not a missing
-port.
+**The dma-buf/DRI3 features are Linux-only** — that is a property of the
+platform, not a missing port (see the macOS section for why). On macOS the
+package instead carries the native half of **XQuartz's own direct-rendering
+path**: the `apple` namespace binds a real-GPU CGL context to an XQuartz
+window through the `Apple-DRI` extension, driven by the same `gl` object and
+the same ES2 shaders. Everything Linux-specific still loads there and
+reports itself unavailable, so cross-platform code can `require()` the
+package unconditionally and branch on `probe()`.
 
 ## API sketch
 
@@ -284,12 +291,14 @@ and
 
 ## macOS / XQuartz
 
-Short answer: **the DRI3 path does not work under XQuartz, and cannot be
-made to.** Present does work, so the display half of the pipeline is
-available on a Mac — but this package supplies the *other* half, and every
-mechanism it depends on is Linux-specific. The addon builds and loads on
-macOS (Apple Silicon prebuild included) purely so that `require('x11-dri')`
-and `probe()` are safe to call from portable code.
+Two separate facts, and the second is the interesting one:
+
+1. **The DRI3 path does not work under XQuartz, and cannot be made to.**
+2. **Accelerated direct rendering into an XQuartz window still works** —
+   through XQuartz's own mechanism, the `Apple-DRI` extension, whose native
+   half this package now carries (`dri.apple`, macOS only).
+
+### Why DRI3 is out
 
 Measured against XQuartz 21.1.23 (X.Org 21.1.23) on macOS 15.2, Apple
 Silicon:
@@ -303,42 +312,95 @@ Silicon:
 | EGL | XQuartz ships Mesa's `libGLESv2`/`libOSMesa` but **no `libEGL`** | no way to create the ES context, even ignoring the above |
 | udmabuf | `/dev/udmabuf` is a Linux driver | the CPU-memory fallback is out too |
 
-The two gaps compound: even with a GPU context, there is no dma-buf to
-export; even with a dma-buf, there is no DRI3 request to hand it to.
+The gaps compound: even with a GPU context, there is no dma-buf to export;
+even with a dma-buf, there is no DRI3 request to hand it to. The pure-JS
+fallback that always works is `CreatePixmap` + `PutImage` + `Present.Pixmap`
+— a copy per frame, no native code.
 
-What that leaves on a Mac, using the pure-JS `x11` package alone and no
-native code at all: fill an ordinary pixmap with `CreatePixmap` +
-`PutImage`, then display it with `Present.Pixmap` and pace off
-`PresentCompleteNotify`. That is a copy per frame rather than DRI3's zero
-copy, but it is the same protocol shape as the samples and needs nothing
-from this package. (`MIT-SHM` is also advertised by XQuartz and would save
-the socket copy, though creating the segment needs native code, and macOS
-ships very small SysV limits by default — `kern.sysv.shmmax` is 4 MiB, less
-than one 1080p frame, and raising it requires a `sysctl`.)
+### What works instead: Apple-DRI
 
-For reference, XQuartz's own direct-rendering mechanism is the `Apple-DRI`
-extension, which its `libGL` uses to bind a GLX drawable to a CoreGraphics
-surface via Apple's private `Xplugin` API. That is a genuine zero-copy path,
-but it shares no protocol, buffer type, or API with DRI3 — supporting it
-would be a separate addon, not a port of this one.
+XQuartz's direct rendering runs the buffer handoff in the *opposite*
+direction from DRI3. The client does not produce a buffer and send it; the
+**server exports the window's own WindowServer surface to the client**, and
+the client renders straight into it:
 
-`probe()` reports all of the above at runtime:
+```
+this process                              X server (XQuartz)
+------------                              ------------------
+apple.clientId()  --- AppleDRICreateSurface(win, cid) --->  exports the
+                  <-------------- key[2] ----------------   window's surface
+ctx.attach(key)      (xp_import_surface + CGL context)
+glDraw... straight into the window's backing store
+ctx.flush()          (CGLFlushDrawable — WindowServer composites)
+                  <--- AppleDRISurfaceNotify ------------   moved/resized:
+                                                            ctx.update()
+```
+
+After the attach, nothing crosses the X socket per frame — no pixels, no
+requests. This is exactly the machinery XQuartz's `libGL` gives GLX clients
+(Apple's private-but-ABI-stable `Xplugin` library plus CGL), minus GLX; the
+context is the real GPU (OpenGL-on-Metal — `glGetString(RENDERER)` answers
+"Apple M1 Pro" and the like).
+
+The division of labor mirrors the DRI3 path exactly. The X protocol side —
+`AppleDRICreateSurface`, the `SurfaceNotify` event — is plain protocol for
+the `x11` package (see
+[`examples/xquartz/appledri.js`](examples/xquartz/appledri.js), written in
+node-x11's extension style). This addon supplies what JavaScript cannot: the
+WindowServer handshake, the surface import, and the CGL context.
+
+```js
+const cid = dri.apple.clientId();          // WindowServer handshake
+// X side: AppleDRI.CreateSurface(screen, wid, cid) -> { key, uid }
+const ctx = new dri.apple.Context({ depthSize: 16 });
+ctx.attach(key);                           // import + bind; context is current
+// ... render with dri.gl — same object, same calls as the Linux path ...
+ctx.flush();                               // present (this backend's swap)
+// on ConfigureNotify / SurfaceNotify(changed):  ctx.update()
+// on SurfaceNotify(destroyed):  CreateSurface again, then ctx.attach(newKey)
+```
+
+[`examples/xquartz/cube.js`](examples/xquartz) is the complete program — the
+DRI3 cube sample, ported to this path.
+
+What makes the same `gl` object work on macOS: the system OpenGL framework
+exports the whole ES 2.0 name set, and the context is created as a **core
+profile** (GL 4.1 on Metal hardware), where `ARB_ES2_compatibility` compiles
+GLSL ES 1.00 — so ES2/WebGL1 shaders run unchanged, with two core-profile
+potholes smoothed over inside the addon: source with no `#version` gets
+`#version 100` prepended (as its own source string, so your line numbers
+survive in info logs), and the context carries a default vertex array object
+the way browsers do. On Apple's GL 4.1 every optional `features` entry —
+VAOs, instancing, drawBuffers, 3D textures, `texStorage` (via
+`GL_ARB_texture_storage`) — resolves true. Shader-language versions are the
+one visible difference: GLSL ES **1.00** or desktop GLSL **4.10** compile,
+`#version 300 es` does not (Apple never shipped `ARB_ES3_compatibility`).
+
+Constraints to know about: the WindowServer only talks to processes in a
+logged-in GUI session (an SSH login gets a clear error from
+`apple.clientId()`); pacing is yours — `flush()` returns immediately by
+default and a timer sets the frame rate (`setSwapInterval(1)` gives real
+vsync at the price of blocking the event loop up to a frame); and `Present`
+plays no part in this path.
+
+`probe()` reports the whole picture at runtime:
 
 ```js
 require('x11-dri').probe();
 // {
 //   platform: 'darwin',
-//   dmabuf: false,                 // false => no library will fix this
+//   dmabuf: false,                 // false => no library will fix DRI3 here
 //   gbm:  'GBM needs Linux DRM/dma-buf — no equivalent on darwin',
 //   egl:  'dlopen(libEGL.dylib) ... no such file',
-//   gles: true,                    // XQuartz's Mesa, found under /opt/X11/lib
+//   gles: true,
+//   appledri: true,                // libXplugin + OpenGL.framework load
 //   udmabuf: 'dma-buf is a Linux kernel facility with no darwin equivalent ...'
 // }
 ```
 
-Every capability is `true` when usable or a string explaining why not, and
-`dmabuf: false` is the one to branch on: it means the host itself, not the
-installation, is the limit.
+Every capability is `true` when usable or a string explaining why not:
+`dmabuf: false` means the DRI3 pipeline is off the table on this host, and
+`appledri: true` means the XQuartz pipeline is on it.
 
 ## Why not `DRI3.Open`?
 

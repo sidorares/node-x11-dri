@@ -142,6 +142,80 @@ report('non-dma-buf platform degrades cleanly', () => {
     return `${caps.platform}: gbm/dma-buf reported unavailable`;
 });
 
+// The Apple-DRI/CGL backend, as far as it goes with no X server: everything
+// except the surface attach — WindowServer handshake, a core-profile context,
+// the ES2-shader shim, the default VAO, and an FBO round trip. The attach
+// itself needs an XQuartz window to exist (examples/xquartz/cube.js is that
+// test). Skips where the WindowServer is unreachable (SSH, CI without a GUI
+// session) rather than failing.
+report('Apple-DRI context: ES2 shaders + FBO on CGL', () => {
+    if (caps.appledri !== true)
+        skip(typeof caps.appledri === 'string' ? caps.appledri : 'appledri unavailable');
+    try {
+        dri.apple.clientId();
+    } catch (e) {
+        skip(`WindowServer unreachable: ${e.message}`);
+    }
+    const ctx = new dri.apple.Context({ depthSize: 0 });
+    try {
+        ctx.makeCurrent();
+        const gl = dri.gl;
+        assert.ok(ctx.glVersion.major >= 3, `core profile expected, got ${ctx.glVersion.string}`);
+        assert.strictEqual(ctx.features.vertexArrayObject, true, 'VAO feature on 4.1');
+
+        const SIZE = 32;
+        const tex = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, tex);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, SIZE, SIZE, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+        const fbo = gl.createFramebuffer();
+        gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+        assert.strictEqual(gl.checkFramebufferStatus(gl.FRAMEBUFFER), gl.FRAMEBUFFER_COMPLETE);
+        gl.viewport(0, 0, SIZE, SIZE);
+
+        // WebGL-1 spelling, no #version line — the shim must make the core
+        // profile accept it
+        const prog = buildProgram(gl, `
+            attribute vec2 aPos;
+            void main() { gl_Position = vec4(aPos, 0.0, 1.0); }
+        `, `
+            precision mediump float;
+            void main() { gl_FragColor = vec4(1.0, 0.5, 0.0, 1.0); }
+        `);
+        const vbo = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+        gl.bufferData(gl.ARRAY_BUFFER,
+            new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+        const aPos = gl.getAttribLocation(prog, 'aPos');
+        gl.useProgram(prog);
+        gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+        gl.enableVertexAttribArray(aPos);
+        gl.clearColor(0, 0, 0, 1);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        gl.drawArrays(gl.TRIANGLES, 0, 3);
+        assert.strictEqual(gl.getError(), gl.NO_ERROR);
+
+        const px = new Uint8Array(4);
+        gl.readPixels(SIZE >> 1, SIZE >> 1, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+        assert.ok(px[0] === 255 && px[1] >= 120 && px[1] <= 135 && px[2] === 0,
+            `fullscreen-triangle pixel: got [${px.join(', ')}]`);
+
+        const exts = gl.getSupportedExtensions();
+        assert.ok(Array.isArray(exts) && exts.length > 0, 'extension list on a core profile');
+        return `${gl.getString(gl.RENDERER)}, GL ${ctx.glVersion.major}.${ctx.glVersion.minor}`;
+    } finally {
+        ctx.destroy();
+    }
+});
+
+report('apple path degrades cleanly off macOS', () => {
+    if (caps.platform === 'darwin')
+        skip('this host is macOS');
+    assert.throws(() => dri.apple.clientId(), /macOS|XQuartz/, 'clientId explains itself');
+    assert.throws(() => new dri.apple.Context(), /macOS|XQuartz/, 'Context explains itself');
+    return `${caps.platform}: appledri reported unavailable`;
+});
+
 report('udmabuf create/write/sync', () => {
     if (caps.udmabuf !== true)
         skip(typeof caps.udmabuf === 'string' ? caps.udmabuf : '/dev/udmabuf not accessible');

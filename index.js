@@ -499,6 +499,92 @@ class Gpu {
     }
 }
 
+// ---- macOS / XQuartz: the Apple-DRI + CGL accelerated path ----
+//
+// XQuartz has no DRI3, but it has a direct-rendering design of its own: the
+// Apple-DRI extension makes the X server export the window's WindowServer
+// surface to a client by (clientId, key[2]), and the client binds an OpenGL
+// context straight to it. No buffers cross the X socket at all — GL renders
+// into the window's backing store and CGLFlushDrawable presents.
+//
+// As with DRI3, the protocol half (AppleDRICreateSurface and the
+// SurfaceNotify event) is plain X and belongs to the pure-JS x11 package;
+// this is the half that cannot be JavaScript: the WindowServer handshake,
+// the surface import, and the CGL context — with `gl` dispatching into the
+// system OpenGL framework (GL 4.1 core on Metal), where ES2-style shaders
+// compile unchanged.
+//
+//   const cid = dri.apple.clientId();            // WindowServer handshake
+//   // X side: AppleDRI.CreateSurface(screen, wid, cid) -> { key, uid }
+//   const ctx = new dri.apple.Context({ depthSize: 16 });
+//   ctx.attach(key);                             // import + bind the surface
+//   /* render with dri.gl */
+//   ctx.flush();                                 // present (the swap)
+
+function parseAppleGlVersion(string) {
+    const m = /(\d+)\.(\d+)/.exec(string || '');
+    return {
+        major: m ? Number(m[1]) : 2,
+        minor: m ? Number(m[2]) : 0,
+        string: string || ''
+    };
+}
+
+class AppleContext {
+    // opts: { colorSize?, alphaSize?, depthSize?, stencilSize?,
+    //         doubleBuffer?, profile? ('core' | 'legacy') }
+    constructor(opts) {
+        opts = opts || {};
+        this._handle = native.appleCreateContext(
+            opts.colorSize != null ? opts.colorSize : 24,
+            opts.alphaSize != null ? opts.alphaSize : 8,
+            opts.depthSize != null ? opts.depthSize : 16,
+            opts.stencilSize != null ? opts.stencilSize : 0,
+            opts.doubleBuffer !== false,
+            opts.profile !== 'legacy');
+        this.gl = gl;
+    }
+    // key: the [key_0, key_1] pair from the AppleDRICreateSurface reply (or
+    // the two words as separate arguments). Imports the exported surface and
+    // binds the context to it; the context comes out current. Attaching
+    // again replaces the surface — the recovery move after a
+    // SurfaceNotify(destroyed) once a fresh surface has been created.
+    attach(key0, key1) {
+        if (Array.isArray(key0))
+            [key0, key1] = key0;
+        native.appleAttach(this._handle, key0 >>> 0, key1 >>> 0);
+        this._settle();
+    }
+    makeCurrent() {
+        native.appleMakeCurrent(this._handle);
+        this._settle();
+    }
+    _settle() {
+        this.glVersion = parseAppleGlVersion(gl.getString(GL.VERSION));
+        this.features = native.glGetFeatures();
+    }
+    // Present the frame — this backend's swap. There is no fd and no Present
+    // round-trip: the WindowServer composites the surface directly.
+    flush() { native.appleFlush(this._handle); }
+    // Refresh the context's idea of the surface after the window resized or
+    // moved: call on ConfigureNotify, or on AppleDRISurfaceNotify kind 0.
+    update() { native.appleUpdate(this._handle); }
+    // 0 (the default): flush returns immediately. 1: flush waits for the
+    // vertical retrace — real vsync, but it blocks the event loop for up to
+    // a frame, so a timer-paced loop usually serves a Node process better.
+    setSwapInterval(n) { native.appleSetSwapInterval(this._handle, n); }
+    destroy() { native.appleDestroyContext(this._handle); }
+}
+
+const apple = {
+    // The WindowServer client id of this process — the client_id argument of
+    // AppleDRICreateSurface. Connects to the WindowServer on first call, and
+    // throws (naming the reason) where there is none to connect to, e.g. an
+    // SSH session or a non-macOS host.
+    clientId() { return native.appleClientId(); },
+    Context: AppleContext
+};
+
 // CPU-memory dma-buf (needs /dev/udmabuf). Returns { fd, memfd, size,
 // buffer (ArrayBuffer view of the pixels), sync(flags), close() }.
 // `fd` is the dma-buf: hand it to DRI3.PixmapFromBuffer (which consumes it);
@@ -525,6 +611,7 @@ module.exports = {
     dup: native.dup,
     listRenderNodes,
     Gpu,
+    apple,
     createUdmabuf,
     dmabufSync: native.dmabufSync,
     gl,

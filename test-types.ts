@@ -9,7 +9,7 @@
 
 import {
     probe, dup, listRenderNodes, createUdmabuf, dmabufSync,
-    Gpu, GL, gl as sharedGl,
+    Gpu, GL, gl as sharedGl, apple,
     FORMAT, GBM_USE, MODIFIER, DMABUF_SYNC,
     ActiveInfo, GlFeatures, GLContext, ProbeResult, Surface, SwapResult, TypedArray
 } from './index';
@@ -179,6 +179,26 @@ const bits: number = precision.precision;
 const pixels: TypedArray = new Uint8Array(4 * 4 * 4);
 gl.readPixels(0, 0, 4, 4, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
 
+// ---- the macOS / XQuartz path ----------------------------------------------
+
+const appledriWhy: string = caps.appledri === true ? 'fine' : caps.appledri;
+const cid: number = apple.clientId();
+const actx = new apple.Context({ depthSize: 16, profile: 'core' });
+actx.attach([0, 0]);
+actx.attach(0, 0);
+const actxGl: GLContext = actx.gl;
+if (actx.features?.instancedArrays)
+    actx.glVersion?.major.toFixed();
+actx.update();
+actx.setSwapInterval(1);
+actx.flush();
+actx.destroy();
+
+// @ts-expect-error — profile is an enum of two spellings
+new apple.Context({ profile: 'compatibility' });
+// @ts-expect-error — a key has two words
+actx.attach(1);
+
 // ---- the module-level gl is the same object --------------------------------
 
 const alsoGl: GLContext = sharedGl;
@@ -197,5 +217,6 @@ gpu.destroy();
 export {
     usable, why, nodes, copy, eglVendor, contextVersion, major, compiled, log,
     viewport, maxTexture, dithering, extensions, live, notANumber, bits,
-    alsoGl, modifierLinear, constantsOnly, nope, gl, out, info, value, precision
+    alsoGl, modifierLinear, constantsOnly, nope, gl, out, info, value, precision,
+    appledriWhy, cid, actxGl
 };
