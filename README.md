@@ -402,6 +402,12 @@ Every capability is `true` when usable or a string explaining why not:
 `dmabuf: false` means the DRI3 pipeline is off the table on this host, and
 `appledri: true` means the XQuartz pipeline is on it.
 
+Building a cross-platform GL surface on top of this (ntk's rendering
+contexts, react-x11's `<glarea>`, scene graphs above them):
+[docs/glarea-portability.md](docs/glarea-portability.md) is the integration
+map — the two paths side by side, the exact work items per repo, and the
+portability rules for consumer code.
+
 ## Why not `DRI3.Open`?
 
 The protocol's own way to get a DRM device fd is a reply carrying a
