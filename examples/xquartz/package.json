@@ -1,0 +1,11 @@
+{
+    "name": "x11-dri-example-xquartz",
+    "private": true,
+    "description": "Accelerated OpenGL into an XQuartz window from Node, via the Apple-DRI extension — the macOS counterpart of the DRI3 cube.",
+    "scripts": {
+        "start": "node cube.js"
+    },
+    "dependencies": {
+        "x11": "^2.5.0"
+    }
+}

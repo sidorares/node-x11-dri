@@ -91,6 +91,14 @@ export interface ProbeResult {
     gbm: true | string;
     egl: true | string;
     gles: true | string;
+    /**
+     * Whether the client half of XQuartz's Apple-DRI direct rendering
+     * (libXplugin + the system OpenGL framework) loads. `true` on macOS with
+     * those libraries; a string naming the reason everywhere else. Whether
+     * the WindowServer will actually talk to this process (a logged-in GUI
+     * session, not SSH) is settled later, by `apple.clientId()`.
+     */
+    appledri: true | string;
     udmabuf: boolean | string;
 }
 
@@ -212,6 +220,85 @@ export declare class Gpu {
     makeCurrent(surface: Surface | null): void;
     destroy(): void;
 }
+
+export interface AppleContextOptions {
+    /** Color buffer bits (R+G+B). Defaults to 24. */
+    colorSize?: number;
+    /** Defaults to 8. */
+    alphaSize?: number;
+    /** Defaults to 16. */
+    depthSize?: number;
+    /** Defaults to 0. */
+    stencilSize?: number;
+    /** Defaults to true. */
+    doubleBuffer?: boolean;
+    /**
+     * `'core'` (the default) asks CGL for a core profile — GL 4.1 on Metal
+     * hardware, whose ES2 compatibility compiles GLSL ES 1.00 shaders
+     * unchanged. `'legacy'` is GL 2.1 with GLSL 1.20, for desktop-GL shaders
+     * that predate `#version` gating.
+     */
+    profile?: 'core' | 'legacy';
+}
+
+/**
+ * A CGL rendering context bound to an XQuartz window's WindowServer surface —
+ * the client half of the Apple-DRI direct rendering path. See `apple`.
+ */
+export declare class AppleContext {
+    constructor(opts?: AppleContextOptions);
+
+    /** The GL entry points. The same object as the module's `gl` export. */
+    readonly gl: GLContext;
+    /** What the driver reports. Set by `attach`/`makeCurrent`. */
+    readonly glVersion?: GlVersion;
+    /** Which optional entry points resolved. Set by `attach`/`makeCurrent`. */
+    readonly features?: GlFeatures;
+
+    /**
+     * Import the surface the X server exported for this process (the
+     * `key_0`/`key_1` words of the AppleDRICreateSurface reply) and bind the
+     * context to it. The context comes out current. Attaching again replaces
+     * the surface — the recovery move after a SurfaceNotify(destroyed) once
+     * a fresh surface has been created.
+     */
+    attach(key: [number, number] | number[]): void;
+    attach(key0: number, key1: number): void;
+    makeCurrent(): void;
+    /**
+     * Present the frame — this backend's swap. No fd, no Present round-trip:
+     * the WindowServer composites the surface directly.
+     */
+    flush(): void;
+    /**
+     * Refresh the context's idea of the surface geometry: call on
+     * ConfigureNotify, or on an AppleDRISurfaceNotify with kind 0 (changed).
+     */
+    update(): void;
+    /**
+     * 0 (the default): `flush` returns immediately. 1: `flush` waits for the
+     * vertical retrace — real vsync, but it blocks the event loop for up to
+     * a frame, so a timer-paced loop usually serves a Node process better.
+     */
+    setSwapInterval(n: number): void;
+    destroy(): void;
+}
+
+/**
+ * The macOS / XQuartz accelerated path (Apple-DRI + CGL). The protocol side —
+ * AppleDRICreateSurface, carrying `clientId()` and answering the `key` that
+ * `AppleContext.attach` consumes — is plain X, spoken by the x11 package.
+ * Every entry point throws with a reason on other platforms.
+ */
+export declare const apple: {
+    /**
+     * This process's WindowServer client id — the `client_id` argument of
+     * AppleDRICreateSurface. Connects to the WindowServer on first call and
+     * throws (naming the reason) where there is none, e.g. over SSH.
+     */
+    clientId(): number;
+    Context: typeof AppleContext;
+};
 
 /** What `getParameter` can answer, depending on the parameter asked for. */
 export type GLParameterValue = number | boolean | number[] | boolean[];

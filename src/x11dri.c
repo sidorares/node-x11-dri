@@ -245,6 +245,41 @@ typedef intptr_t GLintptr;
 typedef intptr_t GLsizeiptr;
 typedef uint32_t GLbitfield;
 
+#if defined(__APPLE__)
+// ---------------------------------------------------------------------------
+// Minimal CGL / Xplugin declarations (from OpenGL/CGLTypes.h and the SDK's
+// Xplugin.h — both stable ABI, both dlopen'd like everything else here).
+//
+// This is the client half of XQuartz's own direct-rendering design: the X
+// server exports the window's WindowServer surface to us by a two-word key
+// (the Apple-DRI extension, spoken in JS by the x11 package), we import it
+// over our own WindowServer connection and attach a CGL context to it. From
+// then on GL renders straight into the window's backing store — the same
+// zero-copy path XQuartz's libGL gives GLX clients, minus GLX.
+// ---------------------------------------------------------------------------
+
+#define LIB_XPLUGIN "/usr/lib/libXplugin.1.dylib" // dyld-cache-only file; dlopen works
+#define LIB_OPENGL  "/System/Library/Frameworks/OpenGL.framework/OpenGL"
+
+#define XP_SUCCESS       0
+#define XP_IN_BACKGROUND (1 << 0)
+
+// CGLPixelFormatAttribute / CGLContextParameter values (CGLTypes.h)
+#define kCGLPFADoubleBuffer   5
+#define kCGLPFAColorSize      8
+#define kCGLPFAAlphaSize      11
+#define kCGLPFADepthSize      12
+#define kCGLPFAStencilSize    13
+#define kCGLPFAAccelerated    73
+#define kCGLPFAClosestPolicy  74
+#define kCGLPFAOpenGLProfile  99
+#define kCGLOGLPVersion_3_2_Core 0x3200 // "3.2 or later" — 4.1 on Metal
+#define kCGLCPSwapInterval    222
+
+typedef void *CGLPixelFormatObj;
+typedef void *CGLContextObj;
+#endif
+
 // ---------------------------------------------------------------------------
 // dlopen'd function tables
 // ---------------------------------------------------------------------------
@@ -333,6 +368,9 @@ static struct {
     void (*Flush)(void);
     GLenum (*GetError)(void);
     const uint8_t *(*GetString)(GLenum);
+    // desktop-GL only (may be NULL): the extension list of a core-profile
+    // context, where GetString(GL_EXTENSIONS) answers NULL + INVALID_ENUM
+    const uint8_t *(*GetStringi)(GLenum, GLuint);
     void (*ReadPixels)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void *);
     // textures
     void (*GenTextures)(GLsizei, GLuint *);
@@ -441,6 +479,35 @@ static struct {
     void (*TexStorage3D)(GLenum, GLsizei, GLenum, GLsizei, GLsizei, GLsizei);
 } gl;
 
+#if defined(__APPLE__)
+// Xplugin: the private-but-ABI-stable client library of the macOS
+// WindowServer that XQuartz is built on. Declarations match the SDK's
+// Xplugin.h; xp_error is an int, ids are unsigned ints.
+static struct {
+    void *lib;
+    int (*init)(unsigned int options);
+    int (*get_client_id)(unsigned int *ret);
+    int (*import_surface)(const unsigned int key[2], unsigned int *sid);
+    int (*destroy_surface)(unsigned int sid);
+    int (*attach_gl_context)(void *cgl_ctx, unsigned int sid);
+    int (*update_gl_context)(void *cgl_ctx);
+} xp;
+
+static struct {
+    void *lib;
+    int (*ChoosePixelFormat)(const int *attribs, CGLPixelFormatObj *pf, GLint *npix);
+    int (*DestroyPixelFormat)(CGLPixelFormatObj pf);
+    int (*CreateContext)(CGLPixelFormatObj pf, CGLContextObj share, CGLContextObj *ctx);
+    int (*DestroyContext)(CGLContextObj ctx);
+    int (*SetCurrentContext)(CGLContextObj ctx);
+    CGLContextObj (*GetCurrentContext)(void);
+    int (*FlushDrawable)(CGLContextObj ctx);
+    int (*ClearDrawable)(CGLContextObj ctx);
+    int (*SetParameter)(CGLContextObj ctx, int pname, const GLint *params);
+    const char *(*ErrorString)(int err);
+} cgl;
+#endif
+
 static const char *load_gbm(void) {
     if (gbm.lib) return NULL;
 #if !HAVE_DMABUF
@@ -511,14 +578,19 @@ static const char *load_egl(void) {
     return NULL;
 }
 
-static const char *load_gles(void) {
-    if (gl.lib) return NULL;
-    void *h = dlopen_lib(LIB_GLES);
-    if (!h) return dlerror();
+// Fill the gl table from an already-dlopen'd library. Shared between the two
+// sources of GL entry points: Linux's libGLESv2, and on macOS the system
+// OpenGL framework (whose desktop GL exports the whole ES 2.0 name set —
+// glClearDepthf and glDepthRangef included, via GL 4.1's ES2 compatibility).
+static const char *fill_gl_table(void *h) {
+    static char err[96];
 #define S(field, name)                                                        \
     do {                                                                      \
         *(void **)&gl.field = dlsym(h, name);                                 \
-        if (!gl.field) return LIB_GLES " is missing " name;                   \
+        if (!gl.field) {                                                      \
+            snprintf(err, sizeof err, "GL library is missing %s", name);      \
+            return err;                                                       \
+        }                                                                     \
     } while (0)
     S(ClearColor, "glClearColor"); S(ClearDepthf, "glClearDepthf");
     S(Clear, "glClear"); S(Viewport, "glViewport");
@@ -609,9 +681,70 @@ static const char *load_gles(void) {
     S(CompressedTexImage2D, "glCompressedTexImage2D");
     S(CompressedTexSubImage2D, "glCompressedTexSubImage2D");
 #undef S
+    // Desktop GL only; NULL on GLES2 libraries. Used to enumerate extensions
+    // where core profiles retired GetString(GL_EXTENSIONS).
+    *(void **)&gl.GetStringi = dlsym(h, "glGetStringi");
     gl.lib = h;
     return NULL;
 }
+
+static const char *load_gles(void) {
+    if (gl.lib) return NULL;
+    void *h = dlopen_lib(LIB_GLES);
+    if (!h) return dlerror();
+    return fill_gl_table(h);
+}
+
+#if defined(__APPLE__)
+// Load the Apple-DRI client pieces: Xplugin (WindowServer surface plumbing),
+// CGL (context creation and presentation) and the GL entry points, all out
+// of system libraries that every macOS with XQuartz support has. The GL
+// table is shared with the EGL path, and on this platform it must dispatch
+// into the system OpenGL framework — CGL contexts belong to it — so it is
+// (re)filled from there even if a probe() already filled it from XQuartz's
+// Mesa libGLESv2 (which has no way to get a current context on macOS).
+static const char *load_apple(void) {
+    if (xp.lib && cgl.lib) return NULL;
+    void *xh = dlopen(LIB_XPLUGIN, RTLD_NOW | RTLD_GLOBAL);
+    if (!xh) return "libXplugin (the WindowServer client library XQuartz "
+                    "builds on) did not load — is this macOS?";
+    void *oh = dlopen(LIB_OPENGL, RTLD_NOW | RTLD_GLOBAL);
+    if (!oh) return "the system OpenGL framework did not load";
+#define SX(field, name)                                                       \
+    do {                                                                      \
+        *(void **)&xp.field = dlsym(xh, name);                                \
+        if (!xp.field) return "libXplugin is missing " name;                  \
+    } while (0)
+    SX(init, "xp_init");
+    SX(get_client_id, "xp_get_client_id");
+    SX(import_surface, "xp_import_surface");
+    SX(destroy_surface, "xp_destroy_surface");
+    SX(attach_gl_context, "xp_attach_gl_context");
+    SX(update_gl_context, "xp_update_gl_context");
+#undef SX
+#define SC(field, name)                                                       \
+    do {                                                                      \
+        *(void **)&cgl.field = dlsym(oh, name);                               \
+        if (!cgl.field) return "OpenGL.framework is missing " name;           \
+    } while (0)
+    SC(ChoosePixelFormat, "CGLChoosePixelFormat");
+    SC(DestroyPixelFormat, "CGLDestroyPixelFormat");
+    SC(CreateContext, "CGLCreateContext");
+    SC(DestroyContext, "CGLDestroyContext");
+    SC(SetCurrentContext, "CGLSetCurrentContext");
+    SC(GetCurrentContext, "CGLGetCurrentContext");
+    SC(FlushDrawable, "CGLFlushDrawable");
+    SC(ClearDrawable, "CGLClearDrawable");
+    SC(SetParameter, "CGLSetParameter");
+    SC(ErrorString, "CGLErrorString");
+#undef SC
+    const char *e = fill_gl_table(oh);
+    if (e) return e;
+    xp.lib = xh;
+    cgl.lib = oh;
+    return NULL;
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // Optional GL entry points
@@ -635,7 +768,10 @@ static const char *load_gles(void) {
 
 typedef struct {
     const char *name;
-    const char *ext; // NULL means the core spelling, which needs ES 3.0
+    const char *ext; // NULL means the core spelling, which needs ES 3.0 —
+                     // or, on desktop GL (the macOS CGL path), `desk`
+    int desk;        // ×10 desktop version the core spelling appeared in;
+                     // 0 = ES only, never satisfied by a desktop version
 } GlCandidate;
 
 typedef struct {
@@ -646,62 +782,66 @@ typedef struct {
 
 static const GlOptional gl_optional[] = {
     { (void **)&gl.GenVertexArrays, "vertexArrayObject", {
-        { "glGenVertexArrays", NULL },
-        { "glGenVertexArraysOES", "GL_OES_vertex_array_object" } } },
+        { "glGenVertexArrays", NULL, 30 },
+        { "glGenVertexArraysOES", "GL_OES_vertex_array_object", 0 } } },
     { (void **)&gl.DeleteVertexArrays, "vertexArrayObject", {
-        { "glDeleteVertexArrays", NULL },
-        { "glDeleteVertexArraysOES", "GL_OES_vertex_array_object" } } },
+        { "glDeleteVertexArrays", NULL, 30 },
+        { "glDeleteVertexArraysOES", "GL_OES_vertex_array_object", 0 } } },
     { (void **)&gl.BindVertexArray, "vertexArrayObject", {
-        { "glBindVertexArray", NULL },
-        { "glBindVertexArrayOES", "GL_OES_vertex_array_object" } } },
+        { "glBindVertexArray", NULL, 30 },
+        { "glBindVertexArrayOES", "GL_OES_vertex_array_object", 0 } } },
     { (void **)&gl.IsVertexArray, "vertexArrayObject", {
-        { "glIsVertexArray", NULL },
-        { "glIsVertexArrayOES", "GL_OES_vertex_array_object" } } },
+        { "glIsVertexArray", NULL, 30 },
+        { "glIsVertexArrayOES", "GL_OES_vertex_array_object", 0 } } },
     { (void **)&gl.DrawArraysInstanced, "instancedArrays", {
-        { "glDrawArraysInstanced", NULL },
-        { "glDrawArraysInstancedEXT", "GL_EXT_instanced_arrays" },
-        { "glDrawArraysInstancedANGLE", "GL_ANGLE_instanced_arrays" },
-        { "glDrawArraysInstancedNV", "GL_NV_instanced_arrays" } } },
+        { "glDrawArraysInstanced", NULL, 31 },
+        { "glDrawArraysInstancedEXT", "GL_EXT_instanced_arrays", 0 },
+        { "glDrawArraysInstancedANGLE", "GL_ANGLE_instanced_arrays", 0 },
+        { "glDrawArraysInstancedNV", "GL_NV_instanced_arrays", 0 } } },
     { (void **)&gl.DrawElementsInstanced, "instancedArrays", {
-        { "glDrawElementsInstanced", NULL },
-        { "glDrawElementsInstancedEXT", "GL_EXT_instanced_arrays" },
-        { "glDrawElementsInstancedANGLE", "GL_ANGLE_instanced_arrays" },
-        { "glDrawElementsInstancedNV", "GL_NV_instanced_arrays" } } },
+        { "glDrawElementsInstanced", NULL, 31 },
+        { "glDrawElementsInstancedEXT", "GL_EXT_instanced_arrays", 0 },
+        { "glDrawElementsInstancedANGLE", "GL_ANGLE_instanced_arrays", 0 },
+        { "glDrawElementsInstancedNV", "GL_NV_instanced_arrays", 0 } } },
     { (void **)&gl.VertexAttribDivisor, "instancedArrays", {
-        { "glVertexAttribDivisor", NULL },
-        { "glVertexAttribDivisorEXT", "GL_EXT_instanced_arrays" },
-        { "glVertexAttribDivisorANGLE", "GL_ANGLE_instanced_arrays" },
-        { "glVertexAttribDivisorNV", "GL_NV_instanced_arrays" } } },
+        { "glVertexAttribDivisor", NULL, 33 },
+        { "glVertexAttribDivisorEXT", "GL_EXT_instanced_arrays", 0 },
+        { "glVertexAttribDivisorANGLE", "GL_ANGLE_instanced_arrays", 0 },
+        { "glVertexAttribDivisorNV", "GL_NV_instanced_arrays", 0 } } },
     { (void **)&gl.DrawBuffers, "drawBuffers", {
-        { "glDrawBuffers", NULL },
-        { "glDrawBuffersEXT", "GL_EXT_draw_buffers" },
-        { "glDrawBuffersNV", "GL_NV_draw_buffers" } } },
+        { "glDrawBuffers", NULL, 20 },
+        { "glDrawBuffersEXT", "GL_EXT_draw_buffers", 0 },
+        { "glDrawBuffersNV", "GL_NV_draw_buffers", 0 } } },
     { (void **)&gl.TexImage3D, "texture3D", {
-        { "glTexImage3D", NULL },
-        { "glTexImage3DOES", "GL_OES_texture_3D" } } },
+        { "glTexImage3D", NULL, 12 },
+        { "glTexImage3DOES", "GL_OES_texture_3D", 0 } } },
     { (void **)&gl.TexSubImage3D, "texture3D", {
-        { "glTexSubImage3D", NULL },
-        { "glTexSubImage3DOES", "GL_OES_texture_3D" } } },
+        { "glTexSubImage3D", NULL, 12 },
+        { "glTexSubImage3DOES", "GL_OES_texture_3D", 0 } } },
     { (void **)&gl.CopyTexSubImage3D, "texture3D", {
-        { "glCopyTexSubImage3D", NULL },
-        { "glCopyTexSubImage3DOES", "GL_OES_texture_3D" } } },
+        { "glCopyTexSubImage3D", NULL, 12 },
+        { "glCopyTexSubImage3DOES", "GL_OES_texture_3D", 0 } } },
     { (void **)&gl.CompressedTexImage3D, "texture3D", {
-        { "glCompressedTexImage3D", NULL },
-        { "glCompressedTexImage3DOES", "GL_OES_texture_3D" } } },
+        { "glCompressedTexImage3D", NULL, 13 },
+        { "glCompressedTexImage3DOES", "GL_OES_texture_3D", 0 } } },
     { (void **)&gl.CompressedTexSubImage3D, "texture3D", {
-        { "glCompressedTexSubImage3D", NULL },
-        { "glCompressedTexSubImage3DOES", "GL_OES_texture_3D" } } },
+        { "glCompressedTexSubImage3D", NULL, 13 },
+        { "glCompressedTexSubImage3DOES", "GL_OES_texture_3D", 0 } } },
     // No ES 2.0 extension provides this: OES_texture_3D renders into a 3D
     // slice with glFramebufferTexture3DOES instead, and array textures do not
     // exist there at all. So it is ES 3.0 or nothing.
     { (void **)&gl.FramebufferTextureLayer, "texture3D", {
-        { "glFramebufferTextureLayer", NULL } } },
+        { "glFramebufferTextureLayer", NULL, 30 } } },
+    // Desktop grew immutable storage in 4.2, later than macOS's 4.1 — there
+    // it exists only if GL_ARB_texture_storage is advertised.
     { (void **)&gl.TexStorage2D, "textureStorage", {
-        { "glTexStorage2D", NULL },
-        { "glTexStorage2DEXT", "GL_EXT_texture_storage" } } },
+        { "glTexStorage2D", NULL, 42 },
+        { "glTexStorage2D", "GL_ARB_texture_storage", 0 },
+        { "glTexStorage2DEXT", "GL_EXT_texture_storage", 0 } } },
     { (void **)&gl.TexStorage3D, "textureStorage", {
-        { "glTexStorage3D", NULL },
-        { "glTexStorage3DEXT", "GL_EXT_texture_storage" } } }
+        { "glTexStorage3D", NULL, 42 },
+        { "glTexStorage3D", "GL_ARB_texture_storage", 0 },
+        { "glTexStorage3DEXT", "GL_EXT_texture_storage", 0 } } }
 };
 
 // GL's extension string is space-separated, and one name can be a prefix of
@@ -717,29 +857,87 @@ static int has_gl_ext(const char *list, const char *want) {
 }
 
 // Which context the table was last resolved against, so switching contexts
-// re-resolves and destroying one forces it.
+// re-resolves and destroying one forces it. (EGLContext and CGLContextObj are
+// both opaque pointers, so the one slot serves either backend.)
 static EGLContext optional_ctx;
+
+// A core-profile desktop context (the macOS path) answers NULL +
+// INVALID_ENUM to GetString(GL_EXTENSIONS); the modern replacement is one
+// GetStringi call per extension. This builds the old-style space-separated
+// list from those, so has_gl_ext() and JS's getSupportedExtensions() keep
+// one code path. Rebuilt when the current context changes.
+static char *synth_exts;
+
+static const char *gl_extensions_string(void) {
+    const char *s = (const char *)gl.GetString(0x1F03 /* GL_EXTENSIONS */);
+    if (s)
+        return s;
+    gl.GetError(); // the query above just raised INVALID_ENUM — clear it
+    if (synth_exts)
+        return synth_exts;
+    if (!gl.GetStringi)
+        return NULL;
+    GLint n = 0;
+    gl.GetIntegerv(0x821D /* GL_NUM_EXTENSIONS */, &n);
+    size_t cap = 256, len = 0;
+    char *buf = malloc(cap);
+    if (!buf)
+        return NULL;
+    buf[0] = '\0';
+    for (GLint i = 0; i < n; i++) {
+        const char *e = (const char *)gl.GetStringi(0x1F03, (GLuint)i);
+        if (!e)
+            continue;
+        size_t el = strlen(e);
+        if (len + el + 2 > cap) {
+            cap = (len + el + 2) * 2;
+            char *nb = realloc(buf, cap);
+            if (!nb) { free(buf); return NULL; }
+            buf = nb;
+        }
+        if (len)
+            buf[len++] = ' ';
+        memcpy(buf + len, e, el + 1);
+        len += el;
+    }
+    synth_exts = buf;
+    return synth_exts;
+}
 
 static void resolve_optional_gl(EGLContext ctx) {
     if (optional_ctx == ctx)
         return;
     optional_ctx = ctx;
+    free(synth_exts);
+    synth_exts = NULL;
 
     // "OpenGL ES N.M <driver>" — the major version is what gates the core
-    // spellings. Anything unparseable is treated as ES 2.0, which only ever
-    // costs an extension lookup that would have worked anyway.
-    int major = 2;
+    // spellings. A version with no "ES" is desktop GL (the CGL backend):
+    // there the gate is per-entry-point, the ×10 version each one entered
+    // desktop core in. Anything unparseable is treated as ES 2.0, which only
+    // ever costs an extension lookup that would have worked anyway.
+    int es_major = 0, desk = 0;
     const char *version = (const char *)gl.GetString(0x1F02 /* GL_VERSION */);
     const char *es = version ? strstr(version, "ES ") : NULL;
-    if (es && es[3] >= '0' && es[3] <= '9')
-        major = es[3] - '0';
-    const char *exts = (const char *)gl.GetString(0x1F03 /* GL_EXTENSIONS */);
+    if (es && es[3] >= '0' && es[3] <= '9') {
+        es_major = es[3] - '0';
+    } else if (version && version[0] >= '0' && version[0] <= '9') {
+        int ma = 0, mi = 0;
+        if (sscanf(version, "%d.%d", &ma, &mi) == 2)
+            desk = ma * 10 + mi;
+    }
+    if (!es_major && !desk)
+        es_major = 2;
+    const char *exts = gl_extensions_string();
 
     for (size_t i = 0; i < sizeof(gl_optional) / sizeof(gl_optional[0]); i++) {
         const GlOptional *o = &gl_optional[i];
         *o->slot = NULL;
         for (int c = 0; c < 4 && o->cand[c].name; c++) {
-            if (o->cand[c].ext ? !has_gl_ext(exts, o->cand[c].ext) : major < 3)
+            if (o->cand[c].ext
+                    ? !has_gl_ext(exts, o->cand[c].ext)
+                    : (desk ? (!o->cand[c].desk || desk < o->cand[c].desk)
+                            : es_major < 3))
                 continue;
             void *fn = gl.lib ? dlsym(gl.lib, o->cand[c].name) : NULL;
             if (!fn && egl.GetProcAddress)
@@ -1175,6 +1373,14 @@ static napi_value Gl_createShader(napi_env env, napi_callback_info info) {
     GET_ARGS(env, info, 1); NEED_GL(env);
     return mk_u32(env, gl.CreateShader(arg_u32(env, args[0])));
 }
+// Set while a core-profile desktop context (the macOS CGL backend) is
+// current. Core profiles refuse version-less shader source outright, but
+// accept GLSL ES 1.00 through ARB_ES2_compatibility — so a source with no
+// #version of its own (WebGL 1 style, implicitly 1.00) gets one prepended as
+// a separate source string, which keeps the user's line numbers intact in
+// info logs (their code is string 1).
+static int apple_core_current;
+
 static napi_value Gl_shaderSource(napi_env env, napi_callback_info info) {
     GET_ARGS(env, info, 2); NEED_GL(env);
     GLuint sh = arg_u32(env, args[0]);
@@ -1182,9 +1388,14 @@ static napi_value Gl_shaderSource(napi_env env, napi_callback_info info) {
     napi_get_value_string_utf8(env, args[1], NULL, 0, &len);
     char *src = malloc(len + 1);
     napi_get_value_string_utf8(env, args[1], src, len + 1, &len);
-    const GLchar *ptr = src;
-    GLint glen = (GLint)len;
-    gl.ShaderSource(sh, 1, &ptr, &glen);
+    if (apple_core_current && !strstr(src, "#version")) {
+        const GLchar *ptrs[2] = { "#version 100\n", src };
+        gl.ShaderSource(sh, 2, ptrs, NULL);
+    } else {
+        const GLchar *ptr = src;
+        GLint glen = (GLint)len;
+        gl.ShaderSource(sh, 1, &ptr, &glen);
+    }
     free(src);
     return NULL;
 }
@@ -1375,7 +1586,12 @@ static napi_value Gl_getError(napi_env env, napi_callback_info info) {
 }
 static napi_value Gl_getString(napi_env env, napi_callback_info info) {
     GET_ARGS(env, info, 1); NEED_GL(env);
-    return mk_str(env, (const char *)gl.GetString(arg_u32(env, args[0])));
+    GLenum pname = arg_u32(env, args[0]);
+    // Core-profile desktop contexts retired GetString(GL_EXTENSIONS); answer
+    // with the same synthesized list resolve_optional_gl gates on.
+    if (pname == 0x1F03 /* GL_EXTENSIONS */)
+        return mk_str(env, gl_extensions_string());
+    return mk_str(env, (const char *)gl.GetString(pname));
 }
 static napi_value Gl_readPixels(napi_env env, napi_callback_info info) {
     GET_ARGS(env, info, 7); NEED_GL(env);
@@ -2351,6 +2567,266 @@ static napi_value GlFeatures(napi_env env, napi_callback_info info) {
 }
 
 // ---------------------------------------------------------------------------
+// Apple-DRI / CGL backend (macOS + XQuartz)
+//
+// XQuartz never grew DRI3 — its direct rendering is the Apple-DRI extension:
+// the server owns a WindowServer surface for the drawable and *exports* it
+// to a client by (client_id, key[2]); the client imports the key over its
+// own WindowServer connection and attaches a CGL context, after which GL
+// renders into the window's backing store with no copies and no X protocol
+// in the frame loop. CGLFlushDrawable is the swap.
+//
+// Division of labor mirrors the DRI3 path exactly: the X requests
+// (AppleDRICreateSurface and friends) are plain protocol, spoken in JS by
+// the x11 package; what cannot be JavaScript — the WindowServer handshake,
+// the surface import, the CGL context — lives here.
+//
+// The contexts this creates default to the core profile (GL 4.1 on Metal
+// hardware), where ARB_ES2_compatibility accepts GLSL ES 1.00 — so the same
+// WebGL-flavored `gl` and the same shaders run unchanged; see the #version
+// shim in Gl_shaderSource and the default VAO below for the two core-profile
+// potholes this smooths over.
+// ---------------------------------------------------------------------------
+
+#if defined(__APPLE__)
+
+typedef struct {
+    CGLPixelFormatObj pf;
+    CGLContextObj ctx;
+    unsigned int sid; // imported xp surface id; 0 = not attached
+    GLuint vao;       // the default vertex array object of a core context
+    int core;
+    int destroyed;
+} AppleCtx;
+
+static void apple_ctx_finalize(napi_env env, void *data, void *hint) {
+    (void)env; (void)hint;
+    AppleCtx *a = data;
+    if (!a->destroyed) {
+        if (a->ctx) cgl.DestroyContext(a->ctx);
+        if (a->pf) cgl.DestroyPixelFormat(a->pf);
+        if (a->sid) xp.destroy_surface(a->sid);
+    }
+    free(a);
+}
+
+// appleClientId() -> number. Connects this process to the WindowServer on
+// first use (xp_init) and reports its client id — the value the X server
+// needs in AppleDRICreateSurface to export a drawable's surface to us.
+static napi_value AppleClientId(napi_env env, napi_callback_info info) {
+    (void)info;
+    const char *e = load_apple();
+    if (e) THROWF(env, "Apple-DRI unavailable: %s", e);
+    static unsigned int cid; // one WindowServer identity per process
+    if (!cid) {
+        int err = xp.init(XP_IN_BACKGROUND);
+        if (err != XP_SUCCESS)
+            THROWF(env, "xp_init failed (%d) — no WindowServer session? "
+                        "(this path needs a logged-in GUI session, not SSH)", err);
+        err = xp.get_client_id(&cid);
+        if (err != XP_SUCCESS || !cid)
+            THROWF(env, "xp_get_client_id failed (%d)", err);
+    }
+    return mk_u32(env, cid);
+}
+
+// appleCreateContext(colorSize, alphaSize, depthSize, stencilSize,
+//                    doubleBuffer, coreProfile) -> external
+static napi_value AppleCreateContext(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 6);
+    const char *e = load_apple();
+    if (e) THROWF(env, "Apple-DRI unavailable: %s", e);
+    int color = arg_i32(env, args[0]);
+    int alpha = arg_i32(env, args[1]);
+    int depth = arg_i32(env, args[2]);
+    int stencil = arg_i32(env, args[3]);
+    bool dbl = arg_bool(env, args[4]);
+    bool core = arg_bool(env, args[5]);
+
+    // Hardware first; when there is none (a VM, say) retry without insisting,
+    // which lets Apple's software renderer through.
+    CGLPixelFormatObj pf = NULL;
+    int cerr = 0;
+    for (int accelerated = 1; accelerated >= 0 && !pf; accelerated--) {
+        int attrs[16], n = 0;
+        if (accelerated) attrs[n++] = kCGLPFAAccelerated;
+        attrs[n++] = kCGLPFAClosestPolicy;
+        if (dbl) attrs[n++] = kCGLPFADoubleBuffer;
+        attrs[n++] = kCGLPFAColorSize;  attrs[n++] = color > 0 ? color : 24;
+        attrs[n++] = kCGLPFAAlphaSize;  attrs[n++] = alpha > 0 ? alpha : 0;
+        attrs[n++] = kCGLPFADepthSize;  attrs[n++] = depth > 0 ? depth : 0;
+        if (stencil > 0) { attrs[n++] = kCGLPFAStencilSize; attrs[n++] = stencil; }
+        if (core) { attrs[n++] = kCGLPFAOpenGLProfile;
+                    attrs[n++] = kCGLOGLPVersion_3_2_Core; }
+        attrs[n] = 0;
+        GLint npix = 0;
+        cerr = cgl.ChoosePixelFormat(attrs, &pf, &npix);
+        if (cerr != 0)
+            pf = NULL;
+    }
+    if (!pf)
+        THROWF(env, "CGLChoosePixelFormat found nothing: %s",
+               cgl.ErrorString(cerr));
+    CGLContextObj ctx = NULL;
+    cerr = cgl.CreateContext(pf, NULL, &ctx);
+    if (cerr != 0 || !ctx) {
+        cgl.DestroyPixelFormat(pf);
+        THROWF(env, "CGLCreateContext: %s", cgl.ErrorString(cerr));
+    }
+    AppleCtx *a = calloc(1, sizeof(AppleCtx));
+    a->pf = pf;
+    a->ctx = ctx;
+    a->core = core ? 1 : 0;
+    napi_value ext;
+    NAPI_CALL(env, napi_create_external(env, a, apple_ctx_finalize, NULL, &ext));
+    return ext;
+}
+
+static bool apple_make_current_impl(napi_env env, AppleCtx *a) {
+    int cerr = cgl.SetCurrentContext(a->ctx);
+    if (cerr != 0) {
+        napi_throw_error(env, NULL, cgl.ErrorString(cerr));
+        return false;
+    }
+    has_current = 1;
+    apple_core_current = a->core;
+    resolve_optional_gl((EGLContext)a->ctx);
+    // A core profile refuses to draw with no vertex array object bound, and
+    // a WebGL-1-style caller has no reason to know VAOs exist — so the
+    // context carries one default VAO, exactly as the browsers do it.
+    if (a->core && !a->vao && gl.GenVertexArrays && gl.BindVertexArray) {
+        gl.GenVertexArrays(1, &a->vao);
+        gl.BindVertexArray(a->vao);
+    }
+    return true;
+}
+
+// appleMakeCurrent(ctx)
+static napi_value AppleMakeCurrent(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 1);
+    AppleCtx *a;
+    if (!get_external(env, args[0], (void **)&a)) return NULL;
+    apple_make_current_impl(env, a);
+    return NULL;
+}
+
+// appleAttach(ctx, key0, key1) — import the surface the X server exported
+// for our client id (the AppleDRICreateSurface reply) and bind the context
+// to it. Makes the context current as a side effect (Xplugin wants it so).
+// Attaching again replaces the previous surface — that is the recovery path
+// after a SurfaceNotify(destroyed) once a fresh surface has been created.
+static napi_value AppleAttach(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 3);
+    AppleCtx *a;
+    if (!get_external(env, args[0], (void **)&a)) return NULL;
+    unsigned int key[2] = { arg_u32(env, args[1]), arg_u32(env, args[2]) };
+    if (a->sid) {
+        cgl.ClearDrawable(a->ctx);
+        xp.destroy_surface(a->sid);
+        a->sid = 0;
+    }
+    int err = xp.import_surface(key, &a->sid);
+    if (err != XP_SUCCESS || !a->sid) {
+        a->sid = 0;
+        THROWF(env, "xp_import_surface failed (%d) — was the surface created "
+                    "with this process's appleClientId()?", err);
+    }
+    if (!apple_make_current_impl(env, a)) return NULL;
+    err = xp.attach_gl_context(a->ctx, a->sid);
+    if (err != XP_SUCCESS)
+        THROWF(env, "xp_attach_gl_context failed (%d)", err);
+    return NULL;
+}
+
+// appleFlush(ctx) — present the frame; the swap of this backend
+static napi_value AppleFlush(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 1);
+    AppleCtx *a;
+    if (!get_external(env, args[0], (void **)&a)) return NULL;
+    int cerr = cgl.FlushDrawable(a->ctx);
+    if (cerr != 0)
+        THROWF(env, "CGLFlushDrawable: %s", cgl.ErrorString(cerr));
+    return NULL;
+}
+
+// appleUpdate(ctx) — refresh the context's idea of the surface after the
+// window moved or resized (on ConfigureNotify or SurfaceNotify kind 0)
+static napi_value AppleUpdate(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 1);
+    AppleCtx *a;
+    if (!get_external(env, args[0], (void **)&a)) return NULL;
+    xp.update_gl_context(a->ctx);
+    return NULL;
+}
+
+// appleSetSwapInterval(ctx, n) — 0: flush returns at once (default);
+// 1: flush blocks to vertical retrace, which also blocks the event loop
+static napi_value AppleSetSwapInterval(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 2);
+    AppleCtx *a;
+    if (!get_external(env, args[0], (void **)&a)) return NULL;
+    GLint v = arg_i32(env, args[1]);
+    cgl.SetParameter(a->ctx, kCGLCPSwapInterval, &v);
+    return NULL;
+}
+
+// appleDestroyContext(ctx)
+static napi_value AppleDestroyContext(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 1);
+    AppleCtx *a;
+    if (!get_external(env, args[0], (void **)&a)) return NULL;
+    if (!a->destroyed) {
+        if (cgl.GetCurrentContext() == a->ctx) {
+            cgl.SetCurrentContext(NULL);
+            has_current = 0;
+            apple_core_current = 0;
+        }
+        if (optional_ctx == (EGLContext)a->ctx)
+            optional_ctx = NULL; // a later context could land on this address
+        cgl.ClearDrawable(a->ctx);
+        cgl.DestroyContext(a->ctx);
+        cgl.DestroyPixelFormat(a->pf);
+        if (a->sid)
+            xp.destroy_surface(a->sid);
+        a->destroyed = 1;
+    }
+    return NULL;
+}
+
+#else // !__APPLE__
+
+#define NO_APPLEDRI                                                           \
+    "the Apple-DRI/CGL path is XQuartz's direct rendering and exists only "   \
+    "on macOS — on " PLATFORM_NAME " use the DRI3 path (Gpu)"
+
+static napi_value AppleClientId(napi_env env, napi_callback_info info) {
+    (void)info; THROW(env, "appleClientId: " NO_APPLEDRI);
+}
+static napi_value AppleCreateContext(napi_env env, napi_callback_info info) {
+    (void)info; THROW(env, "appleCreateContext: " NO_APPLEDRI);
+}
+static napi_value AppleMakeCurrent(napi_env env, napi_callback_info info) {
+    (void)info; THROW(env, "appleMakeCurrent: " NO_APPLEDRI);
+}
+static napi_value AppleAttach(napi_env env, napi_callback_info info) {
+    (void)info; THROW(env, "appleAttach: " NO_APPLEDRI);
+}
+static napi_value AppleFlush(napi_env env, napi_callback_info info) {
+    (void)info; THROW(env, "appleFlush: " NO_APPLEDRI);
+}
+static napi_value AppleUpdate(napi_env env, napi_callback_info info) {
+    (void)info; THROW(env, "appleUpdate: " NO_APPLEDRI);
+}
+static napi_value AppleSetSwapInterval(napi_env env, napi_callback_info info) {
+    (void)info; THROW(env, "appleSetSwapInterval: " NO_APPLEDRI);
+}
+static napi_value AppleDestroyContext(napi_env env, napi_callback_info info) {
+    (void)info; THROW(env, "appleDestroyContext: " NO_APPLEDRI);
+}
+
+#endif // __APPLE__
+
+// ---------------------------------------------------------------------------
 // dma-buf plumbing: udmabuf, DMA_BUF_IOCTL_SYNC, dup
 //
 // The first two are the Linux dma-buf ABI itself and are compiled out where
@@ -2485,6 +2961,15 @@ static napi_value Probe(napi_env env, napi_callback_info info) {
     obj_set(env, obj, "egl", e ? mk_str(env, e) : mk_bool(env, true));
     e = load_gles();
     obj_set(env, obj, "gles", e ? mk_str(env, e) : mk_bool(env, true));
+#if defined(__APPLE__)
+    // The XQuartz direct-rendering client pieces: libXplugin + CGL. True
+    // means they load — whether the WindowServer will talk to this process
+    // (a GUI session, not SSH) is settled by appleClientId().
+    e = load_apple();
+    obj_set(env, obj, "appledri", e ? mk_str(env, e) : mk_bool(env, true));
+#else
+    obj_set(env, obj, "appledri", mk_str(env, NO_APPLEDRI));
+#endif
 #if HAVE_DMABUF
     obj_set(env, obj, "udmabuf", mk_bool(env, access("/dev/udmabuf", W_OK) == 0));
 #else
@@ -2518,6 +3003,15 @@ NAPI_MODULE_INIT() {
     EXPORT("releaseBuffer", ReleaseBuffer);
     EXPORT("destroySurface", DestroySurface);
     EXPORT("destroyGpu", DestroyGpu);
+
+    EXPORT("appleClientId", AppleClientId);
+    EXPORT("appleCreateContext", AppleCreateContext);
+    EXPORT("appleAttach", AppleAttach);
+    EXPORT("appleMakeCurrent", AppleMakeCurrent);
+    EXPORT("appleFlush", AppleFlush);
+    EXPORT("appleUpdate", AppleUpdate);
+    EXPORT("appleSetSwapInterval", AppleSetSwapInterval);
+    EXPORT("appleDestroyContext", AppleDestroyContext);
 
     EXPORT("glClearColor", Gl_clearColor);
     EXPORT("glClearDepthf", Gl_clearDepthf);
