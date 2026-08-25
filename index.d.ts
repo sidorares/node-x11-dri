@@ -297,6 +297,16 @@ export declare const apple: {
      * throws (naming the reason) where there is none, e.g. over SSH.
      */
     clientId(): number;
+    /**
+     * The fastest refresh rate any connected display is running at, in Hz, or
+     * `null` when it cannot be determined (e.g. over SSH — no GUI session,
+     * no rate). XQuartz's RandR advertises modes without timing data, so a
+     * consumer pacing frames on this path asks macOS directly. The maximum
+     * across displays is a pacing *ceiling*, matching the fastest-CRTC
+     * semantics RandR gives on Linux; for variable-rate panels (ProMotion)
+     * it is the nominal maximum. Needs no WindowServer handshake.
+     */
+    refreshRate(): number | null;
     Context: typeof AppleContext;
 };
 

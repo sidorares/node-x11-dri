@@ -382,7 +382,12 @@ logged-in GUI session (an SSH login gets a clear error from
 `apple.clientId()`); pacing is yours — `flush()` returns immediately by
 default and a timer sets the frame rate (`setSwapInterval(1)` gives real
 vsync at the price of blocking the event loop up to a frame); and `Present`
-plays no part in this path.
+plays no part in this path. A timer needs a rate to aim for, and XQuartz's
+RandR advertises modes with **no timing data** — so `apple.refreshRate()`
+asks macOS directly: the fastest rate any connected display is running at, in
+Hz (max across displays, the same pacing-ceiling semantics as taking the
+fastest CRTC from RandR on Linux), or `null` where there is no answer, e.g.
+over SSH.
 
 `probe()` reports the whole picture at runtime:
 

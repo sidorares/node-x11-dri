@@ -582,6 +582,13 @@ const apple = {
     // throws (naming the reason) where there is none to connect to, e.g. an
     // SSH session or a non-macOS host.
     clientId() { return native.appleClientId(); },
+    // The fastest refresh rate any connected display is running at, in Hz, or
+    // null when there is no rate to be had (e.g. over SSH). XQuartz's RandR
+    // advertises modes with no timing data, so a frame loop pacing itself
+    // (flush() never blocks by default) asks macOS directly. Max across
+    // displays — a pacing ceiling, the same semantics as taking the fastest
+    // CRTC from RandR on Linux. Needs no WindowServer handshake.
+    refreshRate() { return native.appleRefreshRate(); },
     Context: AppleContext
 };
 
