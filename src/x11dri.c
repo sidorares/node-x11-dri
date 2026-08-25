@@ -260,6 +260,8 @@ typedef uint32_t GLbitfield;
 
 #define LIB_XPLUGIN "/usr/lib/libXplugin.1.dylib" // dyld-cache-only file; dlopen works
 #define LIB_OPENGL  "/System/Library/Frameworks/OpenGL.framework/OpenGL"
+#define LIB_COREGRAPHICS "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
+#define LIB_COREVIDEO    "/System/Library/Frameworks/CoreVideo.framework/CoreVideo"
 
 #define XP_SUCCESS       0
 #define XP_IN_BACKGROUND (1 << 0)
@@ -506,6 +508,29 @@ static struct {
     int (*SetParameter)(CGLContextObj ctx, int pname, const GLint *params);
     const char *(*ErrorString)(int err);
 } cgl;
+
+// CoreGraphics + CoreVideo, for the one display question the X side cannot
+// answer: how fast the panels actually refresh. XQuartz's RandR advertises
+// modes with no timing data (dotClock/hTotal/vTotal all zero), so a consumer
+// pacing frames has nobody to ask but macOS itself.
+typedef struct { // CVTime (CoreVideo/CVBase.h); returned by value
+    int64_t timeValue;
+    int32_t timeScale;
+    int32_t flags;
+} CVTime_;
+#define kCVTimeIsIndefinite_ (1 << 0)
+
+static struct {
+    void *cg_lib;
+    void *cv_lib; // optional — only the fallback lives here
+    int32_t (*GetOnlineDisplayList)(uint32_t max, uint32_t *ids, uint32_t *n);
+    void *(*CopyDisplayMode)(uint32_t id);
+    double (*ModeGetRefreshRate)(void *mode);
+    void (*ModeRelease)(void *mode);
+    int32_t (*LinkCreateWithCGDisplay)(uint32_t id, void **link);
+    CVTime_ (*LinkGetNominalPeriod)(void *link);
+    void (*LinkRelease)(void *link);
+} dsp;
 #endif
 
 static const char *load_gbm(void) {
@@ -742,6 +767,48 @@ static const char *load_apple(void) {
     if (e) return e;
     xp.lib = xh;
     cgl.lib = oh;
+    return NULL;
+}
+
+// Load the display-timing query. Deliberately apart from load_apple(): this
+// needs neither XQuartz nor the WindowServer handshake, only the system
+// frameworks every macOS has.
+static const char *load_display(void) {
+    if (dsp.cg_lib) return NULL;
+    void *cg = dlopen(LIB_COREGRAPHICS, RTLD_NOW | RTLD_GLOBAL);
+    if (!cg) return "the CoreGraphics framework did not load";
+#define SD(field, name)                                                       \
+    do {                                                                      \
+        *(void **)&dsp.field = dlsym(cg, name);                               \
+        if (!dsp.field) return "CoreGraphics is missing " name;               \
+    } while (0)
+    // Online, not Active: the active list (displays available for drawing)
+    // comes back empty in restricted contexts — observed under a sandboxed
+    // shell whose WindowServer handshake nonetheless succeeds — while the
+    // online list (everything connected, mirrored and sleeping included)
+    // still answers. A superset can only raise the ceiling, never miss it.
+    SD(GetOnlineDisplayList, "CGGetOnlineDisplayList");
+    SD(CopyDisplayMode, "CGDisplayCopyDisplayMode");
+    SD(ModeGetRefreshRate, "CGDisplayModeGetRefreshRate");
+    SD(ModeRelease, "CGDisplayModeRelease");
+#undef SD
+    // CoreVideo covers the panels where CGDisplayModeGetRefreshRate answers
+    // 0 (documented for some built-in flat panels). Its absence only narrows
+    // the answer, so a miss here is not an error.
+    void *cv = dlopen(LIB_COREVIDEO, RTLD_NOW | RTLD_GLOBAL);
+    if (cv) {
+        *(void **)&dsp.LinkCreateWithCGDisplay =
+            dlsym(cv, "CVDisplayLinkCreateWithCGDisplay");
+        *(void **)&dsp.LinkGetNominalPeriod =
+            dlsym(cv, "CVDisplayLinkGetNominalOutputVideoRefreshPeriod");
+        *(void **)&dsp.LinkRelease = dlsym(cv, "CVDisplayLinkRelease");
+        if (dsp.LinkCreateWithCGDisplay && dsp.LinkGetNominalPeriod &&
+            dsp.LinkRelease)
+            dsp.cv_lib = cv;
+        else
+            dlclose(cv);
+    }
+    dsp.cg_lib = cg;
     return NULL;
 }
 #endif
@@ -2630,6 +2697,53 @@ static napi_value AppleClientId(napi_env env, napi_callback_info info) {
     return mk_u32(env, cid);
 }
 
+// appleRefreshRate() -> number | null. The fastest refresh rate any
+// connected display is running at, in Hz — asked of macOS because XQuartz's RandR has
+// no timing data to give. Max across displays is a pacing *ceiling*, the
+// same semantics RandR's fastest CRTC gives consumers on Linux, not
+// per-window tracking. Null when there is no rate to be had (no GUI
+// session, or no display would state one).
+static napi_value AppleRefreshRate(napi_env env, napi_callback_info info) {
+    (void)info;
+    const char *e = load_display();
+    if (e) THROWF(env, "display refresh rate unavailable: %s", e);
+    napi_value ret;
+    uint32_t ids[16], n = 0;
+    if (dsp.GetOnlineDisplayList(16, ids, &n) != 0 || n == 0) {
+        NAPI_CALL(env, napi_get_null(env, &ret));
+        return ret;
+    }
+    double best = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        double hz = 0;
+        void *mode = dsp.CopyDisplayMode(ids[i]);
+        if (mode) {
+            hz = dsp.ModeGetRefreshRate(mode);
+            dsp.ModeRelease(mode);
+        }
+        // 0 is CGDisplayModeGetRefreshRate's documented answer for some
+        // built-in panels; a throwaway display link still knows the nominal
+        // rate (for variable-rate panels like ProMotion, the maximum — the
+        // right number for a pacing ceiling).
+        if (hz <= 0 && dsp.cv_lib) {
+            void *link = NULL;
+            if (dsp.LinkCreateWithCGDisplay(ids[i], &link) == 0 && link) {
+                CVTime_ t = dsp.LinkGetNominalPeriod(link);
+                if (!(t.flags & kCVTimeIsIndefinite_) && t.timeValue > 0)
+                    hz = (double)t.timeScale / (double)t.timeValue;
+                dsp.LinkRelease(link);
+            }
+        }
+        if (hz > best) best = hz;
+    }
+    if (best <= 0) {
+        NAPI_CALL(env, napi_get_null(env, &ret));
+        return ret;
+    }
+    NAPI_CALL(env, napi_create_double(env, best, &ret));
+    return ret;
+}
+
 // appleCreateContext(colorSize, alphaSize, depthSize, stencilSize,
 //                    doubleBuffer, coreProfile) -> external
 static napi_value AppleCreateContext(napi_env env, napi_callback_info info) {
@@ -2801,6 +2915,9 @@ static napi_value AppleDestroyContext(napi_env env, napi_callback_info info) {
 
 static napi_value AppleClientId(napi_env env, napi_callback_info info) {
     (void)info; THROW(env, "appleClientId: " NO_APPLEDRI);
+}
+static napi_value AppleRefreshRate(napi_env env, napi_callback_info info) {
+    (void)info; THROW(env, "appleRefreshRate: " NO_APPLEDRI);
 }
 static napi_value AppleCreateContext(napi_env env, napi_callback_info info) {
     (void)info; THROW(env, "appleCreateContext: " NO_APPLEDRI);
@@ -3005,6 +3122,7 @@ NAPI_MODULE_INIT() {
     EXPORT("destroyGpu", DestroyGpu);
 
     EXPORT("appleClientId", AppleClientId);
+    EXPORT("appleRefreshRate", AppleRefreshRate);
     EXPORT("appleCreateContext", AppleCreateContext);
     EXPORT("appleAttach", AppleAttach);
     EXPORT("appleMakeCurrent", AppleMakeCurrent);

@@ -208,10 +208,26 @@ report('Apple-DRI context: ES2 shaders + FBO on CGL', () => {
     }
 });
 
+// Unlike everything else in the apple namespace this needs no XQuartz and no
+// WindowServer handshake — only the system frameworks — so it is gated on
+// the platform alone. Null is a legal answer (a headless session has no rate
+// to report), a number outside any plausible panel's range is not.
+report('apple.refreshRate answers in Hz or null', () => {
+    if (caps.platform !== 'darwin')
+        skip('needs macOS');
+    const hz = dri.apple.refreshRate();
+    if (hz === null)
+        return 'null (no display would state a rate — headless session?)';
+    assert.strictEqual(typeof hz, 'number');
+    assert.ok(hz >= 24 && hz <= 500, `a plausible display rate, got ${hz}`);
+    return `${hz} Hz`;
+});
+
 report('apple path degrades cleanly off macOS', () => {
     if (caps.platform === 'darwin')
         skip('this host is macOS');
     assert.throws(() => dri.apple.clientId(), /macOS|XQuartz/, 'clientId explains itself');
+    assert.throws(() => dri.apple.refreshRate(), /macOS|XQuartz/, 'refreshRate explains itself');
     assert.throws(() => new dri.apple.Context(), /macOS|XQuartz/, 'Context explains itself');
     return `${caps.platform}: appledri reported unavailable`;
 });

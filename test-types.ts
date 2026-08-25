@@ -183,6 +183,7 @@ gl.readPixels(0, 0, 4, 4, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
 
 const appledriWhy: string = caps.appledri === true ? 'fine' : caps.appledri;
 const cid: number = apple.clientId();
+const hz: number | null = apple.refreshRate();
 const actx = new apple.Context({ depthSize: 16, profile: 'core' });
 actx.attach([0, 0]);
 actx.attach(0, 0);
@@ -218,5 +219,5 @@ export {
     usable, why, nodes, copy, eglVendor, contextVersion, major, compiled, log,
     viewport, maxTexture, dithering, extensions, live, notANumber, bits,
     alsoGl, modifierLinear, constantsOnly, nope, gl, out, info, value, precision,
-    appledriWhy, cid, actxGl
+    appledriWhy, cid, hz, actxGl
 };
