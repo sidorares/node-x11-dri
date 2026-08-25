@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/sidorares/node-x11-dri/compare/v0.5.0...v0.6.0) (2026-08-25)
+
+
+### Features
+
+* **apple:** expose the display refresh rate — XQuartz RandR has no timing data ([#15](https://github.com/sidorares/node-x11-dri/issues/15)) ([2471d9c](https://github.com/sidorares/node-x11-dri/commit/2471d9cedd173d66a7cd841e56c8645a44344cfc)), closes [#14](https://github.com/sidorares/node-x11-dri/issues/14)
+
 ## [0.5.0](https://github.com/sidorares/node-x11-dri/compare/v0.4.0...v0.5.0) (2026-08-24)
 
 
