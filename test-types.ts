@@ -8,10 +8,11 @@
 // which is what keeps the declarations from quietly widening to `any`.
 
 import {
-    probe, dup, listRenderNodes, createUdmabuf, dmabufSync,
+    probe, dup, listRenderNodes, createUdmabuf, mapDmabuf, dmabufSync,
     Gpu, GL, gl as sharedGl, apple,
     FORMAT, GBM_USE, MODIFIER, DMABUF_SYNC,
-    ActiveInfo, GlFeatures, GLContext, ProbeResult, Surface, SwapResult, TypedArray
+    ActiveInfo, GlFeatures, GLContext, ImportedImage, MappedDmabuf, ProbeResult,
+    Surface, SwapResult, TypedArray
 } from './index';
 
 // ---- probe and the plumbing ------------------------------------------------
@@ -28,6 +29,14 @@ buf.sync(DMABUF_SYNC.START | DMABUF_SYNC.WRITE);
 new Uint8Array(buf.buffer)[0] = 0xff;
 buf.sync(DMABUF_SYNC.END | DMABUF_SYNC.WRITE);
 dmabufSync(buf.fd, DMABUF_SYNC.RW);
+
+// the same memory reached through a borrowed descriptor instead
+const mapped: MappedDmabuf = mapDmabuf(buf.fd);
+mapped.sync(DMABUF_SYNC.START | DMABUF_SYNC.READ);
+const firstByte: number = new Uint8Array(mapped.buffer)[0];
+mapped.close();
+mapDmabuf(buf.fd, 4096).close();
+
 buf.close();
 
 // @ts-expect-error — size is required
@@ -149,6 +158,35 @@ if (features?.drawBuffers) {
     gl.drawBuffers(new Uint32Array([gl.COLOR_ATTACHMENT0]));
 }
 
+// ---- importing a dma-buf ---------------------------------------------------
+
+if (features?.dmabufImport) {
+    const image: ImportedImage = gl.importDmabuf({
+        width: 256,
+        height: 256,
+        fourcc: FORMAT.XRGB8888,
+        modifier: features.dmabufImportModifiers ? MODIFIER.LINEAR : MODIFIER.INVALID,
+        planes: [{ fd: copy, stride: 1024, offset: 0 }]
+    });
+    gl.bindTexture(image.target, image.texture);
+    image.destroy();
+
+    // two planes out of one descriptor, and offset defaulting to 0
+    if (features.dmabufImportExternal)
+        gl.importDmabuf({
+            width: 64,
+            height: 64,
+            fourcc: 0x3231564e, // fourcc('N','V','1','2')
+            target: GL.TEXTURE_EXTERNAL_OES,
+            planes: [{ fd: copy, stride: 64 }, { fd: copy, stride: 64, offset: 4096 }]
+        }).destroy();
+}
+
+// @ts-expect-error — planes are not optional
+gl.importDmabuf({ width: 1, height: 1, fourcc: FORMAT.XRGB8888 });
+// @ts-expect-error — a modifier is a BigInt, not a number
+gl.importDmabuf({ width: 1, height: 1, fourcc: FORMAT.XRGB8888, modifier: 0, planes: [] });
+
 // ---- queries answer in the shape the parameter has -------------------------
 
 const viewport = gl.getParameter(gl.VIEWPORT);
@@ -219,5 +257,5 @@ export {
     usable, why, nodes, copy, eglVendor, contextVersion, major, compiled, log,
     viewport, maxTexture, dithering, extensions, live, notANumber, bits,
     alsoGl, modifierLinear, constantsOnly, nope, gl, out, info, value, precision,
-    appledriWhy, cid, hz, actxGl
+    appledriWhy, cid, hz, actxGl, firstByte
 };

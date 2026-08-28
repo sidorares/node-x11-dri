@@ -26,6 +26,14 @@ fills exactly that hole:
   kernel's `/dev/udmabuf`, with the pixels mapped into JS as an
   `ArrayBuffer`: the GPU-less way to feed DRI3 (the same trick Xwayland
   uses), where supported by the server's driver.
+- **`gl.importDmabuf({...})`** — the same traffic in reverse: a dma-buf
+  someone *else* allocated becomes a GL texture with no copy. That is the
+  last step of the compositor path — `Composite.NameWindowPixmap` →
+  `DRI3.BuffersFromPixmap` → here — and how a decoder's or another client's
+  buffer gets sampled. (Linux)
+- **`mapDmabuf(fd, size?)`** — the CPU-read counterpart: a descriptor the
+  caller did not allocate, mapped into JS as an `ArrayBuffer`. What
+  `createUdmabuf` already gives for one it did. (Linux)
 - **`dup(fd)`**, **`dmabufSync(fd, flags)`** — descriptor plumbing (DRI3
   sends consume their fds; `dup` keeps a copy) and CPU-access bracketing.
 
@@ -182,7 +190,7 @@ order, so code and tutorials carry over:
 | framebuffers | `createFramebuffer`, `bindFramebuffer`, `framebufferTexture2D`, `framebufferRenderbuffer`, `checkFramebufferStatus`, `createRenderbuffer`, `bindRenderbuffer`, `renderbufferStorage`, deletes |
 | per-fragment state | `blendFunc`, `blendFuncSeparate`, `blendEquation`, `blendEquationSeparate`, `blendColor`, `depthFunc`, `depthMask`, `depthRange`, `colorMask`, `scissor`, `polygonOffset`, `stencilFunc`, `stencilOp`, `stencilMask`, `clearStencil`, `cullFace`, `frontFace` |
 | introspection | `getActiveUniform`, `getActiveAttrib`, `getUniform`, `getAttachedShaders`, `getShaderSource`, `getShaderPrecisionFormat`, `getVertexAttrib`, `getVertexAttribOffset`, `getBufferParameter`, `getTexParameter`, `getFramebufferAttachmentParameter`, `getRenderbufferParameter`, `getSupportedExtensions`, `validateProgram`, `isBuffer`/`isProgram`/`isShader`/`isTexture`/`isFramebuffer`/`isRenderbuffer`/`isEnabled` |
-| optional (see `gpu.features`) | `createVertexArray`, `bindVertexArray`, `deleteVertexArray`, `isVertexArray`; `drawArraysInstanced`, `drawElementsInstanced`, `vertexAttribDivisor`; `drawBuffers`; `texImage3D`, `texSubImage3D`, `copyTexSubImage3D`, `compressedTexImage3D`, `compressedTexSubImage3D`, `framebufferTextureLayer`; `texStorage2D`, `texStorage3D` |
+| optional (see `gpu.features`) | `createVertexArray`, `bindVertexArray`, `deleteVertexArray`, `isVertexArray`; `drawArraysInstanced`, `drawElementsInstanced`, `vertexAttribDivisor`; `drawBuffers`; `texImage3D`, `texSubImage3D`, `copyTexSubImage3D`, `compressedTexImage3D`, `compressedTexSubImage3D`, `framebufferTextureLayer`; `texStorage2D`, `texStorage3D`; `importDmabuf` |
 | the rest | `clear`, `clearColor`, `clearDepthf`, `viewport`, `enable`, `disable`, `lineWidth`, `pixelStorei`, `getParameter`, `getIntegerv`, `getFloatv`, `getBooleanv`, `getError`, `getString`, `readPixels`, `finish`, `flush` |
 
 `texImage2D` accepts `null` pixels, which is how a texture is allocated to be
@@ -218,7 +226,8 @@ everything else, against a live context, and reported per feature:
 ```js
 gpu.makeCurrent(surface);
 gpu.features            // { vertexArrayObject, instancedArrays, drawBuffers,
-                        //   texture3D, textureStorage }
+                        //   texture3D, textureStorage, dmabufImport,
+                        //   dmabufImportModifiers, dmabufImportExternal }
 if (gpu.features.instancedArrays)
     gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, count);
 ```
@@ -261,6 +270,66 @@ afterwards, through `texSubImage`. Sampling either target needs GLSL ES 3.00
 (`sampler3D`, `sampler2DArray`), so it needs an ES 3.0 context — see
 `glVersion` above. `examples/texture-3d.js` ray-marches a 64³ volume beside
 the array texture and the slices it interpolates between.
+
+### Importing a dma-buf
+
+Everything above produces buffers; this consumes one. A descriptor that
+arrives from anywhere else — `DRI3.BuffersFromPixmap` on a redirected
+window's pixmap, a video decoder, another process — becomes an `EGLImage`
+and then an ordinary texture, sampled where it lies:
+
+```js
+// X side (pure JS, node-x11 >= 4.1 under Bun's receiveFds): the pixmap of a
+// redirected window, described as planes
+const buf = await dri3.BuffersFromPixmap(pixmap);
+// { width, height, modifier, depth, bpp, planes: [{ fd, stride, offset }] }
+
+const image = gl.importDmabuf({
+    width: buf.width, height: buf.height,
+    fourcc: dri.FORMAT.XRGB8888,          // any DRM fourcc, not just these two
+    modifier: buf.modifier,               // omit for the implicit-modifier form
+    planes: buf.planes
+});
+gl.bindTexture(image.target, image.texture);   // then sample it like any other
+// ... draw ...
+image.destroy();                          // glDeleteTextures + eglDestroyImageKHR
+```
+
+The plane shape is exactly what `BuffersFromPixmap` replies with, and exactly
+what `PixmapFromBuffers` takes, because it is the same description of the same
+buffer travelling the other way.
+
+Three things worth knowing:
+
+- **The descriptors are consumed.** On success `importDmabuf` closes them,
+  the same ownership rule DRI3's fd-carrying requests and `swap()`'s exported
+  fd follow — EGL holds its own reference to the buffer from then on. On
+  failure it throws and leaves them open, so a caller can report or retry.
+  `dup()` first if you need to keep one.
+- **`target` is in the answer, not assumed.** A single RGB plane lands on
+  `TEXTURE_2D`; multi-planar and YUV imports come back as
+  `TEXTURE_EXTERNAL_OES`, which GLSL reads through a `samplerExternalOES`
+  rather than a `sampler2D`. Pass `target` explicitly to insist.
+- **Ask before you try.** `gpu.features.dmabufImport` says whether the driver
+  has `EGL_EXT_image_dma_buf_import` at all,
+  `features.dmabufImportModifiers` whether an explicit `modifier` may be
+  passed (without it, only the implicit form works), and
+  `features.dmabufImportExternal` whether the external target exists. All
+  three are `false` on the macOS/CGL backend, which has no EGL.
+  `probe()` cannot answer these — they are extensions of an *initialized* EGL
+  display, and `probe()` opens no devices — so it returns a string saying to
+  read `features` after `makeCurrent()` instead.
+
+`examples/dmabuf-import.js` renders both sides of that: one udmabuf shown
+twice, imported on the left and mapped-then-uploaded on the right.
+
+For a buffer the CPU should read rather than the GPU, `mapDmabuf(fd, size?)`
+returns `{ buffer, size, sync(flags), close() }` — the same shape
+`createUdmabuf` returns, minus the allocation. The descriptor is *borrowed*
+there, not consumed: it stays yours to send on. Only exporters that implement
+mmap can be mapped at all (udmabuf and linear/dumb buffers do, tiled GPU
+allocations generally do not), and `close()` releases the mapping at once
+rather than waiting for the collector.
 
 ### Still not covered
 
@@ -312,6 +381,7 @@ Silicon:
 | GBM | no `libgbm` on macOS | `Gpu` cannot allocate exportable buffers |
 | EGL | XQuartz ships Mesa's `libGLESv2`/`libOSMesa` but **no `libEGL`** | no way to create the ES context, even ignoring the above |
 | udmabuf | `/dev/udmabuf` is a Linux driver | the CPU-memory fallback is out too |
+| dma-buf import | needs EGL and a dma-buf to import | `gl.importDmabuf` and `mapDmabuf` report unavailable |
 
 The gaps compound: even with a GPU context, there is no dma-buf to export;
 even with a dma-buf, there is no DRI3 request to hand it to. The pure-JS
@@ -400,7 +470,8 @@ require('x11-dri').probe();
 //   egl:  'dlopen(libEGL.dylib) ... no such file',
 //   gles: true,
 //   appledri: true,                // libXplugin + OpenGL.framework load
-//   udmabuf: 'dma-buf is a Linux kernel facility with no darwin equivalent ...'
+//   udmabuf: 'dma-buf is a Linux kernel facility with no darwin equivalent ...',
+//   dmabufImport: 'dma-buf is a Linux kernel facility with no darwin equivalent ...'
 // }
 ```
 

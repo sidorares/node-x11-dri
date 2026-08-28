@@ -138,6 +138,7 @@ report('non-dma-buf platform degrades cleanly', () => {
     assert.strictEqual(dri.listRenderNodes().length, 0, 'no render nodes off Linux');
     assert.throws(() => dri.createUdmabuf(4096), /dma-buf/, 'udmabufCreate explains itself');
     assert.throws(() => dri.dmabufSync(0, 0), /dma-buf/, 'dmabufSync explains itself');
+    assert.throws(() => dri.mapDmabuf(0, 4096), /dma-buf/, 'mapDmabuf explains itself');
     assert.throws(() => new dri.Gpu({}), /DRI3|DRM/, 'Gpu explains itself');
     return `${caps.platform}: gbm/dma-buf reported unavailable`;
 });
@@ -278,6 +279,144 @@ report('GPU render + readback + dma-buf export', () => {
     surf.destroy();
     gpu.destroy();
     return renderer;
+});
+
+// Every argument check happens in JavaScript, before the addon is asked for
+// anything — so this is the one part of the import path that can be tested on
+// a machine with no GPU (and it proves a bad call touches no descriptor).
+report('importDmabuf argument checking', () => {
+    const base = {
+        width: 4, height: 4, fourcc: dri.FORMAT.XRGB8888,
+        planes: [{ fd: 0, stride: 16, offset: 0 }]
+    };
+    assert.throws(() => dri.gl.importDmabuf({ ...base, planes: [] }), /planes/);
+    assert.throws(() => dri.gl.importDmabuf({ ...base, planes: undefined }), /planes/);
+    assert.throws(() => dri.gl.importDmabuf({ ...base, planes: [{ stride: 16 }] }), /plane 0/);
+    assert.throws(() => dri.gl.importDmabuf({ ...base, fourcc: undefined }), /fourcc/);
+    assert.throws(() => dri.gl.importDmabuf({ ...base, height: 0 }), /width and height/);
+    assert.throws(() => dri.gl.importDmabuf({ ...base, modifier: 0 }), /BigInt/);
+    fs.fstatSync(0); // nothing above got as far as consuming a descriptor
+});
+
+// The other direction of the dma-buf story: a descriptor this process did
+// allocate, read back through the borrowed-fd path a foreign one would take.
+report('mapDmabuf reads a dma-buf through a borrowed descriptor', () => {
+    if (caps.udmabuf !== true)
+        skip(typeof caps.udmabuf === 'string' ? caps.udmabuf : '/dev/udmabuf not accessible');
+    const ud = dri.createUdmabuf(4096);
+    try {
+        ud.sync(dri.DMABUF_SYNC.START | dri.DMABUF_SYNC.WRITE);
+        new Uint32Array(ud.buffer)[0] = 0xdeadbeef;
+        ud.sync(dri.DMABUF_SYNC.END | dri.DMABUF_SYNC.WRITE);
+
+        const m = dri.mapDmabuf(ud.fd); // size taken from the descriptor
+        assert.ok(m.size >= 4096, `mapped ${m.size} bytes`);
+        m.sync(dri.DMABUF_SYNC.START | dri.DMABUF_SYNC.READ);
+        assert.strictEqual(new Uint32Array(m.buffer)[0], 0xdeadbeef,
+            'the mapping sees the same memory');
+        m.sync(dri.DMABUF_SYNC.END | dri.DMABUF_SYNC.READ);
+
+        const view = new Uint8Array(m.buffer);
+        m.close();
+        assert.strictEqual(view.byteLength, 0, 'close() detaches views over the mapping');
+        m.close(); // idempotent
+        fs.fstatSync(ud.fd); // borrowed, not consumed
+        return `${m.size} bytes`;
+    } finally {
+        ud.close();
+    }
+});
+
+// The round trip, which is the whole point: render a frame, export it as a
+// dma-buf (what DRI3 PixmapFromBuffer would be handed), then import that same
+// descriptor back as a texture and sample it. If the pixels survive the trip
+// the import is real — no copy happened anywhere along it.
+report('dma-buf import: export a frame, import it back and sample it', () => {
+    const W = 64;
+    const { gpu, surf, gl } = glSurface(W, {});
+    try {
+        if (!gpu.features.dmabufImport)
+            skip('driver has no EGL_EXT_image_dma_buf_import');
+
+        gl.clearColor(0.2, 0.4, 0.6, 1);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        const out = surf.swap();
+        assert.ok(out && out.isNew, 'the first swap of a surface exports a descriptor');
+
+        // A modifier is only legal to pass where the second extension is
+        // there to understand it; INVALID means "implicit" either way.
+        const withModifier = gpu.features.dmabufImportModifiers &&
+            out.modifier !== dri.MODIFIER.INVALID;
+        const image = gl.importDmabuf({
+            width: W,
+            height: W,
+            fourcc: gpu.format,
+            modifier: withModifier ? out.modifier : undefined,
+            planes: [{ fd: out.fd, stride: out.stride, offset: out.offset }]
+        });
+        try {
+            assert.strictEqual(image.target, gl.TEXTURE_2D,
+                'one RGB plane imports onto TEXTURE_2D');
+            assert.ok(image.texture > 0, 'a texture name came back');
+            assert.throws(() => fs.fstatSync(out.fd), /EBADF/,
+                'the descriptor was consumed by the import');
+
+            // Sample it into an FBO — the surface's own back buffer belongs
+            // to the swapchain now, and this keeps the check independent of it.
+            const dest = gl.createTexture();
+            gl.bindTexture(gl.TEXTURE_2D, dest);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, W, W, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+            const fbo = gl.createFramebuffer();
+            gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+            gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0,
+                gl.TEXTURE_2D, dest, 0);
+            assert.strictEqual(gl.checkFramebufferStatus(gl.FRAMEBUFFER),
+                gl.FRAMEBUFFER_COMPLETE);
+
+            const prog = buildProgram(gl,
+                'attribute vec2 position;\nvarying vec2 vUv;\n' +
+                'void main() { vUv = position * 0.5 + 0.5;' +
+                ' gl_Position = vec4(position, 0.0, 1.0); }',
+                'precision mediump float;\nuniform sampler2D uMap;\nvarying vec2 vUv;\n' +
+                'void main() { gl_FragColor = texture2D(uMap, vUv); }');
+            const quad = gl.createBuffer();
+            gl.bindBuffer(gl.ARRAY_BUFFER, quad);
+            gl.bufferData(gl.ARRAY_BUFFER,
+                new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+            gl.useProgram(prog);
+            const loc = gl.getAttribLocation(prog, 'position');
+            gl.enableVertexAttribArray(loc);
+            gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+            gl.activeTexture(gl.TEXTURE0);
+            gl.bindTexture(image.target, image.texture);
+            gl.uniform1i(gl.getUniformLocation(prog, 'uMap'), 0);
+            gl.viewport(0, 0, W, W);
+            gl.clearColor(0, 0, 0, 1);
+            gl.clear(gl.COLOR_BUFFER_BIT);
+            gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+            assert.strictEqual(gl.getError(), gl.NO_ERROR, 'sampling the imported texture');
+
+            const px = new Uint8Array(4);
+            gl.readPixels(W >> 1, W >> 1, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+            assert.ok(Math.abs(px[0] - 51) <= 2 && Math.abs(px[1] - 102) <= 2 &&
+                Math.abs(px[2] - 153) <= 2,
+                `the exported frame came back through the import: [${px.join(', ')}]`);
+
+            gl.bindFramebuffer(gl.FRAMEBUFFER, 0);
+            gl.deleteFramebuffer(fbo);
+            gl.deleteTexture(dest);
+        } finally {
+            image.destroy();
+            image.destroy(); // idempotent
+        }
+        surf.release(out.key);
+        return `${gpu.format.toString(16)}${withModifier ? ' with modifier' : ' implicit modifier'}`;
+    } finally {
+        surf.destroy();
+        gpu.destroy();
+    }
 });
 
 // Everything the ES 2.0 binding covers beyond "clear it and read it back":
