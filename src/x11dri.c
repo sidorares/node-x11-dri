@@ -507,6 +507,10 @@ static struct {
     int (*ClearDrawable)(CGLContextObj ctx);
     int (*SetParameter)(CGLContextObj ctx, int pname, const GLint *params);
     const char *(*ErrorString)(int err);
+    int (*TexImageIOSurface2D)(CGLContextObj ctx, unsigned target,
+                               unsigned internal_format, GLsizei width,
+                               GLsizei height, unsigned format, unsigned type,
+                               void *iosurface, unsigned plane);
 } cgl;
 
 // CoreGraphics + CoreVideo, for the one display question the X side cannot
@@ -762,6 +766,7 @@ static const char *load_apple(void) {
     SC(ClearDrawable, "CGLClearDrawable");
     SC(SetParameter, "CGLSetParameter");
     SC(ErrorString, "CGLErrorString");
+    SC(TexImageIOSurface2D, "CGLTexImageIOSurface2D");
 #undef SC
     const char *e = fill_gl_table(oh);
     if (e) return e;
@@ -2677,6 +2682,251 @@ static void apple_ctx_finalize(napi_env env, void *data, void *hint) {
     free(a);
 }
 
+// ---------------------------------------------------------------------------
+// IOSurface render targets — how GL output reaches a Core Animation layer
+// when there is no X server exporting a window surface (the react-x11 Cocoa
+// backend). The mirror of the Linux GBM surface: the GPU addon owns the
+// buffer and exports a process-global handle — there the dma-buf fd, here
+// the IOSurfaceID — and the presentation side (node-calayers) looks it up
+// and sets it as `layer.contents`. Rendering goes through an FBO whose
+// color attachment is the IOSurface, wired by CGLTexImageIOSurface2D onto a
+// GL_TEXTURE_RECTANGLE — the one target that call accepts.
+// ---------------------------------------------------------------------------
+
+#define LIB_IOSURFACE \
+    "/System/Library/Frameworks/IOSurface.framework/IOSurface"
+#define LIB_COREFOUNDATION \
+    "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+
+// the target/format triple CGLTexImageIOSurface2D documents for BGRA
+#define GL_TEXTURE_RECTANGLE_          0x84F5
+#define GL_BGRA_                       0x80E1
+#define GL_UNSIGNED_INT_8_8_8_8_REV_   0x8367
+#define GL_RGBA_                       0x1908
+#define GL_FRAMEBUFFER_                0x8D40
+#define GL_COLOR_ATTACHMENT0_          0x8CE0
+#define GL_FRAMEBUFFER_COMPLETE_       0x8CD5
+#define GL_RENDERBUFFER_               0x8D41
+#define GL_DEPTH24_STENCIL8_           0x88F0
+#define GL_DEPTH_ATTACHMENT_           0x8D00
+#define GL_STENCIL_ATTACHMENT_         0x8D20
+#define kCFNumberSInt32Type_           3
+
+static struct {
+    void *lib;
+    void *cf_lib;
+    void *(*Create)(const void *props);                        // IOSurfaceCreate
+    uint32_t (*GetID)(void *surface);                          // IOSurfaceGetID
+    void *(*DictionaryCreate)(const void *allocator, const void **keys,
+                              const void **values, long count,
+                              const void *keyCallbacks,
+                              const void *valueCallbacks);
+    void *(*NumberCreate)(const void *allocator, long type, const void *value);
+    void (*Release)(const void *cf);
+    const void *keyWidth, *keyHeight, *keyBytesPerElement, *keyPixelFormat;
+    const void *keyCallbacks, *valueCallbacks;
+} ios;
+
+static const char *load_iosurface(void) {
+    if (ios.lib) return NULL;
+    void *ih = dlopen(LIB_IOSURFACE, RTLD_NOW | RTLD_GLOBAL);
+    if (!ih) return "the IOSurface framework did not load";
+    void *ch = dlopen(LIB_COREFOUNDATION, RTLD_NOW | RTLD_GLOBAL);
+    if (!ch) return "the CoreFoundation framework did not load";
+#define SI(field, lib, name)                                                  \
+    do {                                                                      \
+        *(void **)&ios.field = dlsym(lib, name);                              \
+        if (!ios.field) return "missing " name;                               \
+    } while (0)
+    SI(Create, ih, "IOSurfaceCreate");
+    SI(GetID, ih, "IOSurfaceGetID");
+    SI(DictionaryCreate, ch, "CFDictionaryCreate");
+    SI(NumberCreate, ch, "CFNumberCreate");
+    SI(Release, ch, "CFRelease");
+#undef SI
+    // exported CFStringRef constants: dlsym answers the variable's address
+#define SK(field, lib, name)                                                  \
+    do {                                                                      \
+        void **p = (void **)dlsym(lib, name);                                 \
+        if (!p || !*p) return "missing " name;                                \
+        ios.field = *p;                                                       \
+    } while (0)
+    SK(keyWidth, ih, "kIOSurfaceWidth");
+    SK(keyHeight, ih, "kIOSurfaceHeight");
+    SK(keyBytesPerElement, ih, "kIOSurfaceBytesPerElement");
+    SK(keyPixelFormat, ih, "kIOSurfacePixelFormat");
+#undef SK
+    // callback tables are structs, passed by address as-is
+    ios.keyCallbacks = dlsym(ch, "kCFTypeDictionaryKeyCallBacks");
+    ios.valueCallbacks = dlsym(ch, "kCFTypeDictionaryValueCallBacks");
+    if (!ios.keyCallbacks || !ios.valueCallbacks)
+        return "missing CFDictionary callback tables";
+    ios.lib = ih;
+    ios.cf_lib = ch;
+    return NULL;
+}
+
+static bool apple_make_current_impl(napi_env env, AppleCtx *a);
+
+typedef struct {
+    void *surface;   // IOSurfaceRef, retained by Create
+    uint32_t sid;    // its process-global IOSurfaceID
+    GLuint tex;
+    GLuint fbo;
+    GLuint depth_rb; // 0 when the context asked for no depth/stencil
+    int32_t width, height;
+    int destroyed;
+} AppleTarget;
+
+static void apple_target_finalize(napi_env env, void *data, void *hint) {
+    (void)env; (void)hint;
+    AppleTarget *t = data;
+    // GL names need a current context and GC gives none; destroyTarget is
+    // the real teardown. The IOSurface itself is safe to drop from here.
+    if (!t->destroyed && t->surface) ios.Release(t->surface);
+    free(t);
+}
+
+static void *cf_i32(int32_t v) {
+    return ios.NumberCreate(NULL, kCFNumberSInt32Type_, &v);
+}
+
+// appleCreateTarget(ctx, width, height, wantDepth) -> external
+// Renders arrive in the IOSurface named by appleTargetInfo().iosurfaceId —
+// BGRA, premultiplied by whatever the drawing did, ready for
+// `layer.contents`. Makes the context current.
+static napi_value AppleCreateTarget(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 4);
+    const char *e = load_iosurface();
+    if (e) THROWF(env, "IOSurface unavailable: %s", e);
+    AppleCtx *a;
+    if (!get_external(env, args[0], (void **)&a)) return NULL;
+    int32_t w = arg_i32(env, args[1]);
+    int32_t h = arg_i32(env, args[2]);
+    bool want_depth = arg_bool(env, args[3]);
+    if (w < 1) w = 1;
+    if (h < 1) h = 1;
+    if (!apple_make_current_impl(env, a)) return NULL;
+
+    const void *keys[4] = { ios.keyWidth, ios.keyHeight,
+                            ios.keyBytesPerElement, ios.keyPixelFormat };
+    void *vw = cf_i32(w), *vh = cf_i32(h), *vb = cf_i32(4);
+    void *vf = cf_i32(0x42475241); // 'BGRA'
+    const void *vals[4] = { vw, vh, vb, vf };
+    void *props = ios.DictionaryCreate(NULL, keys, vals, 4,
+                                       ios.keyCallbacks, ios.valueCallbacks);
+    void *surface = ios.Create(props);
+    ios.Release(props);
+    ios.Release(vw); ios.Release(vh); ios.Release(vb); ios.Release(vf);
+    if (!surface) THROWF(env, "IOSurfaceCreate(%dx%d) failed", w, h);
+
+    AppleTarget *t = calloc(1, sizeof(AppleTarget));
+    t->surface = surface;
+    t->sid = ios.GetID(surface);
+    t->width = w;
+    t->height = h;
+
+    gl.GenTextures(1, &t->tex);
+    gl.BindTexture(GL_TEXTURE_RECTANGLE_, t->tex);
+    int cerr = cgl.TexImageIOSurface2D(a->ctx, GL_TEXTURE_RECTANGLE_,
+                                       GL_RGBA_, w, h, GL_BGRA_,
+                                       GL_UNSIGNED_INT_8_8_8_8_REV_,
+                                       surface, 0);
+    if (cerr != 0) {
+        gl.DeleteTextures(1, &t->tex);
+        ios.Release(surface);
+        free(t);
+        THROWF(env, "CGLTexImageIOSurface2D: %s", cgl.ErrorString(cerr));
+    }
+    gl.BindTexture(GL_TEXTURE_RECTANGLE_, 0);
+
+    gl.GenFramebuffers(1, &t->fbo);
+    gl.BindFramebuffer(GL_FRAMEBUFFER_, t->fbo);
+    gl.FramebufferTexture2D(GL_FRAMEBUFFER_, GL_COLOR_ATTACHMENT0_,
+                            GL_TEXTURE_RECTANGLE_, t->tex, 0);
+    if (want_depth) {
+        gl.GenRenderbuffers(1, &t->depth_rb);
+        gl.BindRenderbuffer(GL_RENDERBUFFER_, t->depth_rb);
+        gl.RenderbufferStorage(GL_RENDERBUFFER_, GL_DEPTH24_STENCIL8_, w, h);
+        // two calls rather than GL_DEPTH_STENCIL_ATTACHMENT: both profiles
+        // accept the pair, and the combined enum is core-only
+        gl.FramebufferRenderbuffer(GL_FRAMEBUFFER_, GL_DEPTH_ATTACHMENT_,
+                                   GL_RENDERBUFFER_, t->depth_rb);
+        gl.FramebufferRenderbuffer(GL_FRAMEBUFFER_, GL_STENCIL_ATTACHMENT_,
+                                   GL_RENDERBUFFER_, t->depth_rb);
+    }
+    unsigned status = gl.CheckFramebufferStatus(GL_FRAMEBUFFER_);
+    if (status != GL_FRAMEBUFFER_COMPLETE_) {
+        gl.BindFramebuffer(GL_FRAMEBUFFER_, 0);
+        gl.DeleteFramebuffers(1, &t->fbo);
+        if (t->depth_rb) gl.DeleteRenderbuffers(1, &t->depth_rb);
+        gl.DeleteTextures(1, &t->tex);
+        ios.Release(surface);
+        free(t);
+        THROWF(env, "IOSurface framebuffer incomplete: 0x%x", status);
+    }
+    napi_value ext;
+    NAPI_CALL(env, napi_create_external(env, t, apple_target_finalize, NULL,
+                                        &ext));
+    return ext;
+}
+
+// appleBindTarget(ctx, target | null) — subsequent GL draws land in the
+// target's IOSurface (or back in "no framebuffer" for null). Makes the
+// context current.
+static napi_value AppleBindTarget(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 2);
+    AppleCtx *a;
+    if (!get_external(env, args[0], (void **)&a)) return NULL;
+    if (!apple_make_current_impl(env, a)) return NULL;
+    napi_valuetype vt;
+    NAPI_CALL(env, napi_typeof(env, args[1], &vt));
+    if (vt == napi_null || vt == napi_undefined) {
+        gl.BindFramebuffer(GL_FRAMEBUFFER_, 0);
+        return NULL;
+    }
+    AppleTarget *t;
+    if (!get_external(env, args[1], (void **)&t)) return NULL;
+    if (t->destroyed) THROWF(env, "target already destroyed");
+    gl.BindFramebuffer(GL_FRAMEBUFFER_, t->fbo);
+    return NULL;
+}
+
+// appleTargetInfo(target) -> { iosurfaceId, width, height }
+static napi_value AppleTargetInfo(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 1);
+    AppleTarget *t;
+    if (!get_external(env, args[0], (void **)&t)) return NULL;
+    napi_value obj;
+    NAPI_CALL(env, napi_create_object(env, &obj));
+    obj_set(env, obj, "iosurfaceId", mk_u32(env, t->sid));
+    obj_set(env, obj, "fbo", mk_u32(env, t->fbo));
+    obj_set(env, obj, "width", mk_i32(env, t->width));
+    obj_set(env, obj, "height", mk_i32(env, t->height));
+    return obj;
+}
+
+// appleDestroyTarget(ctx, target) — needs the context so the GL names can
+// actually be deleted; the finalizer alone would only drop the IOSurface.
+static napi_value AppleDestroyTarget(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 2);
+    AppleCtx *a;
+    AppleTarget *t;
+    if (!get_external(env, args[0], (void **)&a)) return NULL;
+    if (!get_external(env, args[1], (void **)&t)) return NULL;
+    if (t->destroyed) return NULL;
+    if (apple_make_current_impl(env, a)) {
+        gl.BindFramebuffer(GL_FRAMEBUFFER_, 0);
+        gl.DeleteFramebuffers(1, &t->fbo);
+        if (t->depth_rb) gl.DeleteRenderbuffers(1, &t->depth_rb);
+        gl.DeleteTextures(1, &t->tex);
+    }
+    ios.Release(t->surface);
+    t->surface = NULL;
+    t->destroyed = 1;
+    return NULL;
+}
+
 // appleClientId() -> number. Connects this process to the WindowServer on
 // first use (xp_init) and reports its client id — the value the X server
 // needs in AppleDRICreateSurface to export a drawable's surface to us.
@@ -2940,6 +3190,18 @@ static napi_value AppleSetSwapInterval(napi_env env, napi_callback_info info) {
 static napi_value AppleDestroyContext(napi_env env, napi_callback_info info) {
     (void)info; THROW(env, "appleDestroyContext: " NO_APPLEDRI);
 }
+static napi_value AppleCreateTarget(napi_env env, napi_callback_info info) {
+    (void)info; THROW(env, "appleCreateTarget: " NO_APPLEDRI);
+}
+static napi_value AppleBindTarget(napi_env env, napi_callback_info info) {
+    (void)info; THROW(env, "appleBindTarget: " NO_APPLEDRI);
+}
+static napi_value AppleTargetInfo(napi_env env, napi_callback_info info) {
+    (void)info; THROW(env, "appleTargetInfo: " NO_APPLEDRI);
+}
+static napi_value AppleDestroyTarget(napi_env env, napi_callback_info info) {
+    (void)info; THROW(env, "appleDestroyTarget: " NO_APPLEDRI);
+}
 
 #endif // __APPLE__
 
@@ -3124,6 +3386,10 @@ NAPI_MODULE_INIT() {
     EXPORT("appleClientId", AppleClientId);
     EXPORT("appleRefreshRate", AppleRefreshRate);
     EXPORT("appleCreateContext", AppleCreateContext);
+    EXPORT("appleCreateTarget", AppleCreateTarget);
+    EXPORT("appleBindTarget", AppleBindTarget);
+    EXPORT("appleTargetInfo", AppleTargetInfo);
+    EXPORT("appleDestroyTarget", AppleDestroyTarget);
     EXPORT("appleAttach", AppleAttach);
     EXPORT("appleMakeCurrent", AppleMakeCurrent);
     EXPORT("appleFlush", AppleFlush);

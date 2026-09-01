@@ -281,6 +281,37 @@ export declare class AppleContext {
      * a frame, so a timer-paced loop usually serves a Node process better.
      */
     setSwapInterval(n: number): void;
+    /**
+     * An offscreen render target whose color buffer is an IOSurface — how GL
+     * output reaches a Core Animation layer when there is no X server
+     * exporting a window surface (the react-x11 Cocoa backend). The id is a
+     * process-global IOSurfaceID: the presentation side looks it up and sets
+     * the surface as `layer.contents`. Create two and alternate, like any
+     * swapchain. Makes the context current. `depth: false` skips the
+     * depth/stencil renderbuffer.
+     */
+    createTarget(width: number, height: number,
+                 opts?: { depth?: boolean }): AppleTarget;
+    /**
+     * Route subsequent GL draws into the target's IOSurface, or back to "no
+     * framebuffer" for null. Makes the context current.
+     */
+    bindTarget(target: AppleTarget | null): void;
+    destroy(): void;
+}
+
+/** One IOSurface-backed framebuffer of an {@link AppleContext}. */
+export declare class AppleTarget {
+    /** The process-global IOSurfaceID the presentation side looks up. */
+    readonly iosurfaceId: number;
+    /** The GL framebuffer name — what bindFramebuffer(null) should mean to
+     *  a consumer treating this target as its default framebuffer. */
+    readonly fbo: number;
+    readonly width: number;
+    readonly height: number;
+    /** `ctx.bindTarget(this)`. */
+    bind(): void;
+    /** Delete the GL objects and release the IOSurface. */
     destroy(): void;
 }
 
