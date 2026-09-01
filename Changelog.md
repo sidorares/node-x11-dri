@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.0](https://github.com/sidorares/node-x11-dri/compare/v0.6.0...v0.7.0) (2026-09-01)
+
+
+### Features
+
+* **apple:** IOSurface render targets for compositor-less presentation ([#21](https://github.com/sidorares/node-x11-dri/issues/21)) ([1921adc](https://github.com/sidorares/node-x11-dri/commit/1921adcee9d7282633d89ad7992fe3a9348239df))
+
 ## [0.6.0](https://github.com/sidorares/node-x11-dri/compare/v0.5.0...v0.6.0) (2026-08-25)
 
 
