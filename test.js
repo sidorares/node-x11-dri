@@ -208,6 +208,50 @@ report('Apple-DRI context: ES2 shaders + FBO on CGL', () => {
     }
 });
 
+// The IOSurface render target — the Cocoa-backend presentation path, tested
+// end to end without any compositor: draw into the target, read the pixels
+// back off its framebuffer, and check the surface got a process-global id
+// the presentation side could look up.
+report('Apple IOSurface target: draw, read back, global id', () => {
+    if (caps.appledri !== true)
+        skip(typeof caps.appledri === 'string' ? caps.appledri : 'appledri unavailable');
+    try {
+        dri.apple.clientId();
+    } catch (e) {
+        skip(`WindowServer unreachable: ${e.message}`);
+    }
+    const ctx = new dri.apple.Context({ depthSize: 16 });
+    try {
+        const target = ctx.createTarget(24, 16);
+        const sid = target.iosurfaceId;
+        try {
+            assert.ok(target.iosurfaceId > 0, 'IOSurfaceID is global and nonzero');
+            assert.strictEqual(target.width, 24);
+            assert.strictEqual(target.height, 16);
+            const gl = dri.gl;
+            target.bind();
+            gl.viewport(0, 0, 24, 16);
+            gl.clearColor(0.0, 1.0, 0.25, 1.0);
+            gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+            gl.flush();
+            const px = new Uint8Array(4);
+            gl.readPixels(12, 8, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+            assert.ok(px[0] === 0 && px[1] === 255 && px[2] >= 60 && px[2] <= 68,
+                `clear colour through the IOSurface FBO: got [${px.join(', ')}]`);
+            // a second target coexists — the swapchain shape
+            const back = ctx.createTarget(24, 16);
+            assert.notStrictEqual(back.iosurfaceId, target.iosurfaceId);
+            back.destroy();
+            ctx.bindTarget(null);
+        } finally {
+            target.destroy();
+        }
+        return `IOSurfaceID 0x${sid.toString(16)}`;
+    } finally {
+        ctx.destroy();
+    }
+});
+
 // Unlike everything else in the apple namespace this needs no XQuartz and no
 // WindowServer handshake — only the system frameworks — so it is gated on
 // the platform alone. Null is a legal answer (a headless session has no rate

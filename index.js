@@ -573,7 +573,39 @@ class AppleContext {
     // vertical retrace — real vsync, but it blocks the event loop for up to
     // a frame, so a timer-paced loop usually serves a Node process better.
     setSwapInterval(n) { native.appleSetSwapInterval(this._handle, n); }
+    // An offscreen render target whose color buffer is an IOSurface — how GL
+    // reaches a Core Animation layer when no X server is exporting a window
+    // surface (the react-x11 Cocoa backend). The IOSurfaceID is process-
+    // global: hand it to the presentation side (IOSurfaceLookup there) and
+    // set the surface as `layer.contents`. Draw with two of these and
+    // alternate, like any swapchain. Makes the context current.
+    createTarget(width, height, opts) {
+        const handle = native.appleCreateTarget(this._handle, width, height,
+            !opts || opts.depth !== false);
+        return new AppleTarget(this, handle);
+    }
+    // Route subsequent GL draws into `target`'s IOSurface (null: back to no
+    // framebuffer). Makes the context current.
+    bindTarget(target) {
+        native.appleBindTarget(this._handle, target ? target._handle : null);
+    }
     destroy() { native.appleDestroyContext(this._handle); }
+}
+
+class AppleTarget {
+    constructor(ctx, handle) {
+        this._ctx = ctx;
+        this._handle = handle;
+        const info = native.appleTargetInfo(handle);
+        this.iosurfaceId = info.iosurfaceId;
+        this.width = info.width;
+        this.height = info.height;
+    }
+    bind() { this._ctx.bindTarget(this); }
+    // Deleting the GL half needs the context, which is why this is a method
+    // on a live target rather than work left to GC (GC would only release
+    // the IOSurface).
+    destroy() { native.appleDestroyTarget(this._ctx._handle, this._handle); }
 }
 
 const apple = {
