@@ -3190,6 +3190,18 @@ static napi_value AppleSetSwapInterval(napi_env env, napi_callback_info info) {
 static napi_value AppleDestroyContext(napi_env env, napi_callback_info info) {
     (void)info; THROW(env, "appleDestroyContext: " NO_APPLEDRI);
 }
+static napi_value AppleCreateTarget(napi_env env, napi_callback_info info) {
+    (void)info; THROW(env, "appleCreateTarget: " NO_APPLEDRI);
+}
+static napi_value AppleBindTarget(napi_env env, napi_callback_info info) {
+    (void)info; THROW(env, "appleBindTarget: " NO_APPLEDRI);
+}
+static napi_value AppleTargetInfo(napi_env env, napi_callback_info info) {
+    (void)info; THROW(env, "appleTargetInfo: " NO_APPLEDRI);
+}
+static napi_value AppleDestroyTarget(napi_env env, napi_callback_info info) {
+    (void)info; THROW(env, "appleDestroyTarget: " NO_APPLEDRI);
+}
 
 #endif // __APPLE__
 
