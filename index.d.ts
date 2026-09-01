@@ -304,6 +304,9 @@ export declare class AppleContext {
 export declare class AppleTarget {
     /** The process-global IOSurfaceID the presentation side looks up. */
     readonly iosurfaceId: number;
+    /** The GL framebuffer name — what bindFramebuffer(null) should mean to
+     *  a consumer treating this target as its default framebuffer. */
+    readonly fbo: number;
     readonly width: number;
     readonly height: number;
     /** `ctx.bindTarget(this)`. */

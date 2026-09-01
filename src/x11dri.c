@@ -2900,6 +2900,7 @@ static napi_value AppleTargetInfo(napi_env env, napi_callback_info info) {
     napi_value obj;
     NAPI_CALL(env, napi_create_object(env, &obj));
     obj_set(env, obj, "iosurfaceId", mk_u32(env, t->sid));
+    obj_set(env, obj, "fbo", mk_u32(env, t->fbo));
     obj_set(env, obj, "width", mk_i32(env, t->width));
     obj_set(env, obj, "height", mk_i32(env, t->height));
     return obj;

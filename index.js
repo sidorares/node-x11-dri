@@ -598,6 +598,9 @@ class AppleTarget {
         this._handle = handle;
         const info = native.appleTargetInfo(handle);
         this.iosurfaceId = info.iosurfaceId;
+        // the GL framebuffer name, for a consumer whose "default
+        // framebuffer" must mean this target (WebGL's bindFramebuffer(null))
+        this.fbo = info.fbo;
         this.width = info.width;
         this.height = info.height;
     }
