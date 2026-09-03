@@ -77,6 +77,11 @@ const GL = {
     TEXTURE_CUBE_MAP_POSITIVE_X: 0x8515, TEXTURE_CUBE_MAP_NEGATIVE_X: 0x8516,
     TEXTURE_CUBE_MAP_POSITIVE_Y: 0x8517, TEXTURE_CUBE_MAP_NEGATIVE_Y: 0x8518,
     TEXTURE_CUBE_MAP_POSITIVE_Z: 0x8519, TEXTURE_CUBE_MAP_NEGATIVE_Z: 0x851A,
+    // GL_OES_EGL_image_external — the target an imported multi-planar or YUV
+    // dma-buf binds to (features.dmabufImportExternal), read in GLSL through
+    // a samplerExternalOES rather than a sampler2D.
+    TEXTURE_EXTERNAL_OES: 0x8D65, TEXTURE_BINDING_EXTERNAL_OES: 0x8D67,
+    SAMPLER_EXTERNAL_OES: 0x8D66,
     TEXTURE0: 0x84C0, TEXTURE1: 0x84C1, TEXTURE2: 0x84C2, TEXTURE3: 0x84C3,
     TEXTURE4: 0x84C4, TEXTURE5: 0x84C5, TEXTURE6: 0x84C6, TEXTURE7: 0x84C7,
     ACTIVE_TEXTURE: 0x84E0,
@@ -286,6 +291,7 @@ const UNIFORM_SHAPE = {
     [GL.BOOL]: [1, 'b'],
     [GL.BOOL_VEC2]: [2, 'b'], [GL.BOOL_VEC3]: [3, 'b'], [GL.BOOL_VEC4]: [4, 'b'],
     [GL.SAMPLER_2D]: [1, 'i'], [GL.SAMPLER_CUBE]: [1, 'i'],
+    [GL.SAMPLER_EXTERNAL_OES]: [1, 'i'],
     // ES 3.0 adds non-square matrices and a longer list of sampler types;
     // samplers are all texture units, so all read back as one int.
     [GL.FLOAT_MAT2x3]: [6, 'f'], [GL.FLOAT_MAT2x4]: [8, 'f'],
@@ -343,8 +349,65 @@ function getSupportedExtensions() {
     return gl.getString(GL.EXTENSIONS).split(/\s+/).filter(Boolean);
 }
 
+// A dma-buf someone else allocated, bound to a texture. `texture` is an
+// ordinary GL name — bind it to `target` and sample it — and `destroy()`
+// drops both it and the EGLImage behind it.
+class ImportedImage {
+    constructor(res) {
+        this._handle = res.handle;
+        this.texture = res.texture;
+        this.target = res.target;
+    }
+    destroy() {
+        native.destroyImportedImage(this._handle);
+    }
+}
+
+// Import a dma-buf as a texture: the mirror of Surface.swap()'s export, and
+// the last step of the compositor path (Composite.NameWindowPixmap ->
+// DRI3.BuffersFromPixmap -> here), which is why the plane shape is exactly
+// what BuffersFromPixmap replies with.
+//
+// opts: { width, height, fourcc, modifier?, target?, planes: [{ fd, stride,
+// offset }] }. The descriptors are consumed on success and left open on
+// failure. Needs a current context whose driver has the import extension —
+// gpu.features.dmabufImport says whether it does.
+function importDmabuf(opts) {
+    opts = opts || {};
+    if (!(opts.width > 0) || !(opts.height > 0))
+        throw new TypeError('importDmabuf: width and height are required');
+    if (typeof opts.fourcc !== 'number')
+        throw new TypeError('importDmabuf: fourcc is required — a DRM format code'
+            + ' such as FORMAT.XRGB8888');
+    const planes = opts.planes;
+    if (!Array.isArray(planes) || planes.length < 1 || planes.length > 4)
+        throw new TypeError('importDmabuf: planes must be an array of 1 to 4'
+            + ' { fd, stride, offset }');
+    const fds = [], offsets = [], strides = [];
+    planes.forEach((p, i) => {
+        if (!p || typeof p.fd !== 'number' || typeof p.stride !== 'number')
+            throw new TypeError(`importDmabuf: plane ${i} needs { fd, stride, offset? }`);
+        fds.push(p.fd);
+        offsets.push(p.offset || 0);
+        strides.push(p.stride);
+    });
+    // MODIFIER.INVALID is how the export side spells "no explicit modifier",
+    // and the extension has no attribute for that — so it means send none,
+    // which is also what the plain (non-modifier) extension supports.
+    let modifier = opts.modifier;
+    if (modifier == null || modifier === MODIFIER.INVALID)
+        modifier = null;
+    else if (typeof modifier !== 'bigint')
+        throw new TypeError('importDmabuf: modifier must be a BigInt'
+            + ' (from MODIFIER, swap(), or a BuffersFromPixmap reply)');
+    return new ImportedImage(native.importDmabuf(
+        opts.width, opts.height, opts.fourcc, modifier, opts.target || 0,
+        fds, offsets, strides));
+}
+
 gl.getUniform = getUniform;
 gl.getSupportedExtensions = getSupportedExtensions;
+gl.importDmabuf = importDmabuf;
 
 // ---- buffer layout constants ----
 const FORMAT = {
@@ -648,6 +711,35 @@ function createUdmabuf(size) {
     };
 }
 
+// Map a dma-buf the caller did not allocate — the CPU-read counterpart of
+// createUdmabuf's `buffer`, for a descriptor that arrived from elsewhere
+// (DRI3.BufferFromPixmap, another process). Returns { buffer, size,
+// sync(flags), close() }. The fd is borrowed, never consumed: it stays the
+// caller's to send on or close. `size` defaults to the descriptor's own.
+//
+// Only exporters that implement mmap can be mapped — udmabuf and linear/dumb
+// buffers do, most tiled GPU allocations do not, and those throw here.
+// Bracket reads with sync(START|READ) / sync(END|READ).
+function mapDmabuf(fd, size) {
+    if (size == null)
+        size = fs.fstatSync(fd).size;
+    const res = native.mapDmabuf(fd, size);
+    let mapped = true;
+    return {
+        buffer: res.buffer,
+        size: res.size,
+        sync(flags) { native.dmabufSync(fd, flags); },
+        // Releases the mapping now rather than at the next GC, and detaches
+        // `buffer` so nothing can read through it afterwards.
+        close() {
+            if (!mapped)
+                return;
+            mapped = false;
+            native.unmapDmabuf(res.handle, res.buffer);
+        }
+    };
+}
+
 module.exports = {
     probe: native.probe,
     dup: native.dup,
@@ -655,6 +747,7 @@ module.exports = {
     Gpu,
     apple,
     createUdmabuf,
+    mapDmabuf,
     dmabufSync: native.dmabufSync,
     gl,
     GL,

@@ -70,6 +70,26 @@ export interface GlFeatures {
     texture3D: boolean;
     /** `texStorage2D`, `texStorage3D` */
     textureStorage: boolean;
+    /**
+     * `gl.importDmabuf` — whether this driver has
+     * `EGL_EXT_image_dma_buf_import` and the entry points that go with it.
+     * Unlike the rest of this interface it is a property of the EGL display
+     * as well as of the context, so it is always `false` on the
+     * Apple-DRI/CGL backend, which has no EGL at all.
+     */
+    dmabufImport: boolean;
+    /**
+     * Whether an explicit `modifier` may be passed to `importDmabuf`
+     * (`EGL_EXT_image_dma_buf_import_modifiers`). Without it only the
+     * implicit-modifier form works — pass no modifier, or `MODIFIER.INVALID`.
+     */
+    dmabufImportModifiers: boolean;
+    /**
+     * Whether `TEXTURE_EXTERNAL_OES` is available as an import target
+     * (`GL_OES_EGL_image_external`) — which multi-planar and YUV imports
+     * generally need.
+     */
+    dmabufImportExternal: boolean;
 }
 
 /** What the driver reports through `glGetString(GL_VERSION)`, parsed. */
@@ -100,6 +120,65 @@ export interface ProbeResult {
      */
     appledri: true | string;
     udmabuf: boolean | string;
+    /**
+     * Always a string, and deliberately so: the dma-buf import extensions
+     * belong to an initialized EGL display, and `probe()` opens no devices.
+     * On Linux it says to read `Gpu.features.dmabufImport` after
+     * `makeCurrent()`; elsewhere it says the host has no dma-buf at all.
+     */
+    dmabufImport: string;
+}
+
+/** One plane of a dma-buf — the shape `DRI3.BuffersFromPixmap` replies with. */
+export interface DmabufPlane {
+    /** A dma-buf descriptor. `importDmabuf` consumes it on success. */
+    fd: number;
+    /** Bytes per row of this plane. */
+    stride: number;
+    /** Byte offset of this plane within its descriptor. Defaults to 0. */
+    offset?: number;
+}
+
+export interface DmabufImportOptions {
+    width: number;
+    height: number;
+    /** A DRM fourcc, e.g. `FORMAT.XRGB8888`. */
+    fourcc: number;
+    /**
+     * The layout modifier the buffer was allocated with, as `swap()` and
+     * `BuffersFromPixmap` report it. Omitting it — or passing
+     * `MODIFIER.INVALID` — asks for the implicit-modifier import, which is
+     * the only form available unless `features.dmabufImportModifiers`.
+     */
+    modifier?: bigint;
+    /**
+     * `TEXTURE_2D` or `TEXTURE_EXTERNAL_OES`. Defaults to `TEXTURE_2D` for a
+     * single plane and `TEXTURE_EXTERNAL_OES` for more than one.
+     */
+    target?: GLenum;
+    /** One to four planes. */
+    planes: readonly DmabufPlane[];
+}
+
+/** A dma-buf bound to a GL texture. See `gl.importDmabuf`. */
+export interface ImportedImage {
+    /** An ordinary texture name: `gl.bindTexture(image.target, image.texture)`. */
+    readonly texture: GLuint;
+    /** `TEXTURE_2D`, or `TEXTURE_EXTERNAL_OES` — which needs a `samplerExternalOES`. */
+    readonly target: GLenum;
+    /** `glDeleteTextures` + `eglDestroyImageKHR`. Idempotent. */
+    destroy(): void;
+}
+
+/** A dma-buf mapped for CPU access. See `mapDmabuf`. */
+export interface MappedDmabuf {
+    /** The buffer's memory. Detached by `close()`. */
+    buffer: ArrayBuffer;
+    size: number;
+    /** Bracket CPU access with `START | READ` and `END | READ`. */
+    sync(flags: number): void;
+    /** Unmap now rather than at the next GC. The fd is not touched. */
+    close(): void;
 }
 
 /**
@@ -425,6 +504,10 @@ export interface GLConstants {
     readonly TEXTURE_CUBE_MAP_NEGATIVE_Y: GLenum;
     readonly TEXTURE_CUBE_MAP_POSITIVE_Z: GLenum;
     readonly TEXTURE_CUBE_MAP_NEGATIVE_Z: GLenum;
+    /** `GL_OES_EGL_image_external`: the target imported YUV/multi-planar buffers bind to. */
+    readonly TEXTURE_EXTERNAL_OES: GLenum;
+    readonly TEXTURE_BINDING_EXTERNAL_OES: GLenum;
+    readonly SAMPLER_EXTERNAL_OES: GLenum;
     readonly TEXTURE0: GLenum;
     readonly TEXTURE1: GLenum;
     readonly TEXTURE2: GLenum;
@@ -931,6 +1014,19 @@ export interface GLContext extends GLConstants {
     /** Which optional entry points resolved. Also on `Gpu.features`. */
     getFeatures(): GlFeatures;
 
+    // ---- optional: dma-buf import (features.dmabufImport) ----
+    /**
+     * Import a dma-buf as a texture — the way back in for a descriptor this
+     * package did not allocate, and the last step of the compositor path
+     * (`Composite.NameWindowPixmap` -> `DRI3.BuffersFromPixmap` -> here).
+     * No copy and no upload: the texture reads the buffer where it lies.
+     *
+     * Needs a current context (it makes a texture) on the GBM/EGL backend,
+     * and consumes the plane descriptors on success — on failure it throws
+     * and leaves them open.
+     */
+    importDmabuf(opts: DmabufImportOptions): ImportedImage;
+
     // ---- introspection ----
     /** `null` past the last index, so a loop can enumerate without disturbing `getError()`. */
     getActiveUniform(program: GLuint, index: GLuint): ActiveInfo | null;
@@ -1059,6 +1155,16 @@ export declare function listRenderNodes(): string[];
  * feed DRI3, where the server's driver supports it. Linux only.
  */
 export declare function createUdmabuf(size: number): Udmabuf;
+
+/**
+ * Map a dma-buf the caller did not allocate, for CPU reads and writes — what
+ * `createUdmabuf` already gives for one it did. The descriptor is borrowed,
+ * not consumed. `size` defaults to the descriptor's own size.
+ *
+ * Only exporters that implement mmap can be mapped at all: udmabuf and
+ * linear/dumb buffers do, tiled GPU allocations generally do not. Linux only.
+ */
+export declare function mapDmabuf(fd: number, size?: number): MappedDmabuf;
 
 /** Bracket CPU access to a dma-buf. Flags come from `DMABUF_SYNC`. */
 export declare function dmabufSync(fd: number, flags: number): void;
