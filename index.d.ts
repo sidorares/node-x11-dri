@@ -236,17 +236,27 @@ export interface MappedDmabuf {
  * const out = surface.swap();
  * if (out && out.isNew) dri3.PixmapFromBuffer(pixmap, drawable, ..., out.fd);
  * ```
+ *
+ * Pass the result itself back to `release()`, and key any cache of your own
+ * by `generation` *and* `key` — see {@link Surface.resize}.
  */
 export type SwapResult =
     | {
-        /** Identifies this buffer for `release()`; stable across frames. */
+        /**
+         * Identifies this buffer for `release()`; stable across frames, but
+         * only within `generation` — it is a GEM handle, and the kernel
+         * recycles those.
+         */
         key: number;
+        /** The swapchain this buffer belongs to. See {@link Surface.resize}. */
+        generation: number;
         isNew: false;
         width: number;
         height: number;
     }
     | {
         key: number;
+        generation: number;
         isNew: true;
         width: number;
         height: number;
@@ -311,14 +321,47 @@ export interface Surface {
     readonly width: number;
     readonly height: number;
     /**
+     * Increments on every `resize` that changes the size. `key` is unique
+     * only within one generation, so a cache keyed by `key` alone goes stale
+     * — and dangerously so, since GEM handles are recycled.
+     */
+    readonly generation: number;
+    /**
      * Finish the frame and take the new front buffer. Returns `null` when
      * every buffer is still held by the consumer — wait for a release, redraw
      * and swap again, which is the natural pacing signal.
      *
-     * The buffer stays owned by the caller until `release(key)`.
+     * The buffer stays owned by the caller until `release()`.
      */
     swap(): SwapResult | null;
-    release(key: number): void;
+    /**
+     * Give a buffer back to the swapchain. Answers `false`, and does nothing,
+     * when the buffer belonged to a swapchain a `resize` has already replaced.
+     *
+     * Pass the `swap()` result (or anything carrying its `key` and
+     * `generation`) rather than a bare key on a surface that can resize: a
+     * late release naming only a key would free whichever live buffer
+     * inherited that GEM handle.
+     */
+    release(ref: number | { key: number; generation: number }): boolean;
+    /**
+     * Rebuild the swapchain at a new size, keeping this `Surface`'s identity:
+     * the handle stays valid, the context keeps its GL objects and stays
+     * current if it was, and only the buffers change. Locked buffers are
+     * released, `generation` moves on, and the next `swap()` reports a fresh
+     * set of buffers, every one of them `isNew`.
+     *
+     * Resizing to the size it already has does nothing — no teardown, no
+     * generation bump — so a drag can call this on every configure event and
+     * pay only for the sizes that differ. Any allocation policy on top
+     * (round up to a granularity, never shrink) belongs to the caller; this
+     * is the mechanism under it.
+     *
+     * Throws when the driver refuses the size, and the surface is then
+     * exactly as it was: the new swapchain is built before the old one is
+     * torn down.
+     */
+    resize(width: number, height: number): void;
     destroy(): void;
 }
 

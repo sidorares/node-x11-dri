@@ -325,6 +325,74 @@ report('GPU render + readback + dma-buf export', () => {
     return renderer;
 });
 
+// A resize rebuilds the swapchain under a surface that keeps its identity,
+// and `generation` is what makes that safe to observe from outside: `key` is
+// a GEM handle, which the kernel is free to hand to a buffer of the new size
+// once the old one is freed, so a release or a cache lookup that names a key
+// alone can land on the wrong buffer. Nothing here can force that collision
+// to happen — it is the namespace that is under test, not the driver's
+// handle allocator.
+report('GPU surface resize: same identity, new buffers, new generation', () => {
+    const { gpu, surf, gl } = glSurface(64);
+    assert.strictEqual(surf.generation, 0);
+
+    gl.clearColor(0, 0, 0, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    const first = surf.swap();
+    assert.strictEqual(first.generation, 0);
+    assert.strictEqual(first.width, 64);
+    if (first.isNew) fs.closeSync(first.fd);
+
+    // the size it already has: no teardown, no generation, and the buffer
+    // locked across it is still the surface's to give back
+    surf.resize(64, 64);
+    assert.strictEqual(surf.generation, 0, 'resize to the same size is a no-op');
+    assert.strictEqual(surf.release(first), true);
+
+    // a buffer deliberately left locked across the real resize
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    const stale = surf.swap();
+    assert.ok(stale, 'a swap with nothing locked has a buffer to give');
+    if (stale.isNew) fs.closeSync(stale.fd);
+
+    surf.resize(128, 96);
+    assert.strictEqual(surf.generation, 1, 'a real resize moves the generation');
+    assert.deepStrictEqual([surf.width, surf.height], [128, 96]);
+
+    // the context came back current on the new swapchain by itself: GL still
+    // draws, and the far corner of the new size is inside the framebuffer
+    gl.viewport(0, 0, 128, 96);
+    gl.clearColor(0.2, 0.4, 0.6, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    const px = new Uint8Array(4);
+    gl.readPixels(127, 95, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    assert.deepStrictEqual(Array.from(px), [51, 102, 153, 255],
+        'the corner only the resized surface has');
+
+    const out = surf.swap();
+    assert.strictEqual(out.generation, 1);
+    assert.strictEqual(out.isNew, true, 'every buffer of a new swapchain is new');
+    assert.deepStrictEqual([out.width, out.height], [128, 96]);
+    assert.ok(out.stride >= 128 * 4, 'stride covers the wider row');
+    fs.closeSync(out.fd);
+
+    // the trap this closes: by key alone, a late release of `stale` could
+    // free `out` instead
+    assert.strictEqual(surf.release(stale), false,
+        'a release from the previous generation is ignored');
+    assert.strictEqual(surf.release(out), true);
+
+    assert.throws(() => surf.resize(0, 10), /not a size/, 'a zero dimension is refused');
+    assert.throws(() => surf.release({ key: out.key }), TypeError,
+        'an object release says which generation or nothing');
+
+    surf.destroy();
+    assert.throws(() => surf.resize(32, 32), /destroyed/);
+    assert.throws(() => surf.swap(), /destroyed/);
+    gpu.destroy();
+    return `64x64 -> ${out.width}x${out.height}, generation ${surf.generation}`;
+});
+
 // Every argument check happens in JavaScript, before the addon is asked for
 // anything — so this is the one part of the import path that can be tested on
 // a machine with no GPU (and it proves a bad call touches no descriptor).
