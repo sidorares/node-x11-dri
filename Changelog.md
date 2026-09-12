@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.8.0](https://github.com/sidorares/node-x11-dri/compare/v0.7.0...v0.8.0) (2026-09-12)
+
+
+### Features
+
+* **gl:** separate stencil state, multisampling, sync objects and GPU timer queries ([#23](https://github.com/sidorares/node-x11-dri/issues/23)) ([1c63c52](https://github.com/sidorares/node-x11-dri/commit/1c63c521e8b6269f63b48b43f4f473c93f214fb6))
+* **gpu:** stencilSize on GpuOptions, and the granted bits read back ([#25](https://github.com/sidorares/node-x11-dri/issues/25)) ([c41cf3a](https://github.com/sidorares/node-x11-dri/commit/c41cf3a457cea5f750248bdc2a6299f63ddbcbf6))
+* import a dma-buf as a GL texture, and map one for the CPU ([#18](https://github.com/sidorares/node-x11-dri/issues/18)) ([e97acc0](https://github.com/sidorares/node-x11-dri/commit/e97acc0a6087150d4ed2f6eb053d6e3cce8d6243)), closes [#17](https://github.com/sidorares/node-x11-dri/issues/17)
+* **surface:** resize the swapchain in place, and namespace keys by generation ([#26](https://github.com/sidorares/node-x11-dri/issues/26)) ([ff06886](https://github.com/sidorares/node-x11-dri/commit/ff06886fad3cb2dee98747a975efab84a5fa501c)), closes [#20](https://github.com/sidorares/node-x11-dri/issues/20)
+
+
+### Bug Fixes
+
+* **gpu:** close the render node when the Gpu constructor throws ([#28](https://github.com/sidorares/node-x11-dri/issues/28)) ([86ffe32](https://github.com/sidorares/node-x11-dri/commit/86ffe3245f3f51b5f028f4ab429361eb8c65b16e))
+
 ## [0.7.0](https://github.com/sidorares/node-x11-dri/compare/v0.6.0...v0.7.0) (2026-09-01)
 
 
