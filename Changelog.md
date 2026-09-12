@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.1](https://github.com/sidorares/node-x11-dri/compare/v0.8.0...v0.8.1) (2026-09-12)
+
+
+### Bug Fixes
+
+* **dmabuf:** map read-only descriptors, and let only the importing context destroy an image ([#30](https://github.com/sidorares/node-x11-dri/issues/30)) ([2652706](https://github.com/sidorares/node-x11-dri/commit/26527069286973e9cc0cf551d4580313ac7a5a6a))
+
 ## [0.8.0](https://github.com/sidorares/node-x11-dri/compare/v0.7.0...v0.8.0) (2026-09-12)
 
 
