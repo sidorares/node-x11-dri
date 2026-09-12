@@ -59,7 +59,9 @@ The deep difference: DRI3 is *client-allocates, client-pushes* — Apple-DRI is
 What is already identical, by construction (this PR): the **`gl` object** —
 same WebGL-flavored functions and constants, same `features`
 (`vertexArrayObject`, `instancedArrays`, `drawBuffers`, `texture3D`,
-`textureStorage` — all `true` on Apple GL 4.1), same
+`textureStorage`, `multisample`, `readBuffer`, `sync`, `timerQuery`,
+`timestampQuery` — all `true` on Apple GL 4.1, though its `TIMESTAMP` counter
+has 0 bits), same
 `getSupportedExtensions()`, same error contract.
 
 ## 2. What this repo now provides (`dri.apple`)

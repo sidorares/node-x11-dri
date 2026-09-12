@@ -20,8 +20,9 @@ fills exactly that hole:
   JS: shaders and programs, buffers and vertex attributes, draws, textures
   (including compressed uploads), blending, framebuffer objects for rendering
   to a texture, the uniform setters, program introspection, and `readPixels`
-  — plus vertex array objects, instanced drawing, multiple render targets and
-  3D/array textures where the driver has them.
+  — plus vertex array objects, instanced drawing, multiple render targets,
+  3D/array textures, multisampling, fences and GPU timer queries where the
+  driver has them.
 - **`createUdmabuf(size)`** — CPU memory turned into a dma-buf by the
   kernel's `/dev/udmabuf`, with the pixels mapped into JS as an
   `ArrayBuffer`: the GPU-less way to feed DRI3 (the same trick Xwayland
@@ -180,9 +181,9 @@ order, so code and tutorials carry over:
 | uniforms | `getUniformLocation`, `uniform1f`/`2f`/`3f`/`4f`, `uniform1i`/`2i`/`3i`/`4i`, `uniform1fv`–`4fv`, `uniform1iv`, `uniformMatrix2fv`/`3fv`/`4fv` |
 | textures | `createTexture`, `bindTexture`, `activeTexture`, `texImage2D`, `texSubImage2D`, `compressedTexImage2D`, `compressedTexSubImage2D`, `texParameteri`/`f`, `generateMipmap`, `deleteTexture` |
 | framebuffers | `createFramebuffer`, `bindFramebuffer`, `framebufferTexture2D`, `framebufferRenderbuffer`, `checkFramebufferStatus`, `createRenderbuffer`, `bindRenderbuffer`, `renderbufferStorage`, deletes |
-| per-fragment state | `blendFunc`, `blendFuncSeparate`, `blendEquation`, `blendEquationSeparate`, `blendColor`, `depthFunc`, `depthMask`, `depthRange`, `colorMask`, `scissor`, `polygonOffset`, `stencilFunc`, `stencilOp`, `stencilMask`, `clearStencil`, `cullFace`, `frontFace` |
+| per-fragment state | `blendFunc`, `blendFuncSeparate`, `blendEquation`, `blendEquationSeparate`, `blendColor`, `depthFunc`, `depthMask`, `depthRange`, `colorMask`, `scissor`, `polygonOffset`, `stencilFunc`, `stencilOp`, `stencilMask`, `stencilFuncSeparate`, `stencilOpSeparate`, `stencilMaskSeparate`, `clearStencil`, `cullFace`, `frontFace` |
 | introspection | `getActiveUniform`, `getActiveAttrib`, `getUniform`, `getAttachedShaders`, `getShaderSource`, `getShaderPrecisionFormat`, `getVertexAttrib`, `getVertexAttribOffset`, `getBufferParameter`, `getTexParameter`, `getFramebufferAttachmentParameter`, `getRenderbufferParameter`, `getSupportedExtensions`, `validateProgram`, `isBuffer`/`isProgram`/`isShader`/`isTexture`/`isFramebuffer`/`isRenderbuffer`/`isEnabled` |
-| optional (see `gpu.features`) | `createVertexArray`, `bindVertexArray`, `deleteVertexArray`, `isVertexArray`; `drawArraysInstanced`, `drawElementsInstanced`, `vertexAttribDivisor`; `drawBuffers`; `texImage3D`, `texSubImage3D`, `copyTexSubImage3D`, `compressedTexImage3D`, `compressedTexSubImage3D`, `framebufferTextureLayer`; `texStorage2D`, `texStorage3D` |
+| optional (see `features`) | `createVertexArray`, `bindVertexArray`, `deleteVertexArray`, `isVertexArray`; `drawArraysInstanced`, `drawElementsInstanced`, `vertexAttribDivisor`; `drawBuffers`; `texImage3D`, `texSubImage3D`, `copyTexSubImage3D`, `compressedTexImage3D`, `compressedTexSubImage3D`, `framebufferTextureLayer`; `texStorage2D`, `texStorage3D`; `renderbufferStorageMultisample`, `blitFramebuffer`; `readBuffer`; `fenceSync`, `clientWaitSync`, `waitSync`, `getSyncParameter`, `deleteSync`, `isSync`; `createQuery`, `deleteQuery`, `isQuery`, `beginQuery`, `endQuery`, `getQuery`, `getQueryParameter`, `getQueryObjectui64v`; `queryCounter` |
 | the rest | `clear`, `clearColor`, `clearDepthf`, `viewport`, `enable`, `disable`, `lineWidth`, `pixelStorei`, `getParameter`, `getIntegerv`, `getFloatv`, `getBooleanv`, `getError`, `getString`, `readPixels`, `finish`, `flush` |
 
 `texImage2D` accepts `null` pixels, which is how a texture is allocated to be
@@ -210,25 +211,32 @@ hand and renders the result beside the uncompressed original.
 ### What is optional, and how to ask
 
 Vertex array objects, instanced drawing, multiple render targets, 3D and
-array textures, and immutable storage are core in ES 3.0 and extensions
-before it, so whether they exist at all is a property of the driver and the
-context rather than of this build. They are resolved separately from
-everything else, against a live context, and reported per feature:
+array textures, immutable storage, multisampling, the read buffer and sync
+objects are core in ES 3.0 and extensions before it; GPU timer queries are an
+extension on every ES version. So whether they exist at all is a property of
+the driver and the context rather than of this build. They are resolved
+separately from everything else, against a live context, and reported per
+feature:
 
 ```js
 gpu.makeCurrent(surface);
 gpu.features            // { vertexArrayObject, instancedArrays, drawBuffers,
-                        //   texture3D, textureStorage }
+                        //   texture3D, textureStorage, multisample,
+                        //   readBuffer, sync, timerQuery, timestampQuery }
 if (gpu.features.instancedArrays)
     gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, count);
 ```
 
 `features` appears on `makeCurrent` because that is the first moment the
-answer is knowable, and it is refreshed on each call. A feature is `true`
-only when every entry point it needs resolved, so a driver offering half an
-extension reports it absent rather than throwing partway through a frame.
-Calling one that is missing throws a message naming the feature — the
-wrappers never call through a null pointer.
+answer is knowable, and it is refreshed on each call; `apple.Context` sets it
+on `attach` and `makeCurrent`, and `gl.getFeatures()` answers for whichever
+context is current — the one to ask from code that holds only `gl`. It is the
+probe, and `typeof gl.beginQuery === 'function'` is not: `gl` is one object
+shared by every context of both flavors, so every function is always there. A
+feature is `true` only when every entry point it needs resolved, so a driver
+offering half an extension reports it absent rather than throwing partway
+through a frame. Calling one that is missing throws a message naming the
+feature — the wrappers never call through a null pointer.
 
 Two details this hides. Mesa exports the whole ES 3.2 symbol set from
 `libGLESv2.so.2` whatever the context supports, so finding
@@ -238,6 +246,19 @@ that have the extension but not the core function often export neither,
 offering `glDrawArraysInstancedEXT` (or `…ANGLE`, or `…NV`) through
 `eglGetProcAddress` alone — so each feature carries a list of candidate
 spellings and takes the first that both resolves and is advertised.
+
+The newer groups, per flavor. On the CGL flavor "always" means Apple's GL 4.1
+core profile, the default; the legacy profile's route is in parentheses.
+
+| feature | entry points | GLES flavor (`Gpu`) | CGL flavor (`apple.Context`) |
+| --- | --- | --- | --- |
+| `multisample` | `renderbufferStorageMultisample`, `blitFramebuffer` | ES 3.0; on ES 2.0 the ANGLE or NV `framebuffer_multisample` + `framebuffer_blit` pair | always (`ARB_framebuffer_object`) |
+| `readBuffer` | `readBuffer` | ES 3.0, or `NV_read_buffer` | always (core since GL 1.0) |
+| `sync` | `fenceSync`, `clientWaitSync`, `waitSync`, `getSyncParameter`, `deleteSync`, `isSync` | ES 3.0, or `APPLE_sync` | always (`ARB_sync`) |
+| `timerQuery` | `createQuery`, `deleteQuery`, `isQuery`, `beginQuery`, `endQuery`, `getQuery`, `getQueryParameter`, `getQueryObjectui64v` | only with `GL_EXT_disjoint_timer_query`, on ES 3.0 as on 2.0 | always (`EXT_timer_query`) |
+| `timestampQuery` | `queryCounter` | only with `GL_EXT_disjoint_timer_query` | always, over a clock of 0 bits (absent) |
+
+The separate stencil setters are core ES 2.0 and need no flag.
 
 ### 3D and array textures
 
@@ -262,15 +283,117 @@ afterwards, through `texSubImage`. Sampling either target needs GLSL ES 3.00
 `glVersion` above. `examples/texture-3d.js` ray-marches a 64³ volume beside
 the array texture and the slices it interpolates between.
 
+### One-pass non-zero fills, and multisampled edges
+
+`stencilFuncSeparate`, `stencilOpSeparate` and `stencilMaskSeparate` set one
+facing's stencil state and leave the other's alone, which is what counts a
+winding number in a single pass — front faces up, back faces down:
+
+```js
+gl.colorMask(false, false, false, false);
+gl.stencilFunc(gl.ALWAYS, 0, 0xff);
+gl.stencilOpSeparate(gl.FRONT, gl.KEEP, gl.KEEP, gl.INCR_WRAP);
+gl.stencilOpSeparate(gl.BACK, gl.KEEP, gl.KEEP, gl.DECR_WRAP);
+drawFans();                                  // both windings, one draw
+gl.colorMask(true, true, true, true);
+gl.stencilFunc(gl.NOTEQUAL, 0, 0xff);        // the non-zero rule
+gl.stencilOp(gl.ZERO, gl.ZERO, gl.ZERO);     // clean for the next layer
+drawCover();
+```
+
+A framebuffer with no stencil buffer passes every stencil test, so make sure
+there is one: a CGL context's own framebuffer has none unless it asked for
+`stencilSize`, while `createTarget`'s framebuffer has one. The test is to draw
+with `NOTEQUAL 0` over a cleared stencil — which must draw nothing.
+
+Multisampling (`features.multisample`) is render, then resolve: draw into a
+framebuffer of `renderbufferStorageMultisample` renderbuffers, and
+`blitFramebuffer` it into a single-sample one, which is the only way to read
+or sample what was drawn:
+
+```js
+const samples = Math.min(4, gl.getParameter(gl.MAX_SAMPLES));
+gl.renderbufferStorageMultisample(gl.RENDERBUFFER, samples, gl.RGBA8, w, h);
+// ... attach it to msaaFbo, draw ...
+gl.bindFramebuffer(gl.READ_FRAMEBUFFER, msaaFbo);
+gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, target.fbo);  // an IOSurface target will do
+gl.blitFramebuffer(0, 0, w, h, 0, 0, w, h, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+```
+
+ES 3.0 resolves only between identical formats and identical rectangles.
+`readBuffer` (`features.readBuffer`) chooses which attachment a blit, or
+`readPixels`, reads.
+
+### Timing a frame without stalling it
+
+`finish()` times a frame by waiting for it, stalling the thread — on the
+Cocoa path until the surface is done too. A GPU timer brackets the frame
+instead, and its reading is there a frame or two later with nobody having
+waited for it:
+
+```js
+// each frame
+const q = gl.createQuery();
+gl.beginQuery(gl.TIME_ELAPSED, q);
+drawFrame();
+gl.endQuery(gl.TIME_ELAPSED);
+pending.push(q);
+
+// then, each frame, whatever has come back — asking never waits
+while (pending.length && gl.getQueryParameter(pending[0], gl.QUERY_RESULT_AVAILABLE)) {
+    const done = pending.shift();
+    const ns = gl.getQueryParameter(done, gl.QUERY_RESULT);
+    if (!gl.getParameter(gl.GPU_DISJOINT_EXT))      // false on desktop GL
+        learn(ns);
+    gl.deleteQuery(done);
+}
+```
+
+- **Asking whether there is one.** `features.timerQuery`, then
+  `gl.getQuery(gl.TIME_ELAPSED, gl.QUERY_COUNTER_BITS) > 0`: a driver may
+  offer the entry points over a counter of no bits. On the CGL flavor timers
+  are core GL 3.3 (Apple Silicon gives a 32-bit counter; 64 blended quads on
+  an M1 Pro read about 0.6 ms). On the GLES flavor they need
+  `GL_EXT_disjoint_timer_query` — on ES 3.0 as much as 2.0, since ES's own
+  query objects have no timer.
+- **Disjoint readings.** The ES extension reports when something (a power
+  state change, say) disturbed the GPU clock, voiding the readings taken since
+  the last ask. `getParameter(gl.GPU_DISJOINT_EXT)` answers — and resets — it
+  there, and answers `false` on desktop GL, which has no such notion, without
+  raising the `INVALID_ENUM` GL would; so the loop above is the same on both
+  flavors.
+- **Precision.** Results are 64-bit nanosecond counts. `getQueryParameter`
+  answers a Number, exact below 2^53 ns — 104 days, far past any frame.
+  `getQueryObjectui64v` answers the same reading as a BigInt with all 64 bits,
+  for the one kind of value that can pass 2^53: an absolute `TIMESTAMP`.
+- **Timestamps.** `queryCounter(q, gl.TIMESTAMP)` (`features.timestampQuery`)
+  needs `getQuery(gl.TIMESTAMP, gl.QUERY_COUNTER_BITS) > 0` as well, and
+  Apple's GL answers 0 — on macOS, time spans with `TIME_ELAPSED`.
+- **The stall is still there if asked for.** `QUERY_RESULT` for a result not
+  yet available waits for it. Ask `QUERY_RESULT_AVAILABLE` first.
+
+Fences (`features.sync`) answer the coarser question — has the GPU finished
+everything up to here — in the same non-blocking way. `fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0)`
+after a frame, then `clientWaitSync(fence, 0, 0)` polls: `TIMEOUT_EXPIRED`
+until it has passed, `ALREADY_SIGNALED` after. `flush()` first, or pass
+`SYNC_FLUSH_COMMANDS_BIT`, or the fence may never reach the GPU to signal. A
+timeout other than 0 is nanoseconds, as a Number or a BigInt, and `waitSync`
+takes `gl.TIMEOUT_IGNORED` (WebGL 2's -1, since a Number cannot hold GL's
+2^64 - 1). The handle `fenceSync` returns is a number like every other object
+here, not the driver's pointer: the binding keeps the pointer, and refuses a
+handle that is deleted, made up, or another context's rather than hand GL
+something it cannot validate.
+
 ### Still not covered
 
 The rest of ES 3.0: sampler objects, uniform buffer objects, transform
-feedback, query and sync objects, multisampled renderbuffers, primitive
-restart, and `getUniformuiv` for unsigned-integer uniforms (`getUniform`
-answers `null` for a type it cannot read). Adding one is still a small
-wrapper per entry point in `src/x11dri.c` plus a line in the `EXPORT` block —
-the JS name is derived from the `glFoo` export automatically, and anything
-past ES 2.0 belongs in the optional table beside the features above.
+feedback, primitive restart, and `getUniformuiv` for unsigned-integer uniforms
+(`getUniform` answers `null` for a type it cannot read). Query objects are
+here for the timers; their occlusion targets would go through the same calls
+but have no constants in `GL`. Adding one is still a small wrapper per entry
+point in `src/x11dri.c` plus a line in the `EXPORT` block — the JS name is
+derived from the `glFoo` export automatically, and anything past ES 2.0
+belongs in the optional table beside the features above.
 
 ## How it fits together
 

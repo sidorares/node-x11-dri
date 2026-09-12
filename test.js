@@ -1336,5 +1336,680 @@ report('GL 3D textures, array textures and immutable storage', () => {
     return `${maxLayers} layers, ${max3d}px volumes, ${storageNote}`;
 });
 
+// ---------------------------------------------------------------------------
+// From here on the tests draw into framebuffers they build themselves, so
+// they need nothing from a window system and run the same on either flavor —
+// whichever context this machine can make: a CGL one on macOS (the Apple
+// Software Renderer on CI's runners, which have no GPU) or an EGL one on a
+// Linux render node. Each says which it ran on.
+const anyContext = () => {
+    if (caps.appledri === true) {
+        try {
+            dri.apple.clientId();
+        } catch (e) {
+            skip(`WindowServer unreachable: ${e.message}`);
+        }
+        const ctx = new dri.apple.Context({ depthSize: 0 });
+        ctx.makeCurrent();
+        const gl = dri.gl;
+        return {
+            gl, apple: ctx, features: ctx.features,
+            flavor: `${gl.getString(gl.RENDERER)}, GL ${ctx.glVersion.major}.${ctx.glVersion.minor}`,
+            destroy: () => ctx.destroy()
+        };
+    }
+    const { gpu, surf, gl } = glSurface(16, { format: dri.FORMAT.ARGB8888 });
+    return {
+        gl, apple: null, features: gpu.features,
+        flavor: `${gl.getString(gl.RENDERER)}, ${gpu.glVersion.string}`,
+        destroy: () => { surf.destroy(); gpu.destroy(); }
+    };
+};
+
+// A pause between polls that is not a spin, in a synchronous test: blocks
+// this thread for `ms` and nothing else.
+const sleepMs = ms => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+
+// A framebuffer to draw into and read back: an RGBA texture and, when asked,
+// a depth+stencil renderbuffer — attached twice rather than as
+// DEPTH_STENCIL_ATTACHMENT, the spelling every profile of both dialects
+// accepts (the IOSurface target does the same).
+const colorTarget = (gl, S, withStencil) => {
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, S, S, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    const fbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    let rb = 0;
+    if (withStencil) {
+        rb = gl.createRenderbuffer();
+        gl.bindRenderbuffer(gl.RENDERBUFFER, rb);
+        gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH24_STENCIL8, S, S);
+        gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, rb);
+        gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.STENCIL_ATTACHMENT, gl.RENDERBUFFER, rb);
+    }
+    assert.strictEqual(gl.checkFramebufferStatus(gl.FRAMEBUFFER), gl.FRAMEBUFFER_COMPLETE,
+        `a ${S}px colour${withStencil ? ' + stencil' : ''} framebuffer is complete`);
+    return {
+        fbo, tex,
+        destroy() {
+            gl.deleteFramebuffer(fbo);
+            gl.deleteTexture(tex);
+            if (rb)
+                gl.deleteRenderbuffer(rb);
+        }
+    };
+};
+
+// One colour, from a uniform, over the positions in a buffer of its own.
+const flatProgram = (gl, positions) => {
+    const program = buildProgram(gl,
+        'attribute vec2 position;\nvoid main() { gl_Position = vec4(position, 0.0, 1.0); }',
+        'precision mediump float;\nuniform vec4 uColor;\nvoid main() { gl_FragColor = uColor; }');
+    gl.useProgram(program);
+    const buffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(positions), gl.STATIC_DRAW);
+    const loc = gl.getAttribLocation(program, 'position');
+    gl.enableVertexAttribArray(loc);
+    gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+    const uColor = gl.getUniformLocation(program, 'uColor');
+    return { color: rgba => gl.uniform4fv(uColor, new Float32Array(rgba)) };
+};
+
+// The bound framebuffer, S pixels square, as a lookup of [r, g, b] by pixel.
+const readRgb = (gl, S) => {
+    const px = new Uint8Array(S * S * 4);
+    gl.readPixels(0, 0, S, S, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    return (x, y) => {
+        const o = (y * S + x) * 4;
+        return [px[o], px[o + 1], px[o + 2]];
+    };
+};
+const colorName = ([r, g, b]) => ({
+    '000': 'black', '100': 'red', '010': 'green', '001': 'blue', '111': 'white'
+})[[r, g, b].map(v => (v > 127 ? 1 : 0)).join('')] || `rgb(${r}, ${g}, ${b})`;
+
+const glOkFor = gl => what => {
+    const e = gl.getError();
+    assert.strictEqual(e, gl.NO_ERROR, `${what}: GL error 0x${e.toString(16)}`);
+};
+
+// A non-zero fill, the way the map renderer does one: the winding number
+// counted into the stencil buffer — up on front faces, down on back faces —
+// then colour wherever it is not zero. With the one-facing setters that is a
+// pass per facing with face culling in between; the *Separate ones count
+// both facings in the same draw.
+report('GL separate stencil: a non-zero fill in one pass', () => {
+    const c = anyContext();
+    try {
+        const gl = c.gl;
+        const glOk = glOkFor(gl);
+        const S = 32;
+
+        // a fresh context's masks are all ones, which read back unsigned
+        const mask = gl.getParameter(gl.STENCIL_WRITEMASK);
+        assert.ok(mask >= 0xff, `STENCIL_WRITEMASK reads unsigned: ${mask}`);
+        assert.strictEqual(gl.getParameter(gl.STENCIL_BACK_WRITEMASK), mask);
+
+        // Two quads overlapping across the middle half, the left one wound
+        // counter-clockwise (front-facing) and the right one clockwise — as
+        // triangles, so both go down in one draw — then a full-viewport quad
+        // each way round to paint with. So the winding number is +1 over the
+        // left quarter, +1 - 1 = 0 over the middle, and -1 over the right
+        // quarter, which an 8-bit stencil holds as 255.
+        const quad = (x0, x1, ccw) => ccw
+            ? [x0, -1, x1, -1, x0, 1, x0, 1, x1, -1, x1, 1]
+            : [x0, -1, x0, 1, x1, -1, x0, 1, x1, 1, x1, -1];
+        const flat = flatProgram(gl, [...quad(-1, 0.5, true), ...quad(-0.5, 1, false),
+            ...quad(-1, 1, true), ...quad(-1, 1, false)]);
+        const WINDING = [0, 12], FRONT = [12, 6], BACK = [18, 6];
+        const draw = ([first, count], rgba) => {
+            if (rgba)
+                flat.color(rgba);
+            gl.drawArrays(gl.TRIANGLES, first, count);
+        };
+        const RED = [1, 0, 0, 1], GREEN = [0, 1, 0, 1], BLUE = [0, 0, 1, 1], WHITE = [1, 1, 1, 1];
+        const regions = () => {
+            const at = readRgb(gl, S);
+            return [at(3, 16), at(16, 16), at(28, 16)].map(colorName);
+        };
+        const countWinding = () => {
+            gl.colorMask(false, false, false, false);
+            gl.stencilFunc(gl.ALWAYS, 0, 0xff);
+            gl.stencilOpSeparate(gl.FRONT, gl.KEEP, gl.KEEP, gl.INCR_WRAP);
+            gl.stencilOpSeparate(gl.BACK, gl.KEEP, gl.KEEP, gl.DECR_WRAP);
+            draw(WINDING);
+            gl.colorMask(true, true, true, true);
+        };
+        const paintWhereStencil = pairs => {
+            gl.stencilOp(gl.KEEP, gl.KEEP, gl.KEEP);
+            for (const [ref, rgba] of pairs) {
+                gl.stencilFunc(gl.EQUAL, ref, 0xff);
+                draw(FRONT, rgba);
+            }
+        };
+
+        const fillInto = (fbo, where) => {
+            gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+            gl.viewport(0, 0, S, S);
+            gl.disable(gl.CULL_FACE);
+            gl.disable(gl.DEPTH_TEST);
+            gl.disable(gl.BLEND);
+            gl.stencilMask(0xff);
+            gl.clearStencil(0);
+            gl.clearColor(0, 0, 0, 1);
+            gl.clear(gl.COLOR_BUFFER_BIT | gl.STENCIL_BUFFER_BIT);
+            gl.enable(gl.STENCIL_TEST);
+
+            // First, that there is a stencil buffer at all. A framebuffer
+            // without one passes every stencil test, so "write, then draw
+            // where written" draws either way; NOTEQUAL 0 over a cleared
+            // stencil draws only where there is none.
+            gl.stencilFunc(gl.NOTEQUAL, 0, 0xff);
+            gl.stencilOp(gl.KEEP, gl.KEEP, gl.KEEP);
+            draw(FRONT, WHITE);
+            assert.deepStrictEqual(regions(), ['black', 'black', 'black'],
+                `${where}: a cleared stencil passed NOTEQUAL 0 — no stencil buffer?`);
+
+            // The winding number, both facings in one draw, read back as
+            // colour: +1 red, 0 green, -1 blue.
+            countWinding();
+            assert.strictEqual(gl.getParameter(gl.STENCIL_PASS_DEPTH_PASS), gl.INCR_WRAP);
+            assert.strictEqual(gl.getParameter(gl.STENCIL_BACK_PASS_DEPTH_PASS), gl.DECR_WRAP);
+            assert.strictEqual(gl.getParameter(gl.STENCIL_BACK_PASS_DEPTH_FAIL), gl.KEEP);
+            assert.strictEqual(gl.getParameter(gl.STENCIL_BACK_FAIL), gl.KEEP);
+            paintWhereStencil([[1, RED], [0, GREEN], [0xff, BLUE]]);
+            assert.deepStrictEqual(regions(), ['red', 'green', 'blue'],
+                `${where}: front faces count up, back faces down, and the overlap cancels`);
+
+            // The fill: wherever the winding number is not zero.
+            gl.clear(gl.COLOR_BUFFER_BIT);
+            gl.stencilFunc(gl.NOTEQUAL, 0, 0xff);
+            draw(FRONT, WHITE);
+            assert.deepStrictEqual(regions(), ['white', 'black', 'white'],
+                `${where}: the non-zero rule fills both quads and not their overlap`);
+
+            // stencilFuncSeparate: each facing tests against its own reference
+            gl.clear(gl.COLOR_BUFFER_BIT);
+            gl.stencilFuncSeparate(gl.FRONT, gl.EQUAL, 1, 0xff);
+            gl.stencilFuncSeparate(gl.BACK, gl.EQUAL, 0xff, 0xff);
+            draw(FRONT, RED);
+            draw(BACK, BLUE);
+            assert.deepStrictEqual(regions(), ['red', 'black', 'blue'],
+                `${where}: front faces tested against 1, back faces against 255`);
+            assert.strictEqual(gl.getParameter(gl.STENCIL_REF), 1);
+            assert.strictEqual(gl.getParameter(gl.STENCIL_BACK_REF), 0xff);
+            assert.strictEqual(gl.getParameter(gl.STENCIL_BACK_FUNC), gl.EQUAL);
+
+            // stencilMaskSeparate: each facing writes through its own mask,
+            // so the back faces' decrement from 0 lands as 0x0f, not 0xff
+            gl.clear(gl.COLOR_BUFFER_BIT | gl.STENCIL_BUFFER_BIT);
+            gl.stencilMaskSeparate(gl.BACK, 0x0f);
+            assert.strictEqual(gl.getParameter(gl.STENCIL_WRITEMASK), 0xff);
+            assert.strictEqual(gl.getParameter(gl.STENCIL_BACK_WRITEMASK), 0x0f);
+            countWinding();
+            paintWhereStencil([[1, RED], [0x0f, BLUE]]);
+            assert.deepStrictEqual(regions(), ['red', 'black', 'blue'],
+                `${where}: the back faces wrote through their own mask`);
+            gl.stencilMask(0xff);
+            gl.disable(gl.STENCIL_TEST);
+            glOk(where);
+        };
+
+        const own = colorTarget(gl, S, true);
+        fillInto(own.fbo, 'a depth+stencil renderbuffer');
+        own.destroy();
+        let into = 'a depth+stencil framebuffer';
+        // and the IOSurface target, which is where the map draws on Cocoa
+        if (c.apple) {
+            const target = c.apple.createTarget(S, S);
+            try {
+                fillInto(target.fbo, 'the IOSurface target');
+            } finally {
+                target.destroy();
+            }
+            into += ' and an IOSurface target';
+        }
+        return `${c.flavor}: into ${into}`;
+    } finally {
+        c.destroy();
+    }
+});
+
+// Antialiasing from the hardware: draw into a renderbuffer that keeps
+// several samples per pixel, and resolve it with a blit into one that can be
+// read. The resolved edge has pixels strictly between the colours either side
+// of it; the same draw without samples has none, which is what makes the
+// greys evidence of multisampling rather than of anything else.
+report('GL multisampling: a blit resolves an antialiased edge', () => {
+    const c = anyContext();
+    try {
+        const { gl, features } = c;
+        const glOk = glOkFor(gl);
+        if (!features.multisample) {
+            assert.throws(() => gl.renderbufferStorageMultisample(gl.RENDERBUFFER, 4,
+                gl.RGBA8, 1, 1), /not available/);
+            assert.throws(() => gl.blitFramebuffer(0, 0, 1, 1, 0, 0, 1, 1,
+                gl.COLOR_BUFFER_BIT, gl.NEAREST), /not available/);
+            return `no multisampling on ${c.flavor}`;
+        }
+        const S = 32;
+        // a triangle whose long edge climbs across the whole viewport at a
+        // slope that cuts pixels at every offset
+        const flat = flatProgram(gl, [-1, -1, 1, -1, 1, 0.3]);
+        flat.color([1, 1, 1, 1]);
+        const drawEdge = () => {
+            gl.viewport(0, 0, S, S);
+            gl.clearColor(0, 0, 0, 1);
+            gl.clear(gl.COLOR_BUFFER_BIT);
+            gl.drawArrays(gl.TRIANGLES, 0, 3);
+        };
+        const edgeOf = () => {
+            const px = new Uint8Array(S * S * 4);
+            gl.readPixels(0, 0, S, S, gl.RGBA, gl.UNSIGNED_BYTE, px);
+            let grey = 0;
+            for (let i = 0; i < px.length; i += 4)
+                if (px[i] > 0 && px[i] < 255)
+                    grey++;
+            return { grey, inside: px[(4 * S + 28) * 4], outside: px[(28 * S + 4) * 4] };
+        };
+
+        // A blit between two single-sample framebuffers first: the green
+        // quarter of the source lands in the destination's top-right
+        // quarter, where its coordinates say — a wrapper passing them out of
+        // order would put it elsewhere, or be refused.
+        const src = colorTarget(gl, S), dst = colorTarget(gl, S);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, src.fbo);
+        gl.clearColor(1, 0, 0, 1);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        gl.enable(gl.SCISSOR_TEST);
+        gl.scissor(0, 0, S / 2, S / 2);
+        gl.clearColor(0, 1, 0, 1);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        gl.disable(gl.SCISSOR_TEST);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, dst.fbo);
+        gl.clearColor(0, 0, 0, 1);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        gl.bindFramebuffer(gl.READ_FRAMEBUFFER, src.fbo);
+        gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, dst.fbo);
+        assert.strictEqual(gl.getParameter(gl.READ_FRAMEBUFFER_BINDING), src.fbo);
+        assert.strictEqual(gl.getParameter(gl.DRAW_FRAMEBUFFER_BINDING), dst.fbo);
+        gl.blitFramebuffer(0, 0, S / 2, S / 2, S / 2, S / 2, S, S, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+        glOk('blitFramebuffer');
+        gl.bindFramebuffer(gl.FRAMEBUFFER, dst.fbo);
+        let at = readRgb(gl, S);
+        assert.deepStrictEqual([at(24, 24), at(8, 8), at(24, 8), at(8, 24)].map(colorName),
+            ['green', 'black', 'black', 'black'], 'the quarter landed where the destination said');
+
+        // readBuffer: with the two textures on one framebuffer, readPixels
+        // reads whichever attachment it is told to.
+        let reads = 'readBuffer absent';
+        if (features.readBuffer) {
+            const both = gl.createFramebuffer();
+            gl.bindFramebuffer(gl.FRAMEBUFFER, both);
+            gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, src.tex, 0);
+            gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1, gl.TEXTURE_2D, dst.tex, 0);
+            assert.strictEqual(gl.checkFramebufferStatus(gl.FRAMEBUFFER), gl.FRAMEBUFFER_COMPLETE);
+            gl.readBuffer(gl.COLOR_ATTACHMENT1);
+            assert.strictEqual(gl.getParameter(gl.READ_BUFFER), gl.COLOR_ATTACHMENT1);
+            at = readRgb(gl, S);
+            assert.deepStrictEqual([at(24, 24), at(24, 8)].map(colorName), ['green', 'black'],
+                'attachment 1 is the blit destination');
+            gl.readBuffer(gl.COLOR_ATTACHMENT0);
+            at = readRgb(gl, S);
+            assert.deepStrictEqual([at(8, 8), at(24, 8)].map(colorName), ['green', 'red'],
+                'attachment 0 is the source');
+            gl.deleteFramebuffer(both);
+            glOk('readBuffer');
+            reads = 'readBuffer';
+        } else {
+            assert.throws(() => gl.readBuffer(gl.COLOR_ATTACHMENT0), /not available/);
+        }
+        src.destroy();
+        dst.destroy();
+
+        const most = gl.getParameter(gl.MAX_SAMPLES);
+        if (most < 2)
+            return `${c.flavor}: blits and ${reads}; MAX_SAMPLES is ${most}, so nothing to resolve`;
+        const samples = Math.min(4, most);
+
+        // The resolve target is a renderbuffer of the same sized format as
+        // the multisampled one: ES 3.0 refuses a resolve between formats
+        // that are not identical.
+        const renderbufferTarget = n => {
+            const rb = gl.createRenderbuffer();
+            gl.bindRenderbuffer(gl.RENDERBUFFER, rb);
+            if (n)
+                gl.renderbufferStorageMultisample(gl.RENDERBUFFER, n, gl.RGBA8, S, S);
+            else
+                gl.renderbufferStorage(gl.RENDERBUFFER, gl.RGBA8, S, S);
+            const fbo = gl.createFramebuffer();
+            gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+            gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.RENDERBUFFER, rb);
+            assert.strictEqual(gl.checkFramebufferStatus(gl.FRAMEBUFFER), gl.FRAMEBUFFER_COMPLETE,
+                `the ${n ? `${n}-sample` : 'single-sample'} framebuffer is complete`);
+            return { fbo, rb };
+        };
+        const ms = renderbufferTarget(samples);
+        gl.bindRenderbuffer(gl.RENDERBUFFER, ms.rb);
+        const given = gl.getRenderbufferParameter(gl.RENDERBUFFER, gl.RENDERBUFFER_SAMPLES);
+        assert.ok(given >= samples, `asked for ${samples} samples, got ${given}`);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, ms.fbo);
+        assert.ok(gl.getParameter(gl.SAMPLES) >= 2,
+            `the bound framebuffer has samples: ${gl.getParameter(gl.SAMPLES)}`);
+        const resolved = renderbufferTarget(0);
+
+        // the control: the triangle with one sample per pixel
+        drawEdge();
+        const aliased = edgeOf();
+        assert.strictEqual(aliased.grey, 0, 'one sample per pixel: every pixel black or white');
+
+        gl.bindFramebuffer(gl.FRAMEBUFFER, ms.fbo);
+        drawEdge();
+        gl.bindFramebuffer(gl.READ_FRAMEBUFFER, ms.fbo);
+        gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, resolved.fbo);
+        gl.blitFramebuffer(0, 0, S, S, 0, 0, S, S, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+        glOk('the resolve');
+        gl.bindFramebuffer(gl.FRAMEBUFFER, resolved.fbo);
+        const edge = edgeOf();
+        assert.ok(edge.grey >= S / 4, `the resolved edge has grey pixels: ${edge.grey}`);
+        assert.strictEqual(edge.inside, 255, 'inside the triangle is white');
+        assert.strictEqual(edge.outside, 0, 'outside it is black');
+
+        // and resolved straight into an IOSurface target, the way the map
+        // would present a multisampled frame on Cocoa
+        let intoTarget = '';
+        if (c.apple) {
+            const target = c.apple.createTarget(S, S, { depth: false });
+            try {
+                gl.bindFramebuffer(gl.READ_FRAMEBUFFER, ms.fbo);
+                gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, target.fbo);
+                gl.blitFramebuffer(0, 0, S, S, 0, 0, S, S, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+                glOk('the resolve into an IOSurface target');
+                gl.bindFramebuffer(gl.FRAMEBUFFER, target.fbo);
+                const onTarget = edgeOf();
+                assert.strictEqual(onTarget.grey, edge.grey,
+                    `the IOSurface target took the same resolve: ${onTarget.grey} grey pixels`);
+            } finally {
+                target.destroy();
+            }
+            intoTarget = ', also into an IOSurface target';
+        }
+        for (const t of [ms, resolved]) {
+            gl.deleteFramebuffer(t.fbo);
+            gl.deleteRenderbuffer(t.rb);
+        }
+        glOk('multisampling');
+        return `${c.flavor}: ${given}x, ${edge.grey} grey edge pixels after the resolve` +
+            `${intoTarget}; blits and ${reads}`;
+    } finally {
+        c.destroy();
+    }
+});
+
+// A fence asks "is that frame done?" and gets its answer at once — where
+// finish() answers only by stalling until it is. Polled here the way a frame
+// loop would: a zero timeout, which never blocks, until the fence has passed.
+report('GL sync objects: a fence signals, polled without blocking', () => {
+    const c = anyContext();
+    try {
+        const { gl, features } = c;
+        const glOk = glOkFor(gl);
+        if (!features.sync) {
+            assert.throws(() => gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0), /not available/);
+            return `no sync objects on ${c.flavor}`;
+        }
+        // some work for the fence to follow
+        const S = 256;
+        const t = colorTarget(gl, S);
+        gl.viewport(0, 0, S, S);
+        flatProgram(gl, [-1, -1, 1, -1, -1, 1, 1, 1]).color([0.5, 0.25, 1, 1]);
+        for (let i = 0; i < 16; i++)
+            gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+        const fence = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+        assert.ok(Number.isInteger(fence) && fence > 0, `a handle, as a number: ${fence}`);
+        assert.strictEqual(gl.isSync(fence), true);
+        assert.strictEqual(gl.getSyncParameter(fence, gl.OBJECT_TYPE), gl.SYNC_FENCE);
+        assert.strictEqual(gl.getSyncParameter(fence, gl.SYNC_CONDITION), gl.SYNC_GPU_COMMANDS_COMPLETE);
+        assert.strictEqual(gl.getSyncParameter(fence, gl.SYNC_FLAGS), 0);
+
+        // flush, so the fence reaches the GPU at all, then poll
+        gl.flush();
+        const deadline = Date.now() + 5000;
+        let status, polls = 0;
+        for (;;) {
+            status = gl.clientWaitSync(fence, 0, 0);
+            polls++;
+            if (status !== gl.TIMEOUT_EXPIRED || Date.now() > deadline)
+                break;
+            sleepMs(1);
+        }
+        assert.ok(status === gl.ALREADY_SIGNALED || status === gl.CONDITION_SATISFIED,
+            `signaled within 5 s: 0x${status.toString(16)} after ${polls} polls`);
+        assert.strictEqual(gl.getSyncParameter(fence, gl.SYNC_STATUS), gl.SIGNALED);
+
+        // the other two waits: the GPU waiting (TIMEOUT_IGNORED, WebGL 2's -1),
+        // and this thread with a timeout, as a BigInt this time
+        const second = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+        gl.waitSync(second, 0, gl.TIMEOUT_IGNORED);
+        glOk('waitSync');
+        const waited = gl.clientWaitSync(second, gl.SYNC_FLUSH_COMMANDS_BIT, 1000000000n);
+        assert.ok(waited === gl.ALREADY_SIGNALED || waited === gl.CONDITION_SATISFIED,
+            `a one-second wait: 0x${waited.toString(16)}`);
+
+        // The handles are the binding's, not the driver's pointers, so a stale
+        // or made-up one is refused rather than handed to GL.
+        gl.deleteSync(fence);
+        gl.deleteSync(second);
+        assert.strictEqual(gl.isSync(fence), false);
+        gl.deleteSync(fence); // twice is harmless
+        gl.deleteSync(0);
+        assert.throws(() => gl.clientWaitSync(fence, 0, 0), /not a live sync object/);
+        assert.throws(() => gl.getSyncParameter(0xbeef, gl.SYNC_STATUS), /not a live sync object/);
+        // and a condition GL does not know makes no sync — 0, with the reason in getError()
+        assert.strictEqual(gl.fenceSync(0x1234, 0), 0);
+        assert.strictEqual(gl.getError(), gl.INVALID_ENUM);
+
+        // A handle is good only in the context that fenced it, and dies with
+        // that context. (Two CGL contexts are cheap; two EGL ones would each
+        // want a surface, so this half is the Apple flavor's.)
+        if (c.apple) {
+            const mine = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+            const other = new dri.apple.Context({ depthSize: 0 });
+            let theirs;
+            try {
+                other.makeCurrent();
+                assert.throws(() => gl.clientWaitSync(mine, 0, 0), /another context/);
+                assert.strictEqual(gl.isSync(mine), false, 'not a sync of this context');
+                theirs = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+            } finally {
+                other.destroy();
+                c.apple.makeCurrent();
+            }
+            assert.throws(() => gl.clientWaitSync(theirs, 0, 0), /not a live sync object/,
+                'a destroyed context took its fences with it');
+            assert.strictEqual(gl.isSync(mine), true);
+            gl.deleteSync(mine);
+        }
+        t.destroy();
+        glOk('sync objects');
+        return `${c.flavor}: signaled after ${polls} poll(s)`;
+    } finally {
+        c.destroy();
+    }
+});
+
+// A GPU timer brackets a stretch of the command stream, and its reading turns
+// up a frame or two later without anyone waiting for it: QUERY_RESULT_AVAILABLE
+// never blocks, so a frame loop reads each frame's GPU time once it is ready.
+report('GL timer queries: a frame\'s GPU time, read once it is ready', () => {
+    const c = anyContext();
+    try {
+        const { gl, features } = c;
+        const glOk = glOkFor(gl);
+        // the disjoint flag answers on every flavor, and asking raises nothing
+        assert.strictEqual(typeof gl.getParameter(gl.GPU_DISJOINT_EXT), 'boolean');
+        glOk('asking GPU_DISJOINT_EXT');
+        if (!features.timestampQuery)
+            assert.throws(() => gl.queryCounter(0, gl.TIMESTAMP), /not available/);
+        if (!features.timerQuery) {
+            assert.throws(() => gl.getQueryObjectui64v(0, gl.QUERY_RESULT), /not available/);
+            return `no GPU timers on ${c.flavor}`;
+        }
+        const bits = gl.getQuery(gl.TIME_ELAPSED, gl.QUERY_COUNTER_BITS);
+        glOk('QUERY_COUNTER_BITS');
+        if (bits === 0)
+            return `${c.flavor}: TIME_ELAPSED has a 0-bit counter — no timer to read`;
+
+        const S = 256;
+        const t = colorTarget(gl, S);
+        gl.viewport(0, 0, S, S);
+        flatProgram(gl, [-1, -1, 1, -1, -1, 1, 1, 1]).color([1, 1, 1, 0.1]);
+        gl.enable(gl.BLEND);
+        gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+        const work = () => {
+            for (let i = 0; i < 64; i++)
+                gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        };
+        const whenReady = q => {
+            gl.flush();
+            const deadline = Date.now() + 5000;
+            let polls = 0;
+            while (!gl.getQueryParameter(q, gl.QUERY_RESULT_AVAILABLE) && Date.now() < deadline) {
+                polls++;
+                sleepMs(1);
+            }
+            assert.strictEqual(gl.getQueryParameter(q, gl.QUERY_RESULT_AVAILABLE), true,
+                `a result within 5 s (${polls} polls)`);
+            return polls;
+        };
+
+        const q = gl.createQuery();
+        gl.beginQuery(gl.TIME_ELAPSED, q);
+        assert.strictEqual(gl.getQuery(gl.TIME_ELAPSED, gl.CURRENT_QUERY), q, 'the active query');
+        work();
+        gl.endQuery(gl.TIME_ELAPSED);
+        assert.strictEqual(gl.getQuery(gl.TIME_ELAPSED, gl.CURRENT_QUERY), 0, 'none once ended');
+        assert.strictEqual(gl.isQuery(q), true);
+        const polls = whenReady(q);
+        const ns = gl.getQueryParameter(q, gl.QUERY_RESULT);
+        assert.ok(Number.isInteger(ns) && ns > 0 && ns < 5e9,
+            `a plausible GPU time for 64 blended quads: ${ns} ns`);
+        // the raw form holds the same reading, every bit of it
+        assert.strictEqual(gl.getQueryObjectui64v(q, gl.QUERY_RESULT), BigInt(ns));
+        const disjoint = gl.getParameter(gl.GPU_DISJOINT_EXT);
+        gl.deleteQuery(q);
+        assert.strictEqual(gl.isQuery(q), false);
+
+        // Timestamps: two readings of the GPU clock around the same work.
+        // queryCounter can exist with a clock that does not tick, which is
+        // what QUERY_COUNTER_BITS for TIMESTAMP says.
+        let stamps = 'no timestamps';
+        if (features.timestampQuery) {
+            const stampBits = gl.getQuery(gl.TIMESTAMP, gl.QUERY_COUNTER_BITS);
+            glOk('TIMESTAMP QUERY_COUNTER_BITS');
+            stamps = 'a TIMESTAMP counter of 0 bits';
+            if (stampBits > 0) {
+                const [t0, t1] = [gl.createQuery(), gl.createQuery()];
+                gl.queryCounter(t0, gl.TIMESTAMP);
+                work();
+                gl.queryCounter(t1, gl.TIMESTAMP);
+                whenReady(t1);
+                whenReady(t0);
+                const a = gl.getQueryObjectui64v(t0, gl.QUERY_RESULT);
+                const b = gl.getQueryObjectui64v(t1, gl.QUERY_RESULT);
+                assert.strictEqual(typeof a, 'bigint');
+                assert.ok(b > a, `the clock moved forward: ${a} -> ${b}`);
+                gl.deleteQuery(t0);
+                gl.deleteQuery(t1);
+                stamps = `timestamps ${b - a} ns apart`;
+            }
+        }
+        t.destroy();
+        glOk('timer queries');
+        return `${c.flavor}: ${ns} ns on the GPU, read after ${polls} poll(s)` +
+            `${disjoint ? ' (disjoint: void)' : ''}; ${stamps}`;
+    } finally {
+        c.destroy();
+    }
+});
+
+// The 2.1 legacy profile reaches the features above through extensions —
+// ARB_framebuffer_object, ARB_sync, EXT_timer_query — which makes it the one
+// place on either flavor where a real driver resolves the non-core
+// candidates; the timer's getter is the EXT-suffixed one. It also lacks
+// something outright: timestamps came with ARB_timer_query, so there
+// queryCounter must throw rather than call through a null pointer.
+report('GL optional entry points through extensions: the Apple legacy profile', () => {
+    if (caps.appledri !== true)
+        skip(typeof caps.appledri === 'string' ? caps.appledri : 'appledri unavailable');
+    try {
+        dri.apple.clientId();
+    } catch (e) {
+        skip(`WindowServer unreachable: ${e.message}`);
+    }
+    const ctx = new dri.apple.Context({ depthSize: 0, profile: 'legacy' });
+    try {
+        ctx.makeCurrent();
+        const gl = dri.gl;
+        const glOk = glOkFor(gl);
+        const f = ctx.features;
+        const exts = gl.getSupportedExtensions();
+        const has = name => exts.includes(name);
+        assert.ok(ctx.glVersion.major < 3, `a legacy context: ${ctx.glVersion.string}`);
+        // each feature is there exactly when the extension carrying it is
+        assert.strictEqual(f.multisample, has('GL_ARB_framebuffer_object'), 'multisample');
+        assert.strictEqual(f.sync, has('GL_ARB_sync'), 'sync');
+        assert.strictEqual(f.timerQuery,
+            has('GL_ARB_timer_query') || has('GL_EXT_timer_query'), 'timerQuery');
+        assert.strictEqual(f.timestampQuery, has('GL_ARB_timer_query'), 'timestampQuery');
+        const notes = [];
+        if (!f.timestampQuery) {
+            assert.throws(() => gl.queryCounter(0, gl.TIMESTAMP), /not available/);
+            notes.push('no timestamps, and queryCounter says so');
+        }
+        if (f.timerQuery && gl.getQuery(gl.TIME_ELAPSED, gl.QUERY_COUNTER_BITS) > 0) {
+            const S = 64;
+            const t = colorTarget(gl, S);
+            gl.viewport(0, 0, S, S);
+            // GLSL 1.10, which has no precision statements
+            const p = buildProgram(gl,
+                'attribute vec2 position;\nvoid main() { gl_Position = vec4(position, 0.0, 1.0); }',
+                'void main() { gl_FragColor = vec4(1.0, 0.5, 0.0, 1.0); }');
+            gl.useProgram(p);
+            gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+            gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]),
+                gl.STATIC_DRAW);
+            const loc = gl.getAttribLocation(p, 'position');
+            gl.enableVertexAttribArray(loc);
+            gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+            const q = gl.createQuery();
+            gl.beginQuery(gl.TIME_ELAPSED, q);
+            for (let i = 0; i < 64; i++)
+                gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+            gl.endQuery(gl.TIME_ELAPSED);
+            gl.flush();
+            const deadline = Date.now() + 5000;
+            while (!gl.getQueryParameter(q, gl.QUERY_RESULT_AVAILABLE) && Date.now() < deadline)
+                sleepMs(1);
+            const ns = gl.getQueryParameter(q, gl.QUERY_RESULT);
+            assert.ok(ns > 0 && ns < 5e9, `a plausible GPU time: ${ns} ns`);
+            assert.strictEqual(gl.getQueryObjectui64v(q, gl.QUERY_RESULT), BigInt(ns));
+            gl.deleteQuery(q);
+            t.destroy();
+            notes.push(`${ns} ns through ${has('GL_ARB_timer_query') ? 'ARB' : 'EXT'}_timer_query`);
+        }
+        glOk('the legacy profile');
+        return `${ctx.glVersion.string}: ${notes.join('; ') || 'nothing optional to exercise'}`;
+    } finally {
+        ctx.destroy();
+    }
+});
+
 process.exitCode = failures ? 1 : 0;
 console.log(failures ? `${failures} failure(s)` : 'all good');
