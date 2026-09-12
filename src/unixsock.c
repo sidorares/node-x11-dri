@@ -41,6 +41,14 @@
 #include <unistd.h>
 #include <uv.h>
 
+// Linux has flags for what macOS does with fcntl(2) and a socket option.
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
+#ifndef MSG_CMSG_CLOEXEC
+#define MSG_CMSG_CLOEXEC 0
+#endif
+
 #define US_THROW(env, msg)                                                     \
     do {                                                                       \
         napi_throw_error(env, NULL, msg);                                      \
@@ -315,6 +323,7 @@ static void drain_reads(UnixSock *s) {
             int count = (int)((c->cmsg_len - CMSG_LEN(0)) / sizeof(int));
             int *fds = (int *)CMSG_DATA(c);
             for (int i = 0; i < count; i++) {
+                if (!MSG_CMSG_CLOEXEC) fcntl(fds[i], F_SETFD, FD_CLOEXEC);
                 if (s->nrfds < RECV_FDS_CAP) s->rfds[s->nrfds++] = fds[i];
                 else close(fds[i]);
             }
@@ -410,6 +419,11 @@ static napi_value wrap_fd(napi_env env, int fd, napi_value callback, int connect
     int fl = fcntl(fd, F_GETFL);
     if (fl >= 0) fcntl(fd, F_SETFL, fl | O_NONBLOCK);
     fcntl(fd, F_SETFD, FD_CLOEXEC);
+#ifdef SO_NOSIGPIPE
+    // macOS: a write to a peer that went away must be an EPIPE, not a signal
+    int nosig = 1;
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &nosig, sizeof(nosig));
+#endif
 
     UnixSock *s = calloc(1, sizeof(UnixSock));
     s->fd = fd;
@@ -451,7 +465,16 @@ static napi_value SockConnect(napi_env env, napi_callback_info info) {
     if (napi_get_value_string_utf8(env, args[0], path, sizeof(path), &len) != napi_ok)
         US_THROW(env, "path must be a string");
     if (len == 0 || len >= sizeof(path) - 1) US_THROW(env, "socket path is empty or too long for sockaddr_un");
+#if defined(SOCK_CLOEXEC) && defined(SOCK_NONBLOCK)
     int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+#else
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd >= 0) {
+        fcntl(fd, F_SETFD, FD_CLOEXEC);
+        int fl0 = fcntl(fd, F_GETFL);
+        if (fl0 >= 0) fcntl(fd, F_SETFL, fl0 | O_NONBLOCK);
+    }
+#endif
     if (fd < 0) US_THROWF(env, "socket failed: %s", strerror(errno));
     struct sockaddr_un sa;
     memset(&sa, 0, sizeof(sa));
