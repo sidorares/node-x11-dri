@@ -85,6 +85,7 @@ const gpu = new dri.Gpu({                 // opens a render node (no X auth
     devicePath: undefined,                //   needed), gbm + EGL + a context
     format: dri.FORMAT.XRGB8888,          // must match the window depth
     depthSize: 16,                        // EGL depth buffer bits
+    stencilSize: 0,                       // 8 to stencil — see below
     glVersion: 'auto'                     // 'auto' | 3 | 2 — see below
 });
 const surface = gpu.createSurface(w, h);  // GBM swapchain (add
@@ -168,6 +169,43 @@ honour, and it is what gates the optional entry points above.
 
 `gpu.glVersion` needs a current context to exist, so like `features` it
 appears on `makeCurrent` rather than in the constructor.
+
+### Depth and stencil bits
+
+`depthSize` and `stencilSize` are part of the **EGL config query**, not of the
+context, so the constructor is the only place they can be asked for — there is
+nothing to turn on afterwards:
+
+```js
+const gpu = new dri.Gpu({ depthSize: 24, stencilSize: 8 });
+gpu.depthSize        // what the chosen config carries, e.g. 24
+gpu.stencilSize      // 8 — 0 when it was not asked for
+```
+
+`stencilSize` defaults to **0**, which is why it has to be asked for: a
+default framebuffer with no stencil bits **passes every stencil test**, so
+`stencilFunc`/`stencilOp`/`clearStencil` run without error and change nothing
+at all. That is the failure mode behind a stencil-then-cover fill — the
+standard way to fill an arbitrary vector path, and what
+`NVG_STENCIL_STROKES`-style overlapping strokes need — painting everywhere
+instead of inside the path.
+
+Like a version request, a bit count is a **floor, not an exact size**: EGL may
+hand back a config with more (a 16-bit depth request usually lands on 24, and
+asking for stencil usually brings a packed depth24/stencil8 along with it).
+`gpu.depthSize` and `gpu.stencilSize` read back what the config actually
+carries — the same relationship `contextVersion` has with `glVersion`, except
+that these are known from the constructor, no current context required.
+
+The alternative, when the surface has no stencil bits, is to render to a
+framebuffer of your own with a `DEPTH24_STENCIL8` renderbuffer and blit — an
+extra full-surface pass every frame, and still no way to stencil to the
+default framebuffer.
+
+macOS takes the same two options on `dri.apple.Context`, spelled identically
+(`kCGLPFADepthSize` / `kCGLPFAStencilSize` there), so a renderer asks for a
+stencil buffer the same way on both. There is no read-back on that side: the
+request is all `AppleContext` records.
 
 ### What `gl` covers
 
@@ -302,9 +340,14 @@ drawCover();
 ```
 
 A framebuffer with no stencil buffer passes every stencil test, so make sure
-there is one: a CGL context's own framebuffer has none unless it asked for
-`stencilSize`, while `createTarget`'s framebuffer has one. The test is to draw
-with `NOTEQUAL 0` over a cleared stencil — which must draw nothing.
+there is one. Neither backend's default framebuffer has one unless the context
+asked for it: `new dri.Gpu({ stencilSize: 8 })` on Linux (`gpu.stencilSize`
+reads back what the config granted — see
+[Depth and stencil bits](#depth-and-stencil-bits)),
+`new dri.apple.Context({ stencilSize: 8 })` on macOS. A framebuffer you build
+yourself needs a `DEPTH24_STENCIL8` renderbuffer attached; `createTarget`'s
+already has one. The test is to draw with `NOTEQUAL 0` over a cleared
+stencil — which must draw nothing.
 
 Multisampling (`features.multisample`) is render, then resolve: draw into a
 framebuffer of `renderbufferStorageMultisample` renderbuffers, and

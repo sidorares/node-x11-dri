@@ -468,7 +468,7 @@ function parseGlVersion(string) {
 }
 
 class Gpu {
-    // opts: { devicePath?, fd?, format?, depthSize?, glVersion? }
+    // opts: { devicePath?, fd?, format?, depthSize?, stencilSize?, glVersion? }
     constructor(opts) {
         opts = opts || {};
         this.devicePath = null;
@@ -503,11 +503,17 @@ class Gpu {
         // highest the driver offers and fall back rather than fail.
         const wantEs = opts.glVersion == null || opts.glVersion === 'auto'
             ? 0 : opts.glVersion;
+        // depthSize and stencilSize pick the EGL config, so they cannot be
+        // arranged afterwards: a default framebuffer with no stencil bits
+        // passes every stencil test for good. stencilSize defaults to 0 —
+        // ask for 8 to stencil-then-cover a vector path.
         this._handle = native.createGpu(this._fd, this.format,
-            opts.depthSize != null ? opts.depthSize : 16, wantEs);
+            opts.depthSize != null ? opts.depthSize : 16,
+            opts.stencilSize != null ? opts.stencilSize : 0, wantEs);
         // adds eglVendor, eglVersion, contextVersion (the ES version EGL was
         // asked for and granted — see glVersion after makeCurrent for what
-        // the driver actually gave)
+        // the driver actually gave), and depthSize/stencilSize, the bits the
+        // chosen config actually carries rather than the ones requested
         Object.assign(this, native.gpuInfo(this._handle));
         this.gl = gl;
     }

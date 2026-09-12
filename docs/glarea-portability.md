@@ -55,6 +55,7 @@ The deep difference: DRI3 is *client-allocates, client-pushes* — Apple-DRI is
 | fd passing needed | yes (`DRI3.fdCapable`) | **no** — nothing crosses the socket but requests |
 | locality requirement | local unix socket | same machine **and** a logged-in GUI session (WindowServer refuses SSH) |
 | depth 24 / 32 | XRGB8888 / ARGB8888 formats | colorSize 24 (+alphaSize); server maps bpp 32 → `XP_DEPTH_ARGB8888` (untested here, expected to work) |
+| depth / stencil buffer | `Gpu({ depthSize, stencilSize })` — an EGL config query, so constructor-only; granted bits read back as `gpu.depthSize` / `gpu.stencilSize` | `Context({ depthSize, stencilSize })` — a CGL pixel format, likewise constructor-only; no read-back |
 
 What is already identical, by construction (this PR): the **`gl` object** —
 same WebGL-flavored functions and constants, same `features`
@@ -237,8 +238,10 @@ react-x11 calls `app.chooseGLConfig(spec)` before creating the child window
 and expects `{ backend, visual, depth }`. On the Apple flavor there is no
 fbconfig query: answer synchronously with the root visual and depth
 (`CopyFromParent` works — the verified child test used exactly that), map
-`spec.DEPTH_SIZE` → `Context({ depthSize })`, and `depth: 32` + ARGB visual
-when the spec asks for alpha (verify — §7).
+`spec.DEPTH_SIZE` → `Context({ depthSize })` and `spec.STENCIL_SIZE` →
+`Context({ stencilSize })` (the Linux side takes both on `Gpu` in the same
+spelling), and `depth: 32` + ARGB visual when the spec asks for alpha
+(verify — §7).
 
 ## 5. react-x11 work
 
