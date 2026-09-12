@@ -2522,5 +2522,99 @@ report('GL optional entry points through extensions: the Apple legacy profile', 
     }
 });
 
-process.exitCode = failures ? 1 : 0;
-console.log(failures ? `${failures} failure(s)` : 'all good');
+
+// ---- UnixSocket: descriptors both ways over a socketpair -------------------
+//
+// Asynchronous, unlike everything above: the loop has to deliver the reads.
+// So it runs last, and the exit code is settled after it.
+
+const asyncReport = async (name, fn) => {
+    try {
+        const note = await fn();
+        console.log(`ok   ${name}${note ? ` (${note})` : ''}`);
+    } catch (e) {
+        if (e && e.skip) console.log(`skip ${name} (${e.skip})`);
+        else {
+            failures++;
+            console.log(`FAIL ${name}: ${e.message}`);
+        }
+    }
+};
+
+const unixSocketTest = async () => {
+    if (typeof dri.UnixSocket !== 'function') skip('no UnixSocket export');
+    if (typeof Bun !== 'undefined') skip('Bun does not provide libuv polling to addons');
+    let pair;
+    try {
+        pair = dri.socketpair();
+    } catch (e) {
+        skip(`socketpair: ${e.message}`);
+    }
+    let a, b;
+    try {
+        a = dri.UnixSocket.fromFd(pair[0]);
+        b = dri.UnixSocket.fromFd(pair[1]);
+    } catch (e) {
+        if (/libuv/.test(e.message)) skip(e.message);
+        throw e;
+    }
+    const withTimeout = (p, what) => Promise.race([
+        p,
+        new Promise((_, rej) => setTimeout(() => rej(new Error(`timed out: ${what}`)), 5000).unref()),
+    ]);
+
+    // 1. bytes and a descriptor, in one message
+    const { read, write } = dri.pipe();
+    const payload = Buffer.from('hello over SCM_RIGHTS');
+    const arrived = withTimeout(new Promise((resolve) => {
+        const chunks = [];
+        const onData = (d) => {
+            chunks.push(d);
+            const total = Buffer.concat(chunks);
+            if (total.length >= payload.length) {
+                b.off('data', onData);
+                resolve(total);
+            }
+        };
+        b.on('data', onData);
+    }), 'the first message');
+    a.sendFds(payload, [write]); // consumed: our copy of `write` is closed once sent
+    const total = await arrived;
+    assert.strictEqual(total.toString(), payload.toString(), 'the bytes arrived intact');
+    const fds = b.takeFds(1);
+    assert.strictEqual(fds.length, 1, 'one descriptor arrived with them');
+    fs.writeSync(fds[0], 'through');
+    fs.closeSync(fds[0]);
+    const buf = Buffer.alloc(16);
+    const n = fs.readSync(read, buf, 0, 16, null);
+    assert.strictEqual(buf.toString('utf8', 0, n), 'through', 'the descriptor is the pipe we sent');
+    fs.closeSync(read);
+
+    // 2. backpressure: a large write is queued, drains, and arrives whole
+    const big = Buffer.alloc(4 * 1024 * 1024, 7);
+    let drained = false;
+    b.once('drain', () => { drained = true; });
+    const whole = withTimeout(new Promise((resolve) => {
+        let got = 0;
+        a.on('data', (d) => {
+            got += d.length;
+            if (got >= big.length) resolve(got);
+        });
+    }), '4MiB round trip');
+    const immediate = b.write(big);
+    const got = await whole;
+    assert.strictEqual(got, big.length, 'every byte arrived');
+
+    // 3. close is observed on the other side
+    const closed = withTimeout(new Promise((resolve) => a.once('end', resolve)), 'end on peer close');
+    b.destroy();
+    await closed;
+    a.destroy();
+    return `fd through, 4MiB ${immediate ? 'without' : 'with'} backpressure (drain: ${drained})`;
+};
+
+(async () => {
+    await asyncReport('UnixSocket passes descriptors both ways', unixSocketTest);
+    process.exitCode = failures ? 1 : 0;
+    console.log(failures ? `${failures} failure(s)` : 'all good');
+})();

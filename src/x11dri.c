@@ -4490,8 +4490,12 @@ static napi_value make_fn(napi_env env, napi_callback cb) {
     return fn;
 }
 
+// src/unixsock.c: the fd-passing unix socket, pipe/socketpair/memfd helpers
+void unixsock_register(napi_env env, napi_value exports);
+
 NAPI_MODULE_INIT() {
 #define EXPORT(name, cb) obj_set(env, exports, name, make_fn(env, cb))
+    unixsock_register(env, exports);
     EXPORT("probe", Probe);
     EXPORT("dup", Dup);
     EXPORT("udmabufCreate", UdmabufCreate);
