@@ -291,6 +291,83 @@ report('udmabuf create/write/sync', () => {
     ud.close();
 });
 
+// A Gpu that fails to construct has already opened the render node by the
+// time the native side refuses, and there is no object left to destroy() —
+// so the constructor has to give the fd back itself. Counting /proc/self/fd
+// across a loop of expected throws is the only way to see that: one leaked
+// fd per failure is invisible until a long-lived process runs out.
+report('Gpu: a refused construction leaks no fd', () => {
+    const fdDir = '/proc/self/fd';
+    if (!fs.existsSync(fdDir))
+        skip('no /proc/self/fd on this platform');
+    const nodes = dri.listRenderNodes();
+    if (nodes.length === 0)
+        skip('no /dev/dri/renderD* — nothing is opened to leak');
+    const openFds = () => fs.readdirSync(fdDir).length;
+    // Every shape of refusal, since they leave the constructor from
+    // different depths: a glVersion and a bit count are checked before any
+    // device work, while a 99-bit depth buffer gets through the dlopens,
+    // the fd dup, gbm and eglInitialize before there turns out to be no
+    // config for it. One of each up front, so nothing one-time (those
+    // dlopens, a driver's own caches) lands inside the measured loops.
+    const refusals = [
+        [{ glVersion: 4 }, /must be 2, 3, or 0/],
+        [{ depthSize: -1 }, /not negative/],
+        [{ stencilSize: -1 }, /not negative/]
+    ];
+    const noConfig = { depthSize: 99 };
+    for (const [opts, why] of refusals)
+        assert.throws(() => new dri.Gpu(opts), why);
+    try { new dri.Gpu(noConfig).destroy(); } catch { /* the expected case */ }
+
+    const before = openFds();
+    for (let i = 0; i < 32; i++) {
+        const [opts, why] = refusals[i % refusals.length];
+        assert.throws(() => new dri.Gpu(opts), why);
+    }
+    const after = openFds();
+    assert.strictEqual(after, before, `32 refused constructions: ${before} -> ${after} open fds`);
+
+    // And the deeper one on its own: when the failure comes from inside
+    // EGL setup the native side unwinds its own dup, and the fd opened
+    // here is still ours to close.
+    const deep = openFds();
+    let refused = 0;
+    for (let i = 0; i < 8; i++) {
+        try { new dri.Gpu(noConfig).destroy(); } catch { refused++; }
+    }
+    if (refused === 8)
+        assert.strictEqual(openFds(), deep, 'a failure inside EGL setup returns the fd too');
+
+    // The other half of the contract: a caller-supplied fd is the caller's,
+    // and a failure must not close it out from under them.
+    const fd = fs.openSync(nodes[0], 'r+');
+    try {
+        assert.throws(() => new dri.Gpu({ fd, glVersion: 4 }), /must be 2, 3, or 0/);
+        fs.fstatSync(fd); // EBADF if the constructor closed it
+    } finally {
+        fs.closeSync(fd);
+    }
+
+    // And the success path still balances, which is what makes the counts
+    // above meaningful rather than accidentally constant. The first one is
+    // the probe: where there is no usable device, the refusals are still
+    // the whole point of this test.
+    let usable = null;
+    try {
+        usable = new dri.Gpu({});
+    } catch { /* no context to be had here */ }
+    if (usable) {
+        usable.destroy();
+        const live = openFds();
+        for (let i = 0; i < 4; i++)
+            new dri.Gpu({}).destroy();
+        assert.strictEqual(openFds(), live, 'construct + destroy balances');
+    }
+    return `${refused === 8 ? '40' : '32'} refusals` +
+        (usable ? ' and 4 round trips, fd count flat' : ', fd count flat (no device for the success path)');
+});
+
 report('GPU render + readback + dma-buf export', () => {
     for (const [name, cap] of [['gbm', caps.gbm], ['egl', caps.egl], ['gles', caps.gles]])
         if (cap !== true)
