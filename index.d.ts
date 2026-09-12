@@ -115,6 +115,26 @@ export interface GlFeatures {
      * Apple Silicon answers with 0.
      */
     timestampQuery: boolean;
+    /**
+     * `gl.importDmabuf`: wrap a dma-buf descriptor in an EGLImage and point
+     * a texture at it. Needs `EGL_EXT_image_dma_buf_import` on the display
+     * and `GL_OES_EGL_image` in the driver, so it is `false` on the CGL
+     * flavor and on any host without dma-buf at all.
+     */
+    dmabufImport: boolean;
+    /**
+     * Whether `importDmabuf` accepts an explicit `modifier` (and a fourth
+     * plane), from `EGL_EXT_image_dma_buf_import_modifiers`. Without it only
+     * `MODIFIER.INVALID` — the implicit layout — can be imported, which is
+     * what a `DRI3.BufferFromPixmap` buffer has anyway.
+     */
+    dmabufImportModifiers: boolean;
+    /**
+     * Whether `importDmabuf` can bind to `TEXTURE_EXTERNAL_OES`, from
+     * `GL_OES_EGL_image_external`: the target a YUV buffer generally has to
+     * be sampled through, with `samplerExternalOES` in the shader.
+     */
+    externalTexture: boolean;
 }
 
 /** What the driver reports through `glGetString(GL_VERSION)`, parsed. */
@@ -187,6 +207,75 @@ export interface Udmabuf {
     buffer: ArrayBuffer;
     /** Bracket CPU writes with `START | WRITE` and `END | WRITE`. */
     sync(flags: number): void;
+    close(): void;
+}
+
+/** One plane of a dma-buf, as `DRI3.BuffersFromPixmap` reports it. */
+export interface DmabufPlane {
+    /**
+     * The descriptor. Consumed when the import succeeds — `dup` it first to
+     * keep a copy. A multi-planar buffer may name the same descriptor in
+     * every plane.
+     */
+    fd: number;
+    /** Bytes per row of this plane. */
+    stride: number;
+    /** Bytes from the start of the buffer to this plane. Defaults to 0. */
+    offset?: number;
+}
+
+export interface ImportDmabufOptions {
+    width: number;
+    height: number;
+    /** A DRM fourcc — `FORMAT.XRGB8888` for a depth-24 pixmap, `ARGB8888` for depth 32. */
+    fourcc: number;
+    /**
+     * The buffer's layout. Defaults to `MODIFIER.INVALID`, the implicit
+     * layout; anything else needs `features.dmabufImportModifiers`.
+     */
+    modifier?: bigint | number;
+    /**
+     * `TEXTURE_2D` (the default) or `TEXTURE_EXTERNAL_OES`, which needs
+     * `features.externalTexture` and a `samplerExternalOES` in the shader.
+     * A YUV buffer generally needs the latter; an RGB one does not.
+     */
+    target?: GLenum;
+    /** One to four planes. */
+    planes: DmabufPlane[];
+}
+
+/**
+ * A dma-buf someone else allocated, as a GL texture. Obtained from
+ * `gl.importDmabuf` — there is no exported constructor. Nothing was copied:
+ * the texture samples the buffer where it already lives.
+ */
+export interface ImportedImage {
+    /** Bind with `gl.bindTexture(image.target, image.texture)`. */
+    readonly texture: GLuint;
+    /** `TEXTURE_2D` or `TEXTURE_EXTERNAL_OES`, whichever the import used. */
+    readonly target: GLenum;
+    readonly width: number;
+    readonly height: number;
+    /**
+     * `glDeleteTextures` + `eglDestroyImage`. Needs the context the import
+     * was made in to be current. Calling it twice, or after that context is
+     * gone, does nothing.
+     */
+    destroy(): void;
+}
+
+/** A dma-buf mapped for CPU access. See `mapDmabuf`. */
+export interface MappedDmabuf {
+    /** The descriptor that was mapped. Still the caller's to close. */
+    fd: number;
+    size: number;
+    /** False when the descriptor was exported read-only — writes would fault. */
+    writable: boolean;
+    /** The buffer's pixels. Detached by `close()`. */
+    buffer: ArrayBuffer;
+    /** Bracket access with `START | READ` and `END | READ` (or `WRITE`). */
+    sync(flags: number): void;
+    /** Unmap now rather than at the next GC. Idempotent. */
     close(): void;
 }
 
@@ -865,6 +954,14 @@ export interface GLConstants {
      * so it has no other name — and elsewhere the answer is `false`.
      */
     readonly GPU_DISJOINT_EXT: GLenum;
+
+    // ---- imported dma-buf textures (features.dmabufImport) ----
+    /** The second target `importDmabuf` can bind to; needs `features.externalTexture`. */
+    readonly TEXTURE_EXTERNAL_OES: GLenum;
+    /** The GLSL type of a `TEXTURE_EXTERNAL_OES` sampler, as `getActiveUniform` reports it. */
+    readonly SAMPLER_EXTERNAL_OES: GLenum;
+    readonly TEXTURE_BINDING_EXTERNAL_OES: GLenum;
+    readonly REQUIRED_TEXTURE_IMAGE_UNITS_OES: GLenum;
 }
 
 /**
@@ -1197,6 +1294,30 @@ export interface GLContext extends GLConstants {
     getQueryObjectui64v(query: GLuint, pname: GLenum): bigint;
     /** The GPU clock's reading when the command stream reaches this point: `target` is `TIMESTAMP`. */
     queryCounter(query: GLuint, target: GLenum): void;
+
+    // ---- optional: dma-buf import (features.dmabufImport) ----
+    /**
+     * Wrap a dma-buf descriptor in an EGLImage and hand back a texture bound
+     * to it — the way in, where `Surface.swap()` is the way out. Nothing is
+     * copied.
+     *
+     * The options are the shape `DRI3.BuffersFromPixmap` already answers
+     * with, which is how a compositor turns a redirected window's pixmap
+     * into a texture:
+     *
+     * ```ts
+     * const buf = await dri3.BuffersFromPixmap(pixmap);
+     * const img = gl.importDmabuf(buf);
+     * gl.bindTexture(img.target, img.texture);
+     * ```
+     *
+     * The plane descriptors are consumed on success; a throw leaves them
+     * open and owned by the caller. The texture comes back with `LINEAR`
+     * filtering and `CLAMP_TO_EDGE` wrapping, since an EGLImage texture has
+     * no mipmaps and the GL defaults would leave it incomplete. The binding
+     * in force when the call was made is restored.
+     */
+    importDmabuf(opts: ImportDmabufOptions): ImportedImage;
 }
 
 /** DRM fourcc buffer formats. Must match the depth of the window being fed. */
@@ -1259,3 +1380,15 @@ export declare function createUdmabuf(size: number): Udmabuf;
 
 /** Bracket CPU access to a dma-buf. Flags come from `DMABUF_SYNC`. */
 export declare function dmabufSync(fd: number, flags: number): void;
+
+/**
+ * Map a dma-buf someone else allocated, for CPU reads and writes — what
+ * `createUdmabuf` returns, for memory this package did not allocate. Makes
+ * a `DRI3.BufferFromPixmap` descriptor readable with no GL involved.
+ *
+ * `size` defaults to the whole buffer. The descriptor is not consumed. Only
+ * an exporter that implements mmap can be mapped at all: udmabuf and linear
+ * GPU buffers can, tiled ones throw saying so — for those use
+ * `gl.importDmabuf` instead.
+ */
+export declare function mapDmabuf(fd: number, size?: number): MappedDmabuf;

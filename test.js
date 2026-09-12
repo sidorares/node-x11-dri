@@ -138,6 +138,9 @@ report('non-dma-buf platform degrades cleanly', () => {
     assert.strictEqual(dri.listRenderNodes().length, 0, 'no render nodes off Linux');
     assert.throws(() => dri.createUdmabuf(4096), /dma-buf/, 'udmabufCreate explains itself');
     assert.throws(() => dri.dmabufSync(0, 0), /dma-buf/, 'dmabufSync explains itself');
+    assert.throws(() => dri.mapDmabuf(0, 4096), /dma-buf/, 'mapDmabuf explains itself');
+    assert.throws(() => dri.gl.importDmabuf({ width: 1, height: 1, fourcc: 0, planes: [] }),
+        /dma-buf/, 'importDmabuf explains itself');
     assert.throws(() => new dri.Gpu({}), /DRI3|DRM/, 'Gpu explains itself');
     return `${caps.platform}: gbm/dma-buf reported unavailable`;
 });
@@ -288,6 +291,53 @@ report('udmabuf create/write/sync', () => {
     assert.strictEqual(px[0], 0x11223344);
     assert.ok(fs.fstatSync(ud.fd).size >= 4096, 'dma-buf reports its size');
     ud.close();
+});
+
+// The other direction for CPU memory: map a descriptor this process did not
+// allocate. Nothing here needs a GPU — the udmabuf above plays the part of
+// the foreign buffer, which is the same thing DRI3's BufferFromPixmap hands
+// over for a linear pixmap.
+report('mapDmabuf: a foreign descriptor, read and written from JS', () => {
+    if (caps.udmabuf !== true)
+        skip(typeof caps.udmabuf === 'string' ? caps.udmabuf : '/dev/udmabuf not accessible');
+    const ud = dri.createUdmabuf(8192);
+    try {
+        const written = new Uint32Array(ud.buffer);
+        ud.sync(dri.DMABUF_SYNC.START | dri.DMABUF_SYNC.WRITE);
+        written[0] = 0x11223344;
+        written[written.length - 1] = 0x55667788;
+        ud.sync(dri.DMABUF_SYNC.END | dri.DMABUF_SYNC.WRITE);
+
+        // a second, independent mapping of the same pages
+        const map = dri.mapDmabuf(ud.fd);
+        assert.strictEqual(map.size, 8192, 'the size comes from the descriptor');
+        assert.strictEqual(map.buffer.byteLength, 8192);
+        assert.strictEqual(map.writable, true, 'a udmabuf descriptor is read-write');
+        map.sync(dri.DMABUF_SYNC.START | dri.DMABUF_SYNC.READ);
+        const read = new Uint32Array(map.buffer);
+        assert.strictEqual(read[0], 0x11223344, 'sees what the other mapping wrote');
+        assert.strictEqual(read[read.length - 1], 0x55667788);
+        map.sync(dri.DMABUF_SYNC.END | dri.DMABUF_SYNC.READ);
+        // and writes land the other way round
+        map.sync(dri.DMABUF_SYNC.START | dri.DMABUF_SYNC.WRITE);
+        read[1] = 0x99aabbcc;
+        map.sync(dri.DMABUF_SYNC.END | dri.DMABUF_SYNC.WRITE);
+        assert.strictEqual(written[1], 0x99aabbcc, 'one buffer, two views');
+
+        // an explicit size maps a prefix; close() gives the pages back now
+        const part = dri.mapDmabuf(ud.fd, 4096);
+        assert.strictEqual(part.buffer.byteLength, 4096);
+        part.close();
+        assert.strictEqual(part.buffer.byteLength, 0, 'close() detaches the buffer');
+        part.close(); // idempotent
+        map.close();
+
+        // the descriptor was never taken: it is still the caller's
+        fs.fstatSync(ud.fd);
+        assert.throws(() => dri.mapDmabuf(-1), /dmabufMap/, 'a bad descriptor explains itself');
+    } finally {
+        ud.close();
+    }
 });
 
 report('GPU render + readback + dma-buf export', () => {
@@ -2008,6 +2058,146 @@ report('GL optional entry points through extensions: the Apple legacy profile', 
         return `${ctx.glVersion.string}: ${notes.join('; ') || 'nothing optional to exercise'}`;
     } finally {
         ctx.destroy();
+    }
+});
+
+// The way back in. Everything above produces dma-buf descriptors; this
+// consumes one — the frame just exported, imported as a texture and sampled,
+// which must give back exactly the bytes that were drawn because nothing was
+// copied. It is the compositor path with the X server left out: DRI3's
+// BuffersFromPixmap answers with the very shape importDmabuf takes, and here
+// the GPU plays the part of the server.
+report('dma-buf import: an exported frame, sampled back as a texture', () => {
+    const { gpu, surf, gl } = glSurface(32, { format: dri.FORMAT.XRGB8888 });
+    try {
+        const glOk = glOkFor(gl);
+        const shape = fd => ({
+            width: 32, height: 32, fourcc: dri.FORMAT.XRGB8888,
+            planes: [{ fd, stride: 32 * 4, offset: 0 }]
+        });
+        if (!gpu.features.dmabufImport) {
+            assert.throws(() => gl.importDmabuf(shape(0)), /dmabufImport/,
+                'importDmabuf explains itself');
+            return 'no EGL_EXT_image_dma_buf_import on this display';
+        }
+
+        gl.clearColor(0.2, 0.4, 0.6, 1);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        const out = surf.swap();
+        assert.ok(out && out.isNew, 'a fresh buffer to export');
+        // the import consumes what it is handed, so keep a copy of the one
+        // descriptor this test has
+        const spare = dri.dup(out.fd);
+        const plane = { stride: out.stride, offset: out.offset };
+
+        const img = gl.importDmabuf({
+            width: 32, height: 32, fourcc: dri.FORMAT.XRGB8888,
+            modifier: out.modifier,
+            planes: [Object.assign({ fd: out.fd }, plane)]
+        });
+        assert.throws(() => fs.fstatSync(out.fd), /EBADF/,
+            'the plane descriptor was consumed on success');
+        assert.strictEqual(img.target, gl.TEXTURE_2D, 'TEXTURE_2D unless asked otherwise');
+        assert.strictEqual(img.width, 32);
+        assert.strictEqual(img.height, 32);
+        assert.ok(img.texture > 0, 'a texture name');
+        glOk('importDmabuf');
+        // an EGLImage texture has no mipmaps, so the GL default minification
+        // filter would leave it incomplete and sampling black
+        gl.bindTexture(gl.TEXTURE_2D, img.texture);
+        assert.strictEqual(gl.getTexParameter(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER), gl.LINEAR);
+        assert.strictEqual(gl.getTexParameter(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S), gl.CLAMP_TO_EDGE);
+
+        // sample it over a whole framebuffer and read the result back
+        const S = 8;
+        const dst = colorTarget(gl, S);
+        gl.viewport(0, 0, S, S);
+        const program = buildProgram(gl,
+            'attribute vec2 position;\nvarying vec2 vUv;\n' +
+            'void main() { vUv = position * 0.5 + 0.5; gl_Position = vec4(position, 0.0, 1.0); }',
+            'precision mediump float;\nvarying vec2 vUv;\nuniform sampler2D uTex;\n' +
+            'void main() { gl_FragColor = texture2D(uTex, vUv); }');
+        gl.useProgram(program);
+        const quad = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, quad);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]),
+            gl.STATIC_DRAW);
+        const loc = gl.getAttribLocation(program, 'position');
+        gl.enableVertexAttribArray(loc);
+        gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(img.target, img.texture);
+        gl.uniform1i(gl.getUniformLocation(program, 'uTex'), 0);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        glOk('sampling the imported buffer');
+        assert.deepStrictEqual(readRgb(gl, S)(S / 2, S / 2), [51, 102, 153],
+            'the clear colour, through the dma-buf, byte for byte');
+
+        // importing leaves the binding it found — a library call should not
+        // move the caller's state under it
+        const mine = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, mine);
+        const second = gl.importDmabuf({
+            width: 32, height: 32, fourcc: dri.FORMAT.XRGB8888,
+            modifier: out.modifier,
+            planes: [Object.assign({ fd: dri.dup(spare) }, plane)]
+        });
+        assert.strictEqual(gl.getParameter(gl.TEXTURE_BINDING_2D), mine,
+            'the texture binding survives an import');
+        second.destroy();
+        second.destroy(); // idempotent
+
+        const notes = [];
+        if (gpu.features.externalTexture) {
+            // what a YUV buffer needs: a different target and a different
+            // sampler type. An RGB buffer binds there too, which is what
+            // makes it testable without a video decoder.
+            const ext = gl.importDmabuf({
+                width: 32, height: 32, fourcc: dri.FORMAT.XRGB8888,
+                target: gl.TEXTURE_EXTERNAL_OES,
+                modifier: out.modifier,
+                planes: [Object.assign({ fd: dri.dup(spare) }, plane)]
+            });
+            assert.strictEqual(ext.target, gl.TEXTURE_EXTERNAL_OES);
+            glOk('TEXTURE_EXTERNAL_OES import');
+            ext.destroy();
+            notes.push('TEXTURE_EXTERNAL_OES');
+        } else {
+            assert.throws(() => gl.importDmabuf({
+                width: 32, height: 32, fourcc: dri.FORMAT.XRGB8888,
+                target: gl.TEXTURE_EXTERNAL_OES,
+                planes: [Object.assign({ fd: dri.dup(spare) }, plane)]
+            }), /externalTexture/, 'the external target explains itself');
+        }
+        if (gpu.features.dmabufImportModifiers)
+            notes.push('explicit modifiers');
+
+        // what a bad call does: refuses, and leaves the descriptor alone
+        const before = fs.readdirSync('/proc/self/fd').length;
+        for (const [why, opts] of [
+            ['no dimensions', { width: 0, height: 32, fourcc: dri.FORMAT.XRGB8888, planes: [{ fd: spare, stride: 128 }] }],
+            ['no planes', { width: 32, height: 32, fourcc: dri.FORMAT.XRGB8888, planes: [] }],
+            ['five planes', { width: 32, height: 32, fourcc: dri.FORMAT.XRGB8888, planes: Array(5).fill({ fd: spare, stride: 128 }) }],
+            ['no stride', { width: 32, height: 32, fourcc: dri.FORMAT.XRGB8888, planes: [{ fd: spare }] }],
+            ['a bad target', { width: 32, height: 32, fourcc: dri.FORMAT.XRGB8888, target: gl.TEXTURE_CUBE_MAP, planes: [{ fd: spare, stride: 128 }] }],
+            ['a bad modifier', { width: 32, height: 32, fourcc: dri.FORMAT.XRGB8888, modifier: 'linear', planes: [{ fd: spare, stride: 128 }] }],
+            ['not an object', 42]
+        ])
+            assert.throws(() => gl.importDmabuf(opts), /importDmabuf/, `${why} is refused`);
+        assert.strictEqual(fs.readdirSync('/proc/self/fd').length, before,
+            'a refused import consumes nothing');
+        fs.fstatSync(spare); // still ours
+
+        dst.destroy();
+        gl.deleteTexture(mine);
+        img.destroy();
+        surf.release(out.key);
+        fs.closeSync(spare);
+        return `${gl.getString(gl.RENDERER)}: sampled a dma-buf as a texture` +
+            (notes.length ? `; ${notes.join(', ')}` : '');
+    } finally {
+        surf.destroy();
+        gpu.destroy();
     }
 });
 

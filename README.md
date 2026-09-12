@@ -27,6 +27,11 @@ fills exactly that hole:
   kernel's `/dev/udmabuf`, with the pixels mapped into JS as an
   `ArrayBuffer`: the GPU-less way to feed DRI3 (the same trick Xwayland
   uses), where supported by the server's driver.
+- **`gl.importDmabuf(...)`**, **`mapDmabuf(fd)`** — the other direction: a
+  dma-buf descriptor that arrived from somewhere else, as a GL texture (no
+  copy) or as an `ArrayBuffer`. What a compositor does with a redirected
+  window's pixmap — `DRI3.BuffersFromPixmap` answers with exactly the shape
+  `importDmabuf` takes. (Linux)
 - **`dup(fd)`**, **`dmabufSync(fd, flags)`** — descriptor plumbing (DRI3
   sends consume their fds; `dup` keeps a copy) and CPU-access bracketing.
 
@@ -99,6 +104,18 @@ const out = surface.swap();
 // out === null: every buffer still held — wait for PresentIdleNotify.
 surface.release(out.key);                 // when PresentIdleNotify says so
 surface.destroy(); gpu.destroy();
+```
+
+And the same descriptors coming the other way — a buffer somebody else
+allocated, sampled where it lies:
+
+```js
+const buf = await dri3.BuffersFromPixmap(pixmap);   // { width, height,
+                                                    //   modifier, planes }
+const img = gpu.gl.importDmabuf(buf);               // consumes buf's fds
+gpu.gl.bindTexture(img.target, img.texture);        // draw with it
+// ...
+img.destroy();
 ```
 
 One EGL context per `Gpu`, one thread, GL calls valid between `makeCurrent`
@@ -183,7 +200,7 @@ order, so code and tutorials carry over:
 | framebuffers | `createFramebuffer`, `bindFramebuffer`, `framebufferTexture2D`, `framebufferRenderbuffer`, `checkFramebufferStatus`, `createRenderbuffer`, `bindRenderbuffer`, `renderbufferStorage`, deletes |
 | per-fragment state | `blendFunc`, `blendFuncSeparate`, `blendEquation`, `blendEquationSeparate`, `blendColor`, `depthFunc`, `depthMask`, `depthRange`, `colorMask`, `scissor`, `polygonOffset`, `stencilFunc`, `stencilOp`, `stencilMask`, `stencilFuncSeparate`, `stencilOpSeparate`, `stencilMaskSeparate`, `clearStencil`, `cullFace`, `frontFace` |
 | introspection | `getActiveUniform`, `getActiveAttrib`, `getUniform`, `getAttachedShaders`, `getShaderSource`, `getShaderPrecisionFormat`, `getVertexAttrib`, `getVertexAttribOffset`, `getBufferParameter`, `getTexParameter`, `getFramebufferAttachmentParameter`, `getRenderbufferParameter`, `getSupportedExtensions`, `validateProgram`, `isBuffer`/`isProgram`/`isShader`/`isTexture`/`isFramebuffer`/`isRenderbuffer`/`isEnabled` |
-| optional (see `features`) | `createVertexArray`, `bindVertexArray`, `deleteVertexArray`, `isVertexArray`; `drawArraysInstanced`, `drawElementsInstanced`, `vertexAttribDivisor`; `drawBuffers`; `texImage3D`, `texSubImage3D`, `copyTexSubImage3D`, `compressedTexImage3D`, `compressedTexSubImage3D`, `framebufferTextureLayer`; `texStorage2D`, `texStorage3D`; `renderbufferStorageMultisample`, `blitFramebuffer`; `readBuffer`; `fenceSync`, `clientWaitSync`, `waitSync`, `getSyncParameter`, `deleteSync`, `isSync`; `createQuery`, `deleteQuery`, `isQuery`, `beginQuery`, `endQuery`, `getQuery`, `getQueryParameter`, `getQueryObjectui64v`; `queryCounter` |
+| optional (see `features`) | `createVertexArray`, `bindVertexArray`, `deleteVertexArray`, `isVertexArray`; `drawArraysInstanced`, `drawElementsInstanced`, `vertexAttribDivisor`; `drawBuffers`; `texImage3D`, `texSubImage3D`, `copyTexSubImage3D`, `compressedTexImage3D`, `compressedTexSubImage3D`, `framebufferTextureLayer`; `texStorage2D`, `texStorage3D`; `renderbufferStorageMultisample`, `blitFramebuffer`; `readBuffer`; `fenceSync`, `clientWaitSync`, `waitSync`, `getSyncParameter`, `deleteSync`, `isSync`; `createQuery`, `deleteQuery`, `isQuery`, `beginQuery`, `endQuery`, `getQuery`, `getQueryParameter`, `getQueryObjectui64v`; `queryCounter`; `importDmabuf` |
 | the rest | `clear`, `clearColor`, `clearDepthf`, `viewport`, `enable`, `disable`, `lineWidth`, `pixelStorei`, `getParameter`, `getIntegerv`, `getFloatv`, `getBooleanv`, `getError`, `getString`, `readPixels`, `finish`, `flush` |
 
 `texImage2D` accepts `null` pixels, which is how a texture is allocated to be
@@ -222,7 +239,9 @@ feature:
 gpu.makeCurrent(surface);
 gpu.features            // { vertexArrayObject, instancedArrays, drawBuffers,
                         //   texture3D, textureStorage, multisample,
-                        //   readBuffer, sync, timerQuery, timestampQuery }
+                        //   readBuffer, sync, timerQuery, timestampQuery,
+                        //   dmabufImport, dmabufImportModifiers,
+                        //   externalTexture }
 if (gpu.features.instancedArrays)
     gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, count);
 ```
@@ -257,6 +276,9 @@ core profile, the default; the legacy profile's route is in parentheses.
 | `sync` | `fenceSync`, `clientWaitSync`, `waitSync`, `getSyncParameter`, `deleteSync`, `isSync` | ES 3.0, or `APPLE_sync` | always (`ARB_sync`) |
 | `timerQuery` | `createQuery`, `deleteQuery`, `isQuery`, `beginQuery`, `endQuery`, `getQuery`, `getQueryParameter`, `getQueryObjectui64v` | only with `GL_EXT_disjoint_timer_query`, on ES 3.0 as on 2.0 | always (`EXT_timer_query`) |
 | `timestampQuery` | `queryCounter` | only with `GL_EXT_disjoint_timer_query` | always, over a clock of 0 bits (absent) |
+| `dmabufImport` | `importDmabuf` | `EGL_EXT_image_dma_buf_import` + `GL_OES_EGL_image` | never — there are no dma-bufs on macOS |
+| `dmabufImportModifiers` | an explicit `modifier`, or a fourth plane | `EGL_EXT_image_dma_buf_import_modifiers` | never |
+| `externalTexture` | `TEXTURE_EXTERNAL_OES` as an import target | `GL_OES_EGL_image_external` | never |
 
 The separate stencil setters are core ES 2.0 and need no flag.
 
@@ -384,13 +406,97 @@ here, not the driver's pointer: the binding keeps the pointer, and refuses a
 handle that is deleted, made up, or another context's rather than hand GL
 something it cannot validate.
 
+### Importing a dma-buf: descriptors coming the other way
+
+Everything above *produces* dma-bufs. `gl.importDmabuf` consumes one: it
+wraps the descriptor in an EGLImage
+(`eglCreateImage(EGL_LINUX_DMA_BUF_EXT)`) and points a texture at it
+(`glEGLImageTargetTexture2DOES`), after which the GPU samples the buffer
+where it already lies. No copy, no upload, no round trip through the CPU.
+
+The motivating case is compositing. A redirected window's pixmap becomes a
+texture in three steps, two of which the pure-JS `x11` package already
+speaks:
+
+```js
+const pixmap = X.AllocID();
+X.Composite.NameWindowPixmap(wid, pixmap);
+const buf = await dri3.BuffersFromPixmap(pixmap);
+// buf: { width, height, modifier, depth, bpp, planes: [{ fd, stride, offset }] }
+
+const img = gpu.gl.importDmabuf({ ...buf, fourcc: dri.FORMAT.XRGB8888 });
+gl.activeTexture(gl.TEXTURE0);
+gl.bindTexture(img.target, img.texture);
+gl.uniform1i(uTex, 0);
+gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+img.destroy();                     // glDeleteTextures + eglDestroyImage
+```
+
+`BuffersFromPixmap` needs node-x11 4.1.0 or later under Bun
+(`createClient({ receiveFds: true })`) — receiving descriptors is the half a
+pure-JS client cannot do on Node. `fourcc` is not in its reply, because DRI3
+speaks depth and bpp: depth 24 is `FORMAT.XRGB8888`, depth 32 is
+`ARGB8888`.
+
+Three things worth knowing:
+
+- **The descriptors are consumed on success**, the same rule
+  `DRI3.PixmapFromBuffer` follows at the other end — EGL has taken its own
+  reference by then, so holding onto ours would only leak. A throw leaves
+  them open and yours. `dri.dup(fd)` first if you need to keep a copy. A
+  multi-planar buffer may name one descriptor in every plane; it is closed
+  once.
+- **The texture comes back filtered `LINEAR` and clamped.** An EGLImage
+  texture has no mipmaps, so GL's default minification filter would leave it
+  incomplete and sample black — the classic silent failure here. The binding
+  that was in force is restored.
+- **`target` is in the result** rather than assumed. RGB buffers bind to
+  `TEXTURE_2D` and sample through an ordinary `sampler2D`, which is the
+  default. YUV buffers generally cannot, and want
+  `target: gl.TEXTURE_EXTERNAL_OES` (`features.externalTexture`) with
+  `samplerExternalOES` in the shader — a decision about the shader as much
+  as about the buffer, so it is yours to make rather than something guessed
+  from the fourcc.
+
+`modifier` defaults to `MODIFIER.INVALID`, the implicit layout, which is
+what a DRI3 buffer carries unless the server said otherwise. Anything else —
+and a fourth plane — needs `features.dmabufImportModifiers`.
+
+It lives on `gl` rather than on `Gpu` for two reasons: it is a
+context-current call like everything else there, and anything that forwards
+the `gl` namespace wholesale (ntk's `_installGL`, for one) gets it with no
+code of its own. `examples/dmabuf-import.js` runs the whole round trip with
+no X server: a second GBM surface plays the part of the compositing client,
+and its frame comes back as a texture.
+
+**For CPU reads there is `mapDmabuf(fd, size?)`** — what `createUdmabuf`
+returns, for memory this package did not allocate:
+
+```js
+const map = dri.mapDmabuf(buf.planes[0].fd);   // does NOT consume the fd
+map.sync(dri.DMABUF_SYNC.START | dri.DMABUF_SYNC.READ);
+const pixels = new Uint8Array(map.buffer);
+map.sync(dri.DMABUF_SYNC.END | dri.DMABUF_SYNC.READ);
+map.close();                                   // unmap now, not at the next GC
+```
+
+`size` defaults to the whole buffer. `map.writable` is `false` when the
+descriptor was exported read-only, which some servers do. Only a dma-buf
+whose exporter implements `mmap` can be mapped at all — udmabuf and linear
+GPU buffers can, tiled ones throw saying so, and those have to go through
+`importDmabuf` instead.
+
 ### Still not covered
 
 The rest of ES 3.0: sampler objects, uniform buffer objects, transform
 feedback, primitive restart, and `getUniformuiv` for unsigned-integer uniforms
 (`getUniform` answers `null` for a type it cannot read). Query objects are
 here for the timers; their occlusion targets would go through the same calls
-but have no constants in `GL`. Adding one is still a small wrapper per entry
+but have no constants in `GL`. On the import side, an EGLImage can also back
+a renderbuffer (`glEGLImageTargetRenderbufferStorageOES`) — rendering *into*
+somebody else's dma-buf rather than sampling it — and the YUV colour-space
+and sample-range hints of `EGL_EXT_image_dma_buf_import` are not plumbed
+through. Adding one is still a small wrapper per entry
 point in `src/x11dri.c` plus a line in the `EXPORT` block — the JS name is
 derived from the `glFoo` export automatically, and anything past ES 2.0
 belongs in the optional table beside the features above.

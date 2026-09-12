@@ -8,11 +8,11 @@
 // which is what keeps the declarations from quietly widening to `any`.
 
 import {
-    probe, dup, listRenderNodes, createUdmabuf, dmabufSync,
+    probe, dup, listRenderNodes, createUdmabuf, mapDmabuf, dmabufSync,
     Gpu, GL, gl as sharedGl, apple,
     FORMAT, GBM_USE, MODIFIER, DMABUF_SYNC,
-    ActiveInfo, GlFeatures, GLContext, GLenum, GLsync, ProbeResult, Surface,
-    SwapResult, TypedArray
+    ActiveInfo, GlFeatures, GLContext, GLenum, GLsync, ImportedImage,
+    MappedDmabuf, ProbeResult, Surface, SwapResult, TypedArray
 } from './index';
 
 // ---- probe and the plumbing ------------------------------------------------
@@ -33,6 +33,17 @@ buf.close();
 
 // @ts-expect-error — size is required
 createUdmabuf();
+
+// mapping a descriptor this process did not allocate: size is the optional half
+const mapped: MappedDmabuf = mapDmabuf(buf.fd);
+mapDmabuf(buf.fd, 4096);
+const mappedWritable: boolean = mapped.writable;
+new Uint8Array(mapped.buffer)[0] = 1;
+mapped.sync(DMABUF_SYNC.START | DMABUF_SYNC.READ);
+mapped.close();
+
+// @ts-expect-error — the descriptor is required
+mapDmabuf();
 
 // ---- the context -----------------------------------------------------------
 
@@ -235,6 +246,39 @@ const bits: number = precision.precision;
 const pixels: TypedArray = new Uint8Array(4 * 4 * 4);
 gl.readPixels(0, 0, 4, 4, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
 
+// ---- dma-buf import: a descriptor in, as a texture --------------------------
+
+if (gpu.features?.dmabufImport) {
+    const image: ImportedImage = gl.importDmabuf({
+        width: 256,
+        height: 256,
+        fourcc: FORMAT.XRGB8888,
+        modifier: MODIFIER.INVALID,
+        planes: [{ fd: copy, stride: 1024, offset: 0 }]
+    });
+    gl.bindTexture(image.target, image.texture);
+    // the minimum: one implicit-layout plane, offset defaulted
+    gl.importDmabuf({
+        width: 8, height: 8, fourcc: FORMAT.ARGB8888,
+        planes: [{ fd: copy, stride: 32 }]
+    }).destroy();
+    // and the YUV shape, which is about the sampler as much as the buffer
+    if (gpu.features.externalTexture)
+        gl.importDmabuf({
+            width: 8, height: 8, fourcc: 0x3231564e /* NV12 */,
+            target: gl.TEXTURE_EXTERNAL_OES,
+            planes: [{ fd: copy, stride: 8, offset: 0 }, { fd: copy, stride: 8, offset: 64 }]
+        }).destroy();
+    image.destroy();
+}
+
+// @ts-expect-error — planes are not optional
+gl.importDmabuf({ width: 8, height: 8, fourcc: FORMAT.XRGB8888 });
+// @ts-expect-error — a plane needs a stride
+gl.importDmabuf({ width: 8, height: 8, fourcc: FORMAT.XRGB8888, planes: [{ fd: 3 }] });
+// @ts-expect-error — the returned fields are read-only
+gl.importDmabuf({ width: 8, height: 8, fourcc: 0, planes: [{ fd: 3, stride: 32 }] }).texture = 1;
+
 // ---- the macOS / XQuartz path ----------------------------------------------
 
 const appledriWhy: string = caps.appledri === true ? 'fine' : caps.appledri;
@@ -275,5 +319,5 @@ export {
     usable, why, nodes, copy, eglVendor, contextVersion, major, compiled, log,
     viewport, maxTexture, dithering, extensions, live, notANumber, bits,
     alsoGl, modifierLinear, constantsOnly, nope, gl, out, info, value, precision,
-    appledriWhy, cid, hz, actxGl, frameNs
+    appledriWhy, cid, hz, actxGl, frameNs, mappedWritable
 };

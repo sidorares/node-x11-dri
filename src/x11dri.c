@@ -32,6 +32,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #if defined(__linux__)
@@ -71,6 +72,13 @@
 #define LIB_EGL  "libEGL.so.1"
 #define LIB_GLES "libGLESv2.so.2"
 #endif
+
+// The one sentence every dma-buf entry point says where the kernel has no
+// such thing. Defined here rather than beside those entry points because the
+// dma-buf *importer* lives with the GL wrappers, a long way above them.
+#define NO_DMABUF                                                             \
+    "dma-buf is a Linux kernel facility with no " PLATFORM_NAME " equivalent" \
+    " (and XQuartz implements no DRI3 extension to receive one)"
 
 // dlopen `name`, then the same name under any extra search directories this
 // platform is known to hide graphics libraries in.
@@ -139,6 +147,26 @@ static bool arg_bool(napi_env env, napi_value v) {
     return out;
 }
 
+// A uint64 from either spelling JavaScript has for one: a BigInt (what a
+// dma-buf modifier is, and what swap() hands back) or a Number, which is
+// exact below 2^53 and is how a literal like 0 arrives.
+static bool arg_u64(napi_env env, napi_value v, uint64_t *out) {
+    napi_valuetype t;
+    if (napi_typeof(env, v, &t) != napi_ok)
+        return false;
+    if (t == napi_bigint) {
+        bool lossless = false;
+        return napi_get_value_bigint_uint64(env, v, out, &lossless) == napi_ok &&
+               lossless;
+    }
+    double d = 0;
+    if (napi_get_value_double(env, v, &d) != napi_ok || !(d >= 0) ||
+        d > 18446744073709551615.0)
+        return false;
+    *out = (uint64_t)d;
+    return true;
+}
+
 static napi_value mk_u32(napi_env env, uint32_t v) {
     napi_value out;
     napi_create_uint32(env, v, &out);
@@ -161,6 +189,17 @@ static napi_value mk_str(napi_env env, const char *s) {
 }
 static void obj_set(napi_env env, napi_value obj, const char *k, napi_value v) {
     napi_set_named_property(env, obj, k, v);
+}
+
+// A property of an options object, or NULL when it is absent — which is what
+// an optional field looks like, and is not the same as a bad value.
+static napi_value obj_get(napi_env env, napi_value obj, const char *k) {
+    napi_value v;
+    napi_valuetype t;
+    if (napi_get_named_property(env, obj, k, &v) != napi_ok ||
+        napi_typeof(env, v, &t) != napi_ok || t == napi_undefined || t == napi_null)
+        return NULL;
+    return v;
 }
 
 // A TypedArray as raw bytes. GL sizes its buffer and pixel uploads in bytes,
@@ -232,7 +271,28 @@ typedef intptr_t EGLAttrib;
 #define EGL_CONTEXT_CLIENT_VERSION 0x3098
 #define EGL_VENDOR                0x3053
 #define EGL_VERSION               0x3054
+#define EGL_EXTENSIONS            0x3055
+#define EGL_HEIGHT                0x3056
+#define EGL_WIDTH                 0x3057
 #define EGL_PLATFORM_GBM_KHR      0x31D7
+
+// EGL_KHR_image_base + EGL_EXT_image_dma_buf_import(_modifiers): the import
+// half of the dma-buf story. An EGLImage is an opaque handle to somebody
+// else's pixels; EGL_LINUX_DMA_BUF_EXT is the flavor whose "somebody else" is
+// a dma-buf descriptor, described by the attribute list below.
+typedef void *EGLImageKHR;
+#define EGL_NO_CONTEXT            ((EGLContext)0)
+#define EGL_NO_IMAGE_KHR          ((EGLImageKHR)0)
+#define EGL_LINUX_DMA_BUF_EXT     0x3270
+#define EGL_LINUX_DRM_FOURCC_EXT  0x3271
+// Per-plane fd/offset/pitch. Planes 0-2 are the base extension, plane 3 and
+// every modifier attribute came with EGL_EXT_image_dma_buf_import_modifiers
+// — which is why asking for either without it is refused rather than tried.
+static const EGLint EGL_DMA_BUF_PLANE_FD[4]  = { 0x3272, 0x3275, 0x3278, 0x3440 };
+static const EGLint EGL_DMA_BUF_PLANE_OFF[4] = { 0x3273, 0x3276, 0x3279, 0x3441 };
+static const EGLint EGL_DMA_BUF_PLANE_PITCH[4] = { 0x3274, 0x3277, 0x327A, 0x3442 };
+static const EGLint EGL_DMA_BUF_PLANE_MOD_LO[4] = { 0x3443, 0x3445, 0x3447, 0x3449 };
+static const EGLint EGL_DMA_BUF_PLANE_MOD_HI[4] = { 0x3444, 0x3446, 0x3448, 0x344A };
 
 typedef uint32_t GLenum;
 typedef uint32_t GLuint;
@@ -323,9 +383,26 @@ static struct {
     EGLBoolean (*MakeCurrent)(EGLDisplay, EGLSurface, EGLSurface, EGLContext);
     EGLBoolean (*SwapBuffers)(EGLDisplay, EGLSurface);
     EGLBoolean (*SwapInterval)(EGLDisplay, EGLint);
+    EGLDisplay (*GetCurrentDisplay)(void);
     const char *(*QueryString)(EGLDisplay, EGLint);
     void *(*GetProcAddress)(const char *);
 } egl;
+
+// EGLImage creation, resolved per display rather than at load time: the
+// entry points come through eglGetProcAddress and the extensions that give
+// them meaning are display properties, not library ones. EGL 1.5 made the
+// pair core with a wider attribute type, so both spellings are kept — a
+// driver old enough to have only the KHR one is still the common case.
+static struct {
+    EGLImageKHR (*CreateImageKHR)(EGLDisplay, EGLContext, EGLenum, void *, const EGLint *);
+    EGLBoolean (*DestroyImageKHR)(EGLDisplay, EGLImageKHR);
+    EGLImageKHR (*CreateImage)(EGLDisplay, EGLContext, EGLenum, void *, const EGLAttrib *);
+    EGLBoolean (*DestroyImage)(EGLDisplay, EGLImageKHR);
+    EGLDisplay dpy;     // the display the three flags below describe
+    int import;         // EGL_EXT_image_dma_buf_import
+    int modifiers;      // EGL_EXT_image_dma_buf_import_modifiers
+    int external;       // GL_OES_EGL_image_external (a GL extension)
+} eglimg;
 
 static struct {
     void *lib;
@@ -506,6 +583,8 @@ static struct {
     void (*GetQueryObjectuiv)(GLuint, GLenum, GLuint *);
     void (*GetQueryObjectui64v)(GLuint, GLenum, GLuint64 *);
     void (*QueryCounter)(GLuint, GLenum);
+    // GL_OES_EGL_image: point a texture at an EGLImage's pixels
+    void (*EGLImageTargetTexture2DOES)(GLenum, EGLImageKHR);
 } gl;
 
 #if defined(__APPLE__)
@@ -620,6 +699,7 @@ static const char *load_egl(void) {
     S(MakeCurrent, "eglMakeCurrent");
     S(SwapBuffers, "eglSwapBuffers");
     S(SwapInterval, "eglSwapInterval");
+    S(GetCurrentDisplay, "eglGetCurrentDisplay");
     S(QueryString, "eglQueryString");
     S(GetProcAddress, "eglGetProcAddress");
 #undef S
@@ -1013,7 +1093,13 @@ static const GlOptional gl_optional[] = {
     { (void **)&gl.QueryCounter, "timestampQuery", {
         { "glQueryCounter", NULL, DESKTOP_ONLY(33) },
         { "glQueryCounter", "GL_ARB_timer_query", 0 },
-        { "glQueryCounterEXT", "GL_EXT_disjoint_timer_query", 0 } } }
+        { "glQueryCounterEXT", "GL_EXT_disjoint_timer_query", 0 } } },
+    // Binding an EGLImage to a texture. There is no core spelling on any
+    // version of either API — GL_OES_EGL_image is the whole of it — and it
+    // is only half of `dmabufImport`: the EGL half is a property of the
+    // display, ANDed in by getFeatures().
+    { (void **)&gl.EGLImageTargetTexture2DOES, "dmabufImport", {
+        { "glEGLImageTargetTexture2DOES", "GL_OES_EGL_image", 0 } } }
 };
 #undef SYNC_FN
 #undef QUERY_FN
@@ -1085,6 +1171,45 @@ static const char *gl_extensions_string(void) {
     return synth_exts;
 }
 
+// The EGL half of dma-buf import, settled alongside the GL half because it
+// is the same question asked of the other library: what can *this* context
+// import? `exts` is the GL extension string, already in hand, and carries
+// the one GL-side extension that is not an entry point of its own.
+static void resolve_egl_image(const char *exts) {
+    eglimg.CreateImageKHR = NULL;
+    eglimg.DestroyImageKHR = NULL;
+    eglimg.CreateImage = NULL;
+    eglimg.DestroyImage = NULL;
+    eglimg.import = eglimg.modifiers = eglimg.external = 0;
+    eglimg.dpy = NULL;
+    if (!egl.lib || !egl.GetCurrentDisplay)
+        return; // the CGL backend, or an EGL that never loaded
+    EGLDisplay dpy = egl.GetCurrentDisplay();
+    if (!dpy)
+        return;
+    eglimg.dpy = dpy;
+    const char *e = egl.QueryString(dpy, EGL_EXTENSIONS);
+    eglimg.import = has_gl_ext(e, "EGL_EXT_image_dma_buf_import");
+    eglimg.modifiers = has_gl_ext(e, "EGL_EXT_image_dma_buf_import_modifiers");
+    eglimg.external = has_gl_ext(exts, "GL_OES_EGL_image_external");
+    if (has_gl_ext(e, "EGL_KHR_image_base")) {
+        *(void **)&eglimg.CreateImageKHR = egl.GetProcAddress("eglCreateImageKHR");
+        *(void **)&eglimg.DestroyImageKHR = egl.GetProcAddress("eglDestroyImageKHR");
+    }
+    if (!eglimg.CreateImageKHR || !eglimg.DestroyImageKHR) {
+        // EGL 1.5 core. eglGetProcAddress may answer for a name the display
+        // does not implement, so these come from the library itself.
+        *(void **)&eglimg.CreateImage = dlsym(egl.lib, "eglCreateImage");
+        *(void **)&eglimg.DestroyImage = dlsym(egl.lib, "eglDestroyImage");
+    }
+}
+
+// Whether an EGLImage can be made and unmade at all, either spelling.
+static int egl_image_usable(void) {
+    return (eglimg.CreateImageKHR && eglimg.DestroyImageKHR) ||
+           (eglimg.CreateImage && eglimg.DestroyImage);
+}
+
 static void resolve_optional_gl(EGLContext ctx) {
     if (optional_ctx == ctx)
         return;
@@ -1131,6 +1256,7 @@ static void resolve_optional_gl(EGLContext ctx) {
         }
     }
     disjoint_timer = has_gl_ext(exts, "GL_EXT_disjoint_timer_query");
+    resolve_egl_image(exts);
 }
 
 // ---------------------------------------------------------------------------
@@ -1198,6 +1324,62 @@ static void sync_forget_context(void *ctx) {
 }
 
 // ---------------------------------------------------------------------------
+// Imported dma-buf images
+//
+// An EGLImage plus the texture pointed at it (see importDmabuf below). Both
+// belong to the context they were made in, so they are kept on a list: when
+// that context goes, the objects went with it and the handles JS still holds
+// must stop pretending otherwise. Same reasoning as the sync table above,
+// different shape — these are objects with a destroy(), so each one is an
+// external of its own rather than a slot number.
+// ---------------------------------------------------------------------------
+
+typedef struct ImportedImage {
+    struct ImportedImage *next;
+    EGLDisplay dpy;
+    void *ctx;            // the context the texture name lives in
+    EGLImageKHR image;
+    EGLBoolean (*destroy_image)(EGLDisplay, EGLImageKHR);
+    GLuint texture;
+    GLenum target;
+    uint32_t width, height;
+    int destroyed;
+} ImportedImage;
+
+static ImportedImage *imported_images;
+
+// Let go of one image and take it off the live list. GL and EGL are touched
+// only when `with_context` says the owning context is current; a finalizer
+// running late, or a Gpu already destroyed, leaves both to eglTerminate,
+// which frees every image on the display anyway.
+static void imported_release(ImportedImage *im, int with_context) {
+    if (im->destroyed)
+        return;
+    im->destroyed = 1;
+    if (with_context) {
+        if (im->texture)
+            gl.DeleteTextures(1, &im->texture);
+        if (im->image && im->destroy_image)
+            im->destroy_image(im->dpy, im->image);
+    }
+    for (ImportedImage **p = &imported_images; *p; p = &(*p)->next)
+        if (*p == im) {
+            *p = im->next;
+            break;
+        }
+}
+
+static void imported_forget_context(void *ctx) {
+    ImportedImage *im = imported_images;
+    while (im) {
+        ImportedImage *next = im->next;
+        if (im->ctx == ctx)
+            imported_release(im, 0);
+        im = next;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Gpu (drm fd + gbm device + EGL display/config/context)
 // ---------------------------------------------------------------------------
 
@@ -1233,6 +1415,7 @@ static void gpu_finalize(napi_env env, void *data, void *hint) {
         // JS forgot destroy(); release what we can without touching EGL
         // current state (finalizers can run late in teardown).
         sync_forget_context(g->ctx);
+        imported_forget_context(g->ctx);
         if (g->ctx) egl.DestroyContext(g->dpy, g->ctx);
         if (g->dpy) egl.Terminate(g->dpy);
         if (g->gbm) gbm.device_destroy(g->gbm);
@@ -1542,6 +1725,7 @@ static napi_value DestroyGpu(napi_env env, napi_callback_info info) {
         if (optional_ctx == g->ctx)
             optional_ctx = NULL; // a later context could land on this address
         sync_forget_context(g->ctx);
+        imported_forget_context(g->ctx);
         egl.DestroyContext(g->dpy, g->ctx);
         egl.Terminate(g->dpy);
         gbm.device_destroy(g->gbm);
@@ -3119,7 +3303,8 @@ static napi_value Gl_queryCounter(napi_env env, napi_callback_info info) {
 
 // getFeatures() -> { vertexArrayObject, instancedArrays, drawBuffers,
 //                    texture3D, textureStorage, multisample, readBuffer,
-//                    sync, timerQuery, timestampQuery }
+//                    sync, timerQuery, timestampQuery, dmabufImport,
+//                    dmabufImportModifiers, externalTexture }
 //
 // A feature is present only when every entry point it needs resolved, so a
 // driver offering half an extension reports it as absent rather than
@@ -3138,7 +3323,262 @@ static napi_value GlFeatures(napi_env env, napi_callback_info info) {
             napi_get_value_bool(env, prev, &ok);
         obj_set(env, obj, o->feature, mk_bool(env, ok && *o->slot != NULL));
     }
+    // dma-buf import is the one feature that spans both libraries: the loop
+    // above settled its GL half (glEGLImageTargetTexture2DOES, under the
+    // same name), and the EGL half belongs to the display.
+    int gl_half = gl.EGLImageTargetTexture2DOES != NULL;
+    int egl_half = HAVE_DMABUF && egl_image_usable();
+    obj_set(env, obj, "dmabufImport",
+            mk_bool(env, gl_half && egl_half && eglimg.import));
+    obj_set(env, obj, "dmabufImportModifiers",
+            mk_bool(env, gl_half && egl_half && eglimg.modifiers));
+    obj_set(env, obj, "externalTexture", mk_bool(env, gl_half && eglimg.external));
     return obj;
+}
+
+// ---------------------------------------------------------------------------
+// dma-buf import: a descriptor from anywhere, as a GL texture
+//
+// The mirror of everything above. Surface.swap() and udmabufCreate() hand a
+// dma-buf *out*; this takes one in — eglCreateImage(EGL_LINUX_DMA_BUF_EXT)
+// wraps the descriptor, glEGLImageTargetTexture2DOES points a texture at it,
+// and from then on it samples like any other texture with no copy anywhere.
+//
+// The descriptor it is given normally came from the X server: DRI3's
+// BuffersFromPixmap answers with exactly the shape importDmabuf takes, which
+// is how a compositor turns a redirected window's pixmap into a texture
+// (Composite.NameWindowPixmap -> BuffersFromPixmap -> here).
+//
+// This lives on `gl` rather than on `Gpu` because it is a context-current
+// call like every other one there — NEED_GL says so in the same words — and
+// the display it needs is the current context's, not a Gpu handle's.
+// ---------------------------------------------------------------------------
+
+#define GL_TEXTURE_2D_                   0x0DE1
+#define GL_TEXTURE_EXTERNAL_OES_         0x8D65
+#define GL_TEXTURE_BINDING_2D_           0x8069
+#define GL_TEXTURE_BINDING_EXTERNAL_OES_ 0x8D67
+
+static void imported_finalize(napi_env env, void *data, void *hint) {
+    (void)env; (void)hint;
+    ImportedImage *im = data;
+    // JS forgot destroy(). Deleting a texture takes the context it belongs
+    // to and a finalizer cannot make one current, so this only does the work
+    // when that context happens to still be the current one; otherwise the
+    // objects go when the context does.
+    imported_release(im, im->ctx == optional_ctx && has_current);
+    free(im);
+}
+
+// importDmabuf({ width, height, fourcc, modifier?, target?, planes: [{ fd,
+// stride, offset? }] }) -> { handle, texture, target, width, height }
+//
+// On success the plane descriptors are consumed — EGL has taken its own
+// reference to the buffer by then, so holding ours would only leak. A throw
+// leaves them open and owned by the caller, who may still want to try
+// something else with them. Pass dri.dup(fd) to keep a copy either way.
+static napi_value ImportDmabuf(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 1);
+    // Compiled everywhere — it is all dlopen'd entry points — so the
+    // platform that has no dma-bufs says so here rather than by being a
+    // different function.
+    if (!HAVE_DMABUF)
+        THROW(env, "importDmabuf: " NO_DMABUF);
+    NEED_GL(env);
+    if (!gl.EGLImageTargetTexture2DOES || !egl_image_usable() || !eglimg.import)
+        THROW(env, "importDmabuf: this context cannot import dma-bufs — it needs "
+                   "EGL_EXT_image_dma_buf_import and GL_OES_EGL_image "
+                   "(see features.dmabufImport)");
+
+    napi_valuetype t;
+    if (napi_typeof(env, args[0], &t) != napi_ok || t != napi_object)
+        THROW(env, "importDmabuf: expected an options object");
+
+    napi_value wv = obj_get(env, args[0], "width");
+    napi_value hv = obj_get(env, args[0], "height");
+    napi_value fv = obj_get(env, args[0], "fourcc");
+    if (!wv || !hv || !fv)
+        THROW(env, "importDmabuf: width, height and fourcc are all required");
+    uint32_t width = arg_u32(env, wv);
+    uint32_t height = arg_u32(env, hv);
+    uint32_t fourcc = arg_u32(env, fv);
+    if (!width || !height)
+        THROW(env, "importDmabuf: width and height must be non-zero");
+
+    napi_value planes = obj_get(env, args[0], "planes");
+    bool is_array = false;
+    uint32_t nplanes = 0;
+    if (!planes || napi_is_array(env, planes, &is_array) != napi_ok || !is_array ||
+        napi_get_array_length(env, planes, &nplanes) != napi_ok)
+        THROW(env, "importDmabuf: planes must be an array of { fd, stride, offset }");
+    if (nplanes < 1 || nplanes > 4)
+        THROWF(env, "importDmabuf: 1 to 4 planes, got %u", nplanes);
+
+    // MODIFIER.INVALID (the default) means "implicit": let the driver assume
+    // whatever layout it would have assumed before modifiers existed, which
+    // is the only thing the base extension can express.
+    uint64_t modifier = DRM_FORMAT_MOD_INVALID;
+    napi_value mv = obj_get(env, args[0], "modifier");
+    if (mv && !arg_u64(env, mv, &modifier))
+        THROW(env, "importDmabuf: modifier must be a BigInt or a non-negative Number");
+    int explicit_mod = modifier != DRM_FORMAT_MOD_INVALID;
+    if ((explicit_mod || nplanes > 3) && !eglimg.modifiers)
+        THROWF(env, "importDmabuf: %s needs EGL_EXT_image_dma_buf_import_modifiers, "
+                    "which this display does not have (see "
+                    "features.dmabufImportModifiers)",
+               explicit_mod ? "an explicit modifier" : "a fourth plane");
+
+    // TEXTURE_2D samples an RGB buffer with an ordinary sampler2D. A YUV
+    // buffer usually cannot be sampled that way at all and needs
+    // TEXTURE_EXTERNAL_OES, whose GLSL type is samplerExternalOES — a
+    // decision about the shader as much as about the buffer, so it is the
+    // caller's to make rather than something guessed from the fourcc.
+    GLenum target = GL_TEXTURE_2D_;
+    napi_value tv = obj_get(env, args[0], "target");
+    if (tv)
+        target = arg_u32(env, tv);
+    if (target != GL_TEXTURE_2D_ && target != GL_TEXTURE_EXTERNAL_OES_)
+        THROWF(env, "importDmabuf: target must be TEXTURE_2D or "
+                    "TEXTURE_EXTERNAL_OES (got 0x%x)", target);
+    if (target == GL_TEXTURE_EXTERNAL_OES_ && !eglimg.external)
+        THROW(env, "importDmabuf: TEXTURE_EXTERNAL_OES needs GL_OES_EGL_image_external, "
+                   "which this driver does not have (see features.externalTexture)");
+
+    // 6 for the image + 10 per plane at most + EGL_NONE
+    EGLint attrs[6 + 4 * 10 + 1];
+    int fds[4];
+    int n = 0;
+    attrs[n++] = EGL_WIDTH;                attrs[n++] = (EGLint)width;
+    attrs[n++] = EGL_HEIGHT;               attrs[n++] = (EGLint)height;
+    attrs[n++] = EGL_LINUX_DRM_FOURCC_EXT; attrs[n++] = (EGLint)fourcc;
+    for (uint32_t i = 0; i < nplanes; i++) {
+        napi_value plane, fdv, sv, ov;
+        if (napi_get_element(env, planes, i, &plane) != napi_ok ||
+            napi_typeof(env, plane, &t) != napi_ok || t != napi_object)
+            THROWF(env, "importDmabuf: planes[%u] must be an object", i);
+        if (!(fdv = obj_get(env, plane, "fd")) || !(sv = obj_get(env, plane, "stride")))
+            THROWF(env, "importDmabuf: planes[%u] needs fd and stride", i);
+        ov = obj_get(env, plane, "offset");
+        fds[i] = arg_i32(env, fdv);
+        if (fds[i] < 0)
+            THROWF(env, "importDmabuf: planes[%u].fd is not a descriptor (%d)", i, fds[i]);
+        attrs[n++] = EGL_DMA_BUF_PLANE_FD[i];    attrs[n++] = fds[i];
+        attrs[n++] = EGL_DMA_BUF_PLANE_OFF[i];   attrs[n++] = ov ? (EGLint)arg_u32(env, ov) : 0;
+        attrs[n++] = EGL_DMA_BUF_PLANE_PITCH[i]; attrs[n++] = (EGLint)arg_u32(env, sv);
+        if (explicit_mod) {
+            // the modifier is per plane in the attribute list, and the same
+            // for every plane of one buffer in every layout anyone ships
+            attrs[n++] = EGL_DMA_BUF_PLANE_MOD_LO[i];
+            attrs[n++] = (EGLint)(uint32_t)modifier;
+            attrs[n++] = EGL_DMA_BUF_PLANE_MOD_HI[i];
+            attrs[n++] = (EGLint)(uint32_t)(modifier >> 32);
+        }
+    }
+    attrs[n++] = EGL_NONE;
+
+    EGLImageKHR image;
+    if (eglimg.CreateImageKHR) {
+        image = eglimg.CreateImageKHR(eglimg.dpy, EGL_NO_CONTEXT,
+                                      EGL_LINUX_DMA_BUF_EXT, NULL, attrs);
+    } else {
+        // EGL 1.5 spells the same list in the wider attribute type
+        EGLAttrib wide[sizeof(attrs) / sizeof(attrs[0])];
+        for (int i = 0; i < n; i++)
+            wide[i] = attrs[i];
+        image = eglimg.CreateImage(eglimg.dpy, EGL_NO_CONTEXT,
+                                   EGL_LINUX_DMA_BUF_EXT, NULL, wide);
+    }
+    if (image == EGL_NO_IMAGE_KHR)
+        THROWF(env, "importDmabuf: eglCreateImage(EGL_LINUX_DMA_BUF_EXT) failed "
+                    "(0x%x) — is %ux%u fourcc 0x%08x a layout this driver accepts?",
+               egl.GetError(), width, height, fourcc);
+
+    EGLBoolean (*destroy_image)(EGLDisplay, EGLImageKHR) =
+        eglimg.DestroyImageKHR ? eglimg.DestroyImageKHR : eglimg.DestroyImage;
+
+    // Importing a buffer should not disturb what the caller had bound.
+    GLint prev_tex = 0;
+    gl.GetIntegerv(target == GL_TEXTURE_EXTERNAL_OES_ ? GL_TEXTURE_BINDING_EXTERNAL_OES_
+                                                      : GL_TEXTURE_BINDING_2D_, &prev_tex);
+    GLuint texture = 0;
+    gl.GenTextures(1, &texture);
+    gl.BindTexture(target, texture);
+    for (int i = 0; i < 16 && gl.GetError() != 0; i++)
+        ; // drain, so the next check cannot inherit somebody else's error
+    gl.EGLImageTargetTexture2DOES(target, image);
+    GLenum gerr = gl.GetError();
+    if (gerr) {
+        gl.BindTexture(target, (GLuint)prev_tex);
+        gl.DeleteTextures(1, &texture);
+        destroy_image(eglimg.dpy, image);
+        THROWF(env, "importDmabuf: glEGLImageTargetTexture2DOES failed (0x%x) — "
+                    "the driver made the EGLImage but will not bind it to %s",
+               gerr, target == GL_TEXTURE_EXTERNAL_OES_ ? "TEXTURE_EXTERNAL_OES"
+                                                        : "TEXTURE_2D");
+    }
+    // An EGLImage texture has no mipmaps, so the default minification filter
+    // would leave it incomplete and sampling black — the classic silent
+    // failure here. These four are also the only values TEXTURE_EXTERNAL_OES
+    // accepts at all; on TEXTURE_2D the caller can change them afterwards.
+    gl.TexParameteri(target, 0x2801 /* TEXTURE_MIN_FILTER */, 0x2601 /* LINEAR */);
+    gl.TexParameteri(target, 0x2800 /* TEXTURE_MAG_FILTER */, 0x2601 /* LINEAR */);
+    gl.TexParameteri(target, 0x2802 /* TEXTURE_WRAP_S */, 0x812F /* CLAMP_TO_EDGE */);
+    gl.TexParameteri(target, 0x2803 /* TEXTURE_WRAP_T */, 0x812F /* CLAMP_TO_EDGE */);
+    gl.BindTexture(target, (GLuint)prev_tex);
+
+    ImportedImage *im = calloc(1, sizeof(ImportedImage));
+    if (!im) {
+        gl.DeleteTextures(1, &texture);
+        destroy_image(eglimg.dpy, image);
+        THROW(env, "importDmabuf: out of memory");
+    }
+    im->dpy = eglimg.dpy;
+    im->ctx = optional_ctx;
+    im->image = image;
+    im->destroy_image = destroy_image;
+    im->texture = texture;
+    im->target = target;
+    im->width = width;
+    im->height = height;
+    im->next = imported_images;
+    imported_images = im;
+
+    // The descriptors are consumed now that EGL holds its own reference. A
+    // multi-planar buffer commonly names one descriptor for every plane, so
+    // each distinct one is closed exactly once.
+    for (uint32_t i = 0; i < nplanes; i++) {
+        int seen = 0;
+        for (uint32_t j = 0; j < i; j++)
+            seen |= fds[j] == fds[i];
+        if (!seen)
+            close(fds[i]);
+    }
+
+    napi_value obj, ext;
+    NAPI_CALL(env, napi_create_object(env, &obj));
+    NAPI_CALL(env, napi_create_external(env, im, imported_finalize, NULL, &ext));
+    obj_set(env, obj, "handle", ext);
+    obj_set(env, obj, "texture", mk_u32(env, texture));
+    obj_set(env, obj, "target", mk_u32(env, target));
+    obj_set(env, obj, "width", mk_u32(env, width));
+    obj_set(env, obj, "height", mk_u32(env, height));
+    return obj;
+}
+
+// destroyImportedImage(handle) — glDeleteTextures + eglDestroyImage.
+// Idempotent, and a no-op once the context that owned the objects is gone
+// (they went with it).
+static napi_value DestroyImportedImage(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 1);
+    ImportedImage *im;
+    if (!get_external(env, args[0], (void **)&im)) return NULL;
+    if (im->destroyed)
+        return NULL;
+    if (im->ctx != optional_ctx || !has_current)
+        THROW(env, "destroy(): the context this image was imported into is not "
+                   "current — deleting its texture needs makeCurrent first");
+    imported_release(im, 1);
+    return NULL;
 }
 
 // ---------------------------------------------------------------------------
@@ -3793,6 +4233,114 @@ static napi_value UdmabufCreate(napi_env env, napi_callback_info info) {
     return obj;
 }
 
+// A mapping shared by two napi objects — the ArrayBuffer the pixels are read
+// through, and the handle dmabufUnmap takes — so the pages survive whichever
+// is collected first and are unmapped exactly once.
+typedef struct {
+    void *addr; // NULL once unmapped, explicitly or otherwise
+    size_t size;
+    int refs;
+} Mapping;
+
+static void mapping_release(Mapping *m) {
+    if (--m->refs > 0)
+        return;
+    if (m->addr)
+        munmap(m->addr, m->size);
+    free(m);
+}
+static void mapping_ab_finalize(napi_env env, void *data, void *hint) {
+    (void)env; (void)data;
+    mapping_release(hint);
+}
+static void mapping_ext_finalize(napi_env env, void *data, void *hint) {
+    (void)env; (void)hint;
+    mapping_release(data);
+}
+
+// dmabufMap(fd, size) -> { handle, size, writable, buffer }
+// mmap someone else's dma-buf for CPU reads and writes: the missing half of
+// what udmabufCreate already does for memory this addon allocated itself.
+// `size` 0 means the whole buffer, which a dma-buf reports through fstat.
+//
+// Only an exporter that implements mmap can be mapped at all — udmabuf and
+// linear GPU buffers can, tiled ones generally cannot, and the error says
+// which happened. Bracket access with dmabufSync as always.
+static napi_value DmabufMap(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 2);
+    int fd = arg_i32(env, args[0]);
+    size_t size = arg_u32(env, args[1]);
+    if (!size) {
+        struct stat st;
+        if (fstat(fd, &st) != 0)
+            THROWF(env, "dmabufMap: fstat of fd %d failed: %s", fd, strerror(errno));
+        if (st.st_size <= 0)
+            THROWF(env, "dmabufMap: fd %d reports no size — pass one explicitly", fd);
+        // `size` is reported back as a uint32, so refuse rather than lie
+        // about a buffer no pixel format plausibly needs.
+        if ((uint64_t)st.st_size > 0xFFFFFFFFu)
+            THROWF(env, "dmabufMap: fd %d is %lld bytes — larger than this maps "
+                        "in one go", fd, (long long)st.st_size);
+        size = (size_t)st.st_size;
+    }
+
+    // A dma-buf fd can be read-only (DRI3 servers that export without
+    // DRM_RDWR), and then only the read-only mapping succeeds. Reporting
+    // which one this is beats guessing from a segfault later.
+    int writable = 1;
+    void *map = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (map == MAP_FAILED && (errno == EACCES || errno == EPERM)) {
+        writable = 0;
+        map = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
+    }
+    if (map == MAP_FAILED)
+        THROWF(env, "dmabufMap: mmap of fd %d failed: %s (a tiled or otherwise "
+                    "unmappable dma-buf has to go through GL instead)",
+               fd, strerror(errno));
+
+    Mapping *m = calloc(1, sizeof(Mapping));
+    if (!m) {
+        munmap(map, size);
+        THROW(env, "dmabufMap: out of memory");
+    }
+    m->addr = map;
+    m->size = size;
+    m->refs = 2; // the ArrayBuffer and the handle below
+
+    napi_value obj, ab, ext;
+    NAPI_CALL(env, napi_create_object(env, &obj));
+    NAPI_CALL(env, napi_create_external_arraybuffer(env, map, size,
+        mapping_ab_finalize, m, &ab));
+    NAPI_CALL(env, napi_create_external(env, m, mapping_ext_finalize, NULL, &ext));
+    obj_set(env, obj, "handle", ext);
+    obj_set(env, obj, "size", mk_u32(env, (uint32_t)size));
+    obj_set(env, obj, "writable", mk_bool(env, writable));
+    obj_set(env, obj, "buffer", ab);
+    return obj;
+}
+
+// dmabufUnmap(handle, buffer) — give the address space back now rather than
+// at the next GC, which is what a compositor mapping a pixmap per frame
+// needs. The ArrayBuffer is detached first so JS cannot reach freed pages;
+// if that is refused the mapping is left to the finalizer, because unmapping
+// under a live view is worse than holding it a while longer.
+static napi_value DmabufUnmap(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 2);
+    Mapping *m;
+    if (!get_external(env, args[0], (void **)&m)) return NULL;
+    if (!m->addr)
+        return NULL; // already unmapped
+    bool detached = false;
+    if (napi_is_detached_arraybuffer(env, args[1], &detached) != napi_ok)
+        THROW(env, "dmabufUnmap: expected the buffer this mapping handed out");
+    if (!detached && napi_detach_arraybuffer(env, args[1]) != napi_ok)
+        THROW(env, "dmabufUnmap: the buffer could not be detached — the mapping "
+                   "will be released when it is collected");
+    munmap(m->addr, m->size);
+    m->addr = NULL;
+    return NULL;
+}
+
 // dmabufSync(fd, flags) — bracket CPU access (DMA_BUF_SYNC_* flags)
 static napi_value DmabufSync(napi_env env, napi_callback_info info) {
     GET_ARGS(env, info, 2);
@@ -3804,10 +4352,6 @@ static napi_value DmabufSync(napi_env env, napi_callback_info info) {
 
 #else // !HAVE_DMABUF
 
-#define NO_DMABUF                                                             \
-    "dma-buf is a Linux kernel facility with no " PLATFORM_NAME " equivalent" \
-    " (and XQuartz implements no DRI3 extension to receive one)"
-
 static napi_value UdmabufCreate(napi_env env, napi_callback_info info) {
     (void)info;
     THROW(env, "udmabufCreate: " NO_DMABUF);
@@ -3815,6 +4359,14 @@ static napi_value UdmabufCreate(napi_env env, napi_callback_info info) {
 static napi_value DmabufSync(napi_env env, napi_callback_info info) {
     (void)info;
     THROW(env, "dmabufSync: " NO_DMABUF);
+}
+static napi_value DmabufMap(napi_env env, napi_callback_info info) {
+    (void)info;
+    THROW(env, "dmabufMap: " NO_DMABUF);
+}
+static napi_value DmabufUnmap(napi_env env, napi_callback_info info) {
+    (void)info;
+    THROW(env, "dmabufUnmap: " NO_DMABUF);
 }
 
 #endif // HAVE_DMABUF
@@ -3878,6 +4430,10 @@ NAPI_MODULE_INIT() {
     EXPORT("dup", Dup);
     EXPORT("udmabufCreate", UdmabufCreate);
     EXPORT("dmabufSync", DmabufSync);
+    EXPORT("dmabufMap", DmabufMap);
+    EXPORT("dmabufUnmap", DmabufUnmap);
+    EXPORT("importDmabuf", ImportDmabuf);
+    EXPORT("destroyImportedImage", DestroyImportedImage);
 
     EXPORT("createGpu", CreateGpu);
     EXPORT("gpuInfo", GpuInfo);

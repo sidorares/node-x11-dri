@@ -300,7 +300,15 @@ const GL = {
     // GPU_DISJOINT_EXT has no other name: only the ES extension has it.
     TIME_ELAPSED: 0x88BF, TIMESTAMP: 0x8E28, QUERY_COUNTER_BITS: 0x8864,
     CURRENT_QUERY: 0x8865, QUERY_RESULT: 0x8866, QUERY_RESULT_AVAILABLE: 0x8867,
-    GPU_DISJOINT_EXT: 0x8FBB
+    GPU_DISJOINT_EXT: 0x8FBB,
+
+    // ---- imported dma-buf textures (features.dmabufImport) ----
+    // The second target importDmabuf can bind to, from GL_OES_EGL_image_external
+    // (features.externalTexture): what a YUV buffer usually has to be sampled
+    // as, with `samplerExternalOES` in GLSL rather than `sampler2D`.
+    TEXTURE_EXTERNAL_OES: 0x8D65, SAMPLER_EXTERNAL_OES: 0x8D66,
+    TEXTURE_BINDING_EXTERNAL_OES: 0x8D67,
+    REQUIRED_TEXTURE_IMAGE_UNITS_OES: 0x8D68
 };
 
 // WebGL-flavored view over the flat native functions ("gl.clearColor" etc).
@@ -336,7 +344,8 @@ const UNIFORM_SHAPE = {
     [GL.INT_SAMPLER_CUBE]: [1, 'i'], [GL.INT_SAMPLER_2D_ARRAY]: [1, 'i'],
     [GL.UNSIGNED_INT_SAMPLER_2D]: [1, 'i'], [GL.UNSIGNED_INT_SAMPLER_3D]: [1, 'i'],
     [GL.UNSIGNED_INT_SAMPLER_CUBE]: [1, 'i'],
-    [GL.UNSIGNED_INT_SAMPLER_2D_ARRAY]: [1, 'i']
+    [GL.UNSIGNED_INT_SAMPLER_2D_ARRAY]: [1, 'i'],
+    [GL.SAMPLER_EXTERNAL_OES]: [1, 'i']
 };
 
 // WebGL's getUniform(program, location). GL will write as many components as
@@ -381,8 +390,48 @@ function getSupportedExtensions() {
     return gl.getString(GL.EXTENSIONS).split(/\s+/).filter(Boolean);
 }
 
+// An EGLImage wrapping somebody else's dma-buf, with a texture pointed at
+// it. Obtained from `gl.importDmabuf` — there is no exported constructor.
+class ImportedImage {
+    constructor(res) {
+        this._handle = res.handle;
+        // Bind it like any other texture — with `target`, which is
+        // TEXTURE_2D unless the import asked for TEXTURE_EXTERNAL_OES.
+        this.texture = res.texture;
+        this.target = res.target;
+        this.width = res.width;
+        this.height = res.height;
+    }
+    // glDeleteTextures + eglDestroyImage. Needs the context the import was
+    // made in to be current, which is the same rule every other GL call
+    // here follows. Doing nothing is what happens after the second call, and
+    // after the context itself is gone.
+    destroy() {
+        native.destroyImportedImage(this._handle);
+    }
+}
+
+// Import a dma-buf as a texture: no copy, the GPU samples the buffer where
+// it already is. `opts` is { width, height, fourcc, modifier?, target?,
+// planes: [{ fd, stride, offset? }] } — which is the shape DRI3's
+// BuffersFromPixmap reply already has, so a redirected window's pixmap goes
+// straight in. The plane descriptors are consumed on success (dup() first to
+// keep a copy); a throw leaves them alone.
+//
+// `fourcc` is a DRM format code — dri.FORMAT.XRGB8888 for a depth-24 pixmap,
+// ARGB8888 for depth 32. `modifier` defaults to MODIFIER.INVALID, meaning
+// the implicit layout; anything else needs features.dmabufImportModifiers.
+//
+// Lives on `gl` rather than on `Gpu` because it is a context-current call
+// like the rest of `gl`, and so that anything which forwards the `gl`
+// namespace gets it for free.
+function importDmabuf(opts) {
+    return new ImportedImage(native.importDmabuf(opts));
+}
+
 gl.getUniform = getUniform;
 gl.getSupportedExtensions = getSupportedExtensions;
+gl.importDmabuf = importDmabuf;
 
 // ---- buffer layout constants ----
 const FORMAT = {
@@ -686,6 +735,33 @@ function createUdmabuf(size) {
     };
 }
 
+// The CPU half of the same import: map a dma-buf somebody else allocated,
+// which is what createUdmabuf already returns for memory this package
+// allocated itself. Returns { fd, size, writable, buffer (ArrayBuffer),
+// sync(flags), close() }.
+//
+// `size` defaults to the whole buffer. The fd is *not* consumed — the
+// returned object keeps using it for sync(), and the caller still owns it.
+// `writable` is false when the descriptor was exported read-only, which is
+// what some X servers do for DRI3 BufferFromPixmap.
+//
+// Only a dma-buf whose exporter implements mmap can be mapped: udmabuf and
+// linear GPU buffers can, tiled ones cannot and throw saying so — those have
+// to go through gl.importDmabuf instead.
+function mapDmabuf(fd, size) {
+    const res = native.dmabufMap(fd, size || 0);
+    return {
+        fd,
+        size: res.size,
+        writable: res.writable,
+        buffer: res.buffer,
+        sync(flags) { native.dmabufSync(fd, flags); },
+        // Hand the address space back now instead of at the next GC, and
+        // detach `buffer` so nothing can reach the unmapped pages.
+        close() { native.dmabufUnmap(res.handle, res.buffer); }
+    };
+}
+
 module.exports = {
     probe: native.probe,
     dup: native.dup,
@@ -693,6 +769,7 @@ module.exports = {
     Gpu,
     apple,
     createUdmabuf,
+    mapDmabuf,
     dmabufSync: native.dmabufSync,
     gl,
     GL,
