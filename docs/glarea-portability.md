@@ -47,7 +47,7 @@ The deep difference: DRI3 is *client-allocates, client-pushes* — Apple-DRI is
 | show a frame | `Present.Pixmap` (a request per frame) | `ctx.flush()` (CGLFlushDrawable — zero X traffic per frame) |
 | pacing signal | `PresentCompleteNotify` / `PresentIdleNotify` events | none from X — self-paced (timer; vsync via `setSwapInterval(1)` blocks) |
 | buffer recycling | swapchain generations, IdleNotify returns buffers | none — the surface *is* the window's backing store |
-| resize | new buffer generation at the new size | `ctx.update()`; the surface tracks the window |
+| resize | `surface.resize(w, h)` — one call; the swapchain is rebuilt at the new size and `generation` moves on | `ctx.update()`; the surface tracks the window |
 | move / clip change | nothing (buffers are position-free) | `AppleDRISurfaceNotify(kind=0)` → `ctx.update()` |
 | surface loss | n/a | `AppleDRISurfaceNotify(kind=1)` → `CreateSurface` + `attach` again |
 | child windows | yes (it's just a drawable) | **yes, verified** — server positions the surface at the child's offset in the top-level frame and shapes it by the child's clip region (`DRIUpdateSurface` in xorg-server `hw/xquartz/xpr/dri.c`) |
@@ -168,7 +168,7 @@ A sibling of `renderingcontext_gles.js` implementing the **same contract**
 | --- | --- | --- |
 | `backend` | `'direct'` | `'direct'` |
 | `gl.*` on the context | `_installGL()` copies `dri.gl` with a currency check | same, `_bind()` = `ctx.makeCurrent()` |
-| `makeCurrent()` | size check → maybe new generation → EGL make-current | CGL make-current; on size change also `ctx.update()` |
+| `makeCurrent()` | `surface.resize(w, h)` (a no-op at the same size) → EGL make-current | CGL make-current; on size change also `ctx.update()` |
 | `canRender()` | false while every buffer is with the server | **false until attached, and false while frame-throttled** (§4.4) |
 | `onFrameAvailable` | fires on IdleNotify | fires on attach completing, and on each pacing tick |
 | `SwapBuffers()` | swapchain.swap(): fd/pixmap/Present dance | `ctx.flush()`; return true |

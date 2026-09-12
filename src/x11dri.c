@@ -1319,12 +1319,21 @@ typedef struct {
     struct gbm_surface *gs;
     EGLSurface esurf;
     uint32_t width, height;
+    uint32_t use;        // the GBM_BO_USE mask it was made with; resize repeats it
+    // Bumped by every resize. A `key` is a GEM handle, which is unique only
+    // among the buffers of one swapchain: the kernel recycles a handle once
+    // its bo is freed, so a key from before a resize can name a different
+    // buffer after it. This is what a consumer namespaces its cache by.
+    uint32_t generation;
     struct { uint32_t key; struct gbm_bo *bo; } locked[MAX_LOCKED];
     int nlocked;
     int destroyed;
 } Surface;
 
 static int has_current = 0;
+// Which surface has_current is current *on* — resize needs to know whether to
+// put the context back afterwards, and nothing else in EGL will say.
+static Surface *current_surface = NULL;
 
 static void gpu_finalize(napi_env env, void *data, void *hint) {
     (void)env; (void)hint;
@@ -1350,6 +1359,7 @@ static void surface_finalize(napi_env env, void *data, void *hint) {
         if (s->esurf) egl.DestroySurface(s->gpu->dpy, s->esurf);
         if (s->gs) gbm.surface_destroy(s->gs);
     }
+    if (current_surface == s) current_surface = NULL;
     free(s);
 }
 
@@ -1528,6 +1538,7 @@ static napi_value CreateSurface(napi_env env, napi_callback_info info) {
     s->esurf = esurf;
     s->width = w;
     s->height = h;
+    s->use = use;
 
     napi_value ext;
     NAPI_CALL(env, napi_create_external(env, s, surface_finalize, NULL, &ext));
@@ -1543,9 +1554,12 @@ static napi_value MakeCurrent(napi_env env, napi_callback_info info) {
     napi_typeof(env, args[1], &t);
     Surface *s = NULL;
     if (t == napi_external && !get_external(env, args[1], (void **)&s)) return NULL;
+    if (s && s->destroyed)
+        THROW(env, "makeCurrent: this surface is destroyed");
     EGLSurface es = s ? s->esurf : NULL;
     if (!egl.MakeCurrent(g->dpy, es, es, s ? g->ctx : NULL))
         THROWF(env, "eglMakeCurrent failed (0x%x)", egl.GetError());
+    current_surface = s;
     if (s) {
         egl.SwapInterval(g->dpy, 0); // gbm surfaces have no vblank; Present paces us
         has_current = 1;
@@ -1571,6 +1585,8 @@ static napi_value SwapBuffers(napi_env env, napi_callback_info info) {
     Surface *s;
     if (!get_external(env, args[0], (void **)&g)) return NULL;
     if (!get_external(env, args[1], (void **)&s)) return NULL;
+    if (s->destroyed)
+        THROW(env, "swapBuffers: this surface is destroyed");
 
     if (s->nlocked >= MAX_LOCKED)
         THROW(env, "too many locked buffers — releaseBuffer() lost?");
@@ -1606,6 +1622,7 @@ static napi_value SwapBuffers(napi_env env, napi_callback_info info) {
     obj_set(env, obj, "isNew", mk_bool(env, is_new));
     obj_set(env, obj, "width", mk_u32(env, s->width));
     obj_set(env, obj, "height", mk_u32(env, s->height));
+    obj_set(env, obj, "generation", mk_u32(env, s->generation));
 
     if (is_new) {
         gbm.bo_set_user_data(bo, (void *)1, NULL);
@@ -1630,6 +1647,8 @@ static napi_value ReleaseBuffer(napi_env env, napi_callback_info info) {
     GET_ARGS(env, info, 2);
     Surface *s;
     if (!get_external(env, args[0], (void **)&s)) return NULL;
+    if (s->destroyed)
+        THROW(env, "releaseBuffer: this surface is destroyed");
     uint32_t key = arg_u32(env, args[1]);
     for (int i = 0; i < s->nlocked; i++) {
         if (s->locked[i].key == key) {
@@ -1639,6 +1658,78 @@ static napi_value ReleaseBuffer(napi_env env, napi_callback_info info) {
         }
     }
     THROWF(env, "releaseBuffer: no locked buffer with key %u", key);
+}
+
+// resizeSurface(surface, width, height) -> generation
+// Rebuild the swapchain at a new size in place: the caller keeps its handle,
+// the context keeps its GL objects, and only the buffers change. Resizing to
+// the size it already has does nothing at all (a drag can call this per
+// configure event and pay only for the sizes that differ).
+//
+// The new pair is built before the old one is torn down, so a driver that
+// refuses the size leaves the surface exactly as it was — an unusable surface
+// is the worst possible answer to a window that merely got bigger. It costs
+// nothing to overlap them: gbm allocates a surface's bos on demand at
+// lock-front-buffer time, not here.
+static napi_value ResizeSurface(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 3);
+    Surface *s;
+    if (!get_external(env, args[0], (void **)&s)) return NULL;
+    if (s->destroyed)
+        THROW(env, "resizeSurface: this surface is destroyed");
+    uint32_t w = arg_u32(env, args[1]);
+    uint32_t h = arg_u32(env, args[2]);
+    if (!w || !h)
+        THROWF(env, "resizeSurface: %ux%u is not a size a surface can have", w, h);
+    if (w == s->width && h == s->height)
+        return mk_u32(env, s->generation);
+
+    Gpu *g = s->gpu;
+    struct gbm_surface *gs = gbm.surface_create(g->gbm, w, h, g->format, s->use);
+    if (!gs)
+        THROWF(env, "resizeSurface: gbm_surface_create(%ux%u) failed (size or "
+                    "format refused by the driver) — the surface is unchanged", w, h);
+    EGLSurface esurf = egl.CreateWindowSurface(g->dpy, g->cfg, gs, NULL);
+    if (!esurf) {
+        EGLint ec = egl.GetError();
+        gbm.surface_destroy(gs);
+        THROWF(env, "resizeSurface: eglCreateWindowSurface failed (0x%x) — the "
+                    "surface is unchanged", ec);
+    }
+
+    // Past here the old swapchain goes. Unbind first: EGL keeps a current
+    // surface alive until something replaces it, and the point of the
+    // exercise is to stop paying for buffers of the old size. The locked
+    // buffers go with it — their pixels stay alive for whoever imported the
+    // dma-buf, which is what lets the consumer finish with them in its own
+    // time, but they are this surface's no longer.
+    int was_current = (current_surface == s);
+    if (was_current)
+        egl.MakeCurrent(g->dpy, NULL, NULL, NULL);
+    for (int i = 0; i < s->nlocked; i++)
+        gbm.surface_release_buffer(s->gs, s->locked[i].bo);
+    s->nlocked = 0;
+    egl.DestroySurface(g->dpy, s->esurf);
+    gbm.surface_destroy(s->gs);
+
+    s->gs = gs;
+    s->esurf = esurf;
+    s->width = w;
+    s->height = h;
+    s->generation++;
+
+    if (was_current) {
+        if (!egl.MakeCurrent(g->dpy, esurf, esurf, g->ctx)) {
+            EGLint ec = egl.GetError();
+            has_current = 0;
+            current_surface = NULL;
+            THROWF(env, "resizeSurface: the new swapchain is up but "
+                        "eglMakeCurrent on it failed (0x%x) — no context is "
+                        "current now", ec);
+        }
+        egl.SwapInterval(g->dpy, 0);
+    }
+    return mk_u32(env, s->generation);
 }
 
 // destroySurface(surface) — all locked buffers are released first
@@ -1652,6 +1743,9 @@ static napi_value DestroySurface(napi_env env, napi_callback_info info) {
         s->nlocked = 0;
         egl.DestroySurface(s->gpu->dpy, s->esurf);
         gbm.surface_destroy(s->gs);
+        s->esurf = NULL;
+        s->gs = NULL;
+        if (current_surface == s) current_surface = NULL;
         s->destroyed = 1;
     }
     return NULL;
@@ -1665,6 +1759,7 @@ static napi_value DestroyGpu(napi_env env, napi_callback_info info) {
     if (!g->destroyed) {
         egl.MakeCurrent(g->dpy, NULL, NULL, NULL);
         has_current = 0;
+        current_surface = NULL;
         if (optional_ctx == g->ctx)
             optional_ctx = NULL; // a later context could land on this address
         sync_forget_context(g->ctx);
@@ -4342,6 +4437,7 @@ NAPI_MODULE_INIT() {
     EXPORT("makeCurrent", MakeCurrent);
     EXPORT("swapBuffers", SwapBuffers);
     EXPORT("releaseBuffer", ReleaseBuffer);
+    EXPORT("resizeSurface", ResizeSurface);
     EXPORT("destroySurface", DestroySurface);
     EXPORT("destroyGpu", DestroyGpu);
 

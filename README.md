@@ -11,7 +11,8 @@ fills exactly that hole:
 - **`Gpu` / `Surface`** — an OpenGL ES 2.0 or 3.0 rendering context on a DRM render
   node (GBM + EGL) whose finished frames are exportable as dma-buf fds:
   render → `swap()` → `{fd, stride, modifier}` → `DRI3.PixmapFromBuffer` →
-  `Present.Pixmap`. (Linux)
+  `Present.Pixmap`, with a swapchain that resizes in place with the window.
+  (Linux)
 - **`apple.Context`** — on macOS, the client half of XQuartz's `Apple-DRI`
   direct rendering: import the WindowServer surface the X server exported
   for a window and bind a real-GPU CGL context to it, driven by the same
@@ -102,16 +103,66 @@ gpu.makeCurrent(surface);                 //   dri.GBM_USE.LINEAR for
 const gl = gpu.gl;                        // clearColor, shaders, drawElements…
 // ... draw ...
 const out = surface.swap();
-// out: { key, isNew, width, height } and, the first time a buffer appears,
-//      { fd, stride, offset, modifier (BigInt) } — hand fd to
-//      DRI3.PixmapFromBuffer (it is consumed), cache pixmap by out.key.
+// out: { key, generation, isNew, width, height } and, the first time a buffer
+//      appears, { fd, stride, offset, modifier (BigInt) } — hand fd to
+//      DRI3.PixmapFromBuffer (it is consumed), cache the pixmap by
+//      out.generation + out.key (see below).
 // out === null: every buffer still held — wait for PresentIdleNotify.
-surface.release(out.key);                 // when PresentIdleNotify says so
+surface.release(out);                     // when PresentIdleNotify says so
+surface.resize(w2, h2);                   // window resized: same Surface, new
+                                          //   swapchain, generation moves on
 surface.destroy(); gpu.destroy();
 ```
 
 One EGL context per `Gpu`, one thread, GL calls valid between `makeCurrent`
 and `destroy` — deliberately no more machinery than a renderer needs.
+
+### Resizing, and what a `key` is unique within
+
+A window that resizes does not need a new surface:
+
+```js
+surface.resize(width, height);   // the same Surface, a new swapchain
+surface.generation;              // 0, 1, 2, … — every resize moves it on
+```
+
+The handle stays valid, the context keeps its GL objects and stays current if
+it was, the buffers still locked are released, and the next `swap()` reports a
+fresh set — every one of them `isNew`, with a new dma-buf fd to import.
+Resizing to the size it already has does nothing at all, so a drag can call
+this on every `ConfigureNotify` and pay only for the sizes that differ. What
+it will not do is decide *when*: rounding the window size up to a granularity,
+so that a continuous drag reallocates a handful of times instead of once per
+frame, is policy, and policy belongs to the caller — this is the mechanism
+under it.
+
+`generation` is the other half, and it earns its place whether or not anything
+ever resizes. `key` is a GEM handle: per-DRM-fd, and recycled as soon as the
+buffer behind it is freed. It is unique among the buffers of **one** swapchain
+and no further. Here is the same driver handing the same handle to a buffer of
+a different size two resizes later:
+
+| generation | size | key | stride |
+| --- | --- | --- | --- |
+| 0 | 64×64 | 1 | 256 |
+| 1 | 128×96 | 3 | 512 |
+| 2 | 256×192 | **1** | 1024 |
+
+So key the pixmap cache by the pair, and give the swap result itself back to
+`release()` rather than the bare key:
+
+```js
+const out = surface.swap();
+cache.set(`${out.generation}:${out.key}`, pixmap);   // not out.key alone
+...
+surface.release(out);   // false, and harmless, if a resize got there first
+```
+
+A late `release(out.key)` — an `IdleNotify` for a buffer of the swapchain that
+just went away — would free whichever live buffer inherited that handle.
+`release(out)` reads the generation off the result, sees it is not the current
+one, and answers `false` instead. The pixmaps of a generation you have left
+behind are yours to free: the buffers under them are already gone.
 
 ### TypeScript
 

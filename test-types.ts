@@ -90,6 +90,7 @@ if (features?.instancedArrays)
 const out: SwapResult | null = surface.swap();
 if (out) {
     const key: number = out.key;
+    const bornIn: number = out.generation;
     // @ts-expect-error — fd is only there when isNew
     const bad: number = out.fd;
     if (out.isNew) {
@@ -97,8 +98,24 @@ if (out) {
         const stride: number = out.stride;
         const modifier: bigint = out.modifier;
     }
+    // the result itself is the safe thing to hand back — it carries the
+    // generation its key is unique within
+    const releasedIt: boolean = surface.release(out);
     surface.release(out.key);
+    // @ts-expect-error — an object has to say which generation the key is from
+    surface.release({ key: out.key });
 }
+
+// ---- resize keeps the surface and moves the generation ---------------------
+
+surface.resize(512, 384);
+const generation: number = surface.generation;
+const sized: number = surface.width + surface.height;
+
+// @ts-expect-error — both dimensions, or neither
+surface.resize(512);
+// @ts-expect-error — the surface bumps this, nobody else
+surface.generation = 7;
 
 // ---- drawing ---------------------------------------------------------------
 

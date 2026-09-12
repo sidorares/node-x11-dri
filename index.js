@@ -496,12 +496,19 @@ class Surface {
     constructor(gpu, handle, width, height) {
         this._gpu = gpu;
         this._handle = handle;
-        this.width = width;
-        this.height = height;
+        // as the addon saw them (uint32), so they cannot disagree with swap()
+        this.width = width >>> 0;
+        this.height = height >>> 0;
+        // Bumped by every resize that changes the size. `key` is a GEM
+        // handle, unique only among the buffers of one swapchain — the kernel
+        // recycles a handle once its buffer is freed, so a key from before a
+        // resize can name a different buffer after it. Namespace caches by
+        // the pair.
+        this.generation = 0;
     }
-    // Finish the frame; returns { key, isNew, width, height, fd?, stride?,
-    // offset?, modifier? }. The buffer stays owned by the caller until
-    // release(key) — release it when Present says IdleNotify.
+    // Finish the frame; returns { key, generation, isNew, width, height, fd?,
+    // stride?, offset?, modifier? }. The buffer stays owned by the caller
+    // until release() — release it when Present says IdleNotify.
     //
     // Returns null when every buffer of the surface is still unreleased (the
     // GPU has nothing to render the next frame into): wait for a release,
@@ -510,8 +517,43 @@ class Surface {
     swap() {
         return native.swapBuffers(this._gpu._handle, this._handle);
     }
-    release(key) {
-        native.releaseBuffer(this._handle, key);
+    // Give a buffer back to the swapchain. Takes the swap() result itself (or
+    // anything carrying its key and generation), which is the form to use
+    // when the surface can resize: a release that names an older generation
+    // is ignored rather than freeing whichever live buffer inherited that GEM
+    // handle. Answers whether a buffer was released.
+    //
+    // A bare key is still accepted, and is then trusted — there is nothing to
+    // check it against.
+    release(ref) {
+        if (typeof ref === 'number') {
+            native.releaseBuffer(this._handle, ref);
+            return true;
+        }
+        if (!ref || typeof ref.key !== 'number' || typeof ref.generation !== 'number')
+            throw new TypeError('release() takes a swap() result, or its key');
+        if (ref.generation !== this.generation)
+            return false; // a buffer of the swapchain a resize replaced
+        native.releaseBuffer(this._handle, ref.key);
+        return true;
+    }
+    // Rebuild the swapchain at a new size, keeping this surface's identity:
+    // the handle stays valid, the context keeps its GL objects and stays
+    // current if it was, and only the buffers change. Every buffer locked at
+    // the time is released (their pixels live on for whoever imported the
+    // dma-buf, but this surface is done with them), `generation` moves on,
+    // and the next swap() reports a fresh set with isNew set.
+    //
+    // Resizing to the size it already has does nothing — no teardown, no
+    // generation bump — so a drag can call this per configure event and pay
+    // only for the sizes that actually differ. Any rounding policy (allocate
+    // in steps, never shrink) belongs to the caller; this is the mechanism.
+    //
+    // Throws without touching the surface when the driver refuses the size.
+    resize(width, height) {
+        this.generation = native.resizeSurface(this._handle, width, height);
+        this.width = width >>> 0;
+        this.height = height >>> 0;
     }
     destroy() {
         native.destroySurface(this._handle);
