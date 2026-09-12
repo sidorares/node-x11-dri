@@ -1231,6 +1231,11 @@ static void sync_forget_context(void *ctx) {
             sync_slots[i] = (SyncSlot){ NULL, NULL };
 }
 
+// The same question for the other kind of context-owned handle: an imported
+// dma-buf's texture and EGLImage. Defined with the importer far below, and
+// called from the two teardown paths just after this.
+static void imports_forget_context(void *ctx);
+
 // ---------------------------------------------------------------------------
 // dma-buf import (EGL_EXT_image_dma_buf_import)
 //
@@ -1342,6 +1347,7 @@ static void gpu_finalize(napi_env env, void *data, void *hint) {
         // JS forgot destroy(); release what we can without touching EGL
         // current state (finalizers can run late in teardown).
         sync_forget_context(g->ctx);
+        imports_forget_context(g->ctx);
         if (g->ctx) egl.DestroyContext(g->dpy, g->ctx);
         if (g->dpy) egl.Terminate(g->dpy);
         if (g->gbm) gbm.device_destroy(g->gbm);
@@ -1763,6 +1769,7 @@ static napi_value DestroyGpu(napi_env env, napi_callback_info info) {
         if (optional_ctx == g->ctx)
             optional_ctx = NULL; // a later context could land on this address
         sync_forget_context(g->ctx);
+        imports_forget_context(g->ctx);
         if (img.dpy == g->dpy)
             resolve_egl_image(NULL); // same, for the display
         egl.DestroyContext(g->dpy, g->ctx);
@@ -3388,31 +3395,64 @@ static napi_value GlFeatures(napi_env env, napi_callback_info info) {
 // untouched on failure, so the caller can report or retry.
 // ---------------------------------------------------------------------------
 
-typedef struct {
-    EGLDisplay dpy;
+typedef struct Import {
+    struct Import *next; // the live list, so a dying Gpu can void its own
+    EGLDisplay dpy;      // NULL once the display has been terminated
+    void *ctx;           // the context that issued the texture name
     EGLImageKHR image;
     GLuint texture;
     GLenum target;
     int destroyed;
 } Import;
 
-static void import_release(Import *im) {
+static Import *imports;
+
+// Let go of one import and take it off the live list. The two objects have
+// different owners, so they are released on different conditions:
+//
+//   - the texture is a *name*, and a name means nothing outside the context
+//     that issued it: deleting one while another context is current deletes
+//     whatever *that* context happens to call by the same number. So it goes
+//     only when `ctx_current` says its own context is the current one.
+//   - the image belongs to the display, not to any context, so it needs
+//     nothing current — only a display that is still initialized, which is
+//     what a NULL `dpy` records the end of.
+static void import_release(Import *im, int ctx_current) {
     if (im->destroyed)
         return;
-    // The texture belongs to a context, so drop it only while one is current
-    // (a finalizer can run after teardown); the image belongs to the display
-    // alone, and eglDestroyImageKHR needs nothing current.
-    if (im->texture && has_current)
-        gl.DeleteTextures(1, &im->texture);
-    if (im->image && egl.DestroyImageKHR)
-        egl.DestroyImageKHR(im->dpy, im->image);
     im->destroyed = 1;
+    if (ctx_current && im->texture)
+        gl.DeleteTextures(1, &im->texture);
+    if (im->dpy && im->image && egl.DestroyImageKHR)
+        egl.DestroyImageKHR(im->dpy, im->image);
+    for (Import **p = &imports; *p; p = &(*p)->next)
+        if (*p == im) {
+            *p = im->next;
+            break;
+        }
+}
+
+// A Gpu is going: eglTerminate frees every image on its display and the
+// context takes its texture names with it, so neither may be touched again.
+static void imports_forget_context(void *ctx) {
+    for (Import *im = imports, *next; im; im = next) {
+        next = im->next;
+        if (im->ctx == ctx) {
+            im->dpy = NULL;
+            im->texture = 0;
+            import_release(im, 0);
+        }
+    }
 }
 
 static void import_finalize(napi_env env, void *data, void *hint) {
     (void)env; (void)hint;
-    import_release(data);
-    free(data);
+    Import *im = data;
+    // JS forgot destroy(). A finalizer cannot make a context current, so the
+    // texture goes only if its context happens to be current already;
+    // otherwise it goes when that context does.
+    import_release(im, im->ctx == optional_ctx && has_current);
+    free(im);
 }
 
 // One of the three parallel plane arrays, which JS has already checked are
@@ -3568,10 +3608,18 @@ static napi_value ImportDmabuf(napi_env env, napi_callback_info info) {
     }
 
     Import *im = calloc(1, sizeof(Import));
+    if (!im) {
+        gl.DeleteTextures(1, &tex);
+        egl.DestroyImageKHR(img.dpy, image);
+        THROW(env, "importDmabuf: out of memory");
+    }
     im->dpy = img.dpy;
+    im->ctx = optional_ctx;
     im->image = image;
     im->texture = tex;
     im->target = target;
+    im->next = imports;
+    imports = im;
 
     napi_value obj, ext;
     NAPI_CALL(env, napi_create_object(env, &obj));
@@ -3582,12 +3630,21 @@ static napi_value ImportDmabuf(napi_env env, napi_callback_info info) {
     return obj;
 }
 
-// destroyImportedImage(handle) — glDeleteTextures + eglDestroyImageKHR
+// destroyImportedImage(handle) — glDeleteTextures + eglDestroyImageKHR.
+// Idempotent, and already done once the Gpu that owned the objects is gone.
 static napi_value DestroyImportedImage(napi_env env, napi_callback_info info) {
     GET_ARGS(env, info, 1);
     Import *im;
     if (!get_external(env, args[0], (void **)&im)) return NULL;
-    import_release(im);
+    if (im->destroyed)
+        return NULL;
+    // Refuse rather than delete a texture name belonging to whichever context
+    // is current instead — the same rule a fenceSync handle already follows.
+    if (im->ctx != optional_ctx || !has_current)
+        THROW(env, "destroy(): the context this image was imported into is not "
+                   "current, and its texture name means something else in the "
+                   "one that is — makeCurrent it first");
+    import_release(im, 1);
     return NULL;
 }
 
@@ -4280,7 +4337,7 @@ static void mapping_ext_finalize(napi_env env, void *data, void *hint) {
     mapping_unref(data);
 }
 
-// mapDmabuf(fd, size) -> { handle, buffer, size }
+// mapDmabuf(fd, size) -> { handle, buffer, size, writable }
 // The CPU side of a descriptor that arrived from elsewhere: DRI3
 // BufferFromPixmap, or the udmabuf another process made. The fd is only
 // read, never taken — the caller still owns it and can still send it on.
@@ -4295,7 +4352,19 @@ static napi_value MapDmabuf(napi_env env, napi_callback_info info) {
         THROW(env, "mapDmabuf: size must be a positive number of bytes");
     size_t len = (size_t)want;
 
+    // A dma-buf descriptor carries an access mode like any other fd, and a
+    // read-only one is common: DRM_RDWR is opt-in when a buffer is exported,
+    // and a server handing out BufferFromPixmap need not pass it — as
+    // gbm_bo_get_fd does not. PROT_WRITE on such a descriptor is EACCES, so
+    // the read-only mapping is tried before giving up, and `writable` says
+    // which one this is. Writing through a read-only mapping would fault,
+    // and finding that out from a segfault is no way to find it out.
+    int writable = 1;
     void *addr = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (addr == MAP_FAILED && (errno == EACCES || errno == EPERM)) {
+        writable = 0;
+        addr = mmap(NULL, len, PROT_READ, MAP_SHARED, fd, 0);
+    }
     if (addr == MAP_FAILED)
         THROWF(env, "mmap of dma-buf failed: %s (not every exporter implements "
                     "mmap — tiled GPU buffers generally do not)", strerror(errno));
@@ -4312,6 +4381,7 @@ static napi_value MapDmabuf(napi_env env, napi_callback_info info) {
     NAPI_CALL(env, napi_create_external(env, m, mapping_ext_finalize, NULL, &ext));
     obj_set(env, obj, "handle", ext);
     obj_set(env, obj, "buffer", ab);
+    obj_set(env, obj, "writable", mk_bool(env, writable));
     napi_value size_v; // a foreign buffer can be larger than a uint32 holds
     NAPI_CALL(env, napi_create_double(env, (double)len, &size_v));
     obj_set(env, obj, "size", size_v);

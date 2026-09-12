@@ -832,6 +832,10 @@ function mapDmabuf(fd, size) {
     return {
         buffer: res.buffer,
         size: res.size,
+        // False when the descriptor was exported read-only — a dma-buf fd
+        // carries an access mode, and DRM_RDWR is opt-in. Writing through
+        // the mapping would fault.
+        writable: res.writable,
         sync(flags) { native.dmabufSync(fd, flags); },
         // Releases the mapping now rather than at the next GC, and detaches
         // `buffer` so nothing can read through it afterwards.

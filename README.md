@@ -518,7 +518,7 @@ The plane shape is exactly what `BuffersFromPixmap` replies with, and exactly
 what `PixmapFromBuffers` takes, because it is the same description of the same
 buffer travelling the other way.
 
-Three things worth knowing:
+Four things worth knowing:
 
 - **The descriptors are consumed.** On success `importDmabuf` closes them,
   the same ownership rule DRI3's fd-carrying requests and `swap()`'s exported
@@ -538,17 +538,30 @@ Three things worth knowing:
   `probe()` cannot answer these — they are extensions of an *initialized* EGL
   display, and `probe()` opens no devices — so it returns a string saying to
   read `features` after `makeCurrent()` instead.
+- **`destroy()` belongs to the importing context.** A texture name means
+  something else in every other context, so destroying an image while a
+  different `Gpu` is current throws rather than deleting whatever *that*
+  context happens to call by the same number — `makeCurrent` the right one
+  first. Destroying the `Gpu` takes its images with it, so a `destroy()`
+  after that does nothing, as does a second one.
 
 `examples/dmabuf-import.js` renders both sides of that: one udmabuf shown
 twice, imported on the left and mapped-then-uploaded on the right.
 
 For a buffer the CPU should read rather than the GPU, `mapDmabuf(fd, size?)`
-returns `{ buffer, size, sync(flags), close() }` — the same shape
+returns `{ buffer, size, writable, sync(flags), close() }` — the same shape
 `createUdmabuf` returns, minus the allocation. The descriptor is *borrowed*
 there, not consumed: it stays yours to send on. Only exporters that implement
 mmap can be mapped at all (udmabuf and linear/dumb buffers do, tiled GPU
 allocations generally do not), and `close()` releases the mapping at once
 rather than waiting for the collector.
+
+`writable` is the one to check before writing through `buffer`. A dma-buf
+descriptor carries an access mode like any other fd, and a read-only one is
+ordinary rather than exotic: `DRM_RDWR` is opt-in when a buffer is exported,
+and `gbm_bo_get_fd` does not pass it — so even this package's own `swap()`
+descriptor maps read-only on most drivers. Mapping still succeeds, for
+reading; it is writing through such a mapping that faults.
 
 ### Still not covered
 
