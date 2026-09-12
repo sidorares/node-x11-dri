@@ -612,14 +612,32 @@ class Gpu {
         // arranged afterwards: a default framebuffer with no stencil bits
         // passes every stencil test for good. stencilSize defaults to 0 —
         // ask for 8 to stencil-then-cover a vector path.
-        this._handle = native.createGpu(this._fd, this.format,
-            opts.depthSize != null ? opts.depthSize : 16,
-            opts.stencilSize != null ? opts.stencilSize : 0, wantEs);
-        // adds eglVendor, eglVersion, contextVersion (the ES version EGL was
-        // asked for and granted — see glVersion after makeCurrent for what
-        // the driver actually gave), and depthSize/stencilSize, the bits the
-        // chosen config actually carries rather than the ones requested
-        Object.assign(this, native.gpuInfo(this._handle));
+        //
+        // A refused glVersion, a negative bit count, no gbm/EGL/GLES to
+        // load, no config for what was asked — every one of them throws
+        // with the render node already open and no object left for the
+        // caller to destroy(), so the fd has to go back here. An opts.fd
+        // belongs to the caller either way.
+        try {
+            this._handle = native.createGpu(this._fd, this.format,
+                opts.depthSize != null ? opts.depthSize : 16,
+                opts.stencilSize != null ? opts.stencilSize : 0, wantEs);
+            // adds eglVendor, eglVersion, contextVersion (the ES version EGL was
+            // asked for and granted — see glVersion after makeCurrent for what
+            // the driver actually gave), and depthSize/stencilSize, the bits the
+            // chosen config actually carries rather than the ones requested
+            Object.assign(this, native.gpuInfo(this._handle));
+        } catch (e) {
+            // a context that was made but never became usable goes back now
+            // rather than at the finalizer
+            if (this._handle) {
+                try { native.destroyGpu(this._handle); } catch { /* ignore */ }
+            }
+            if (this._ownFd) {
+                try { fs.closeSync(this._fd); } catch { /* ignore */ }
+            }
+            throw e;
+        }
         this.gl = gl;
     }
     // useFlags: GBM_USE mask; RENDERING is implied. Pass GBM_USE.LINEAR when

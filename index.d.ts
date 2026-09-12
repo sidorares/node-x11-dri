@@ -283,7 +283,12 @@ export interface Udmabuf {
 export interface GpuOptions {
     /** A specific render node. Defaults to the first of `listRenderNodes()`. */
     devicePath?: string;
-    /** An already-open DRM fd to use instead of opening a render node. */
+    /**
+     * An already-open DRM fd to use instead of opening a render node. It
+     * stays the caller's: `destroy()` does not close it, and neither does a
+     * constructor that throws. A node opened from `devicePath` is closed on
+     * both paths.
+     */
     fd?: number;
     /** A `FORMAT` value; must match the depth of the window it will feed. */
     format?: number;
