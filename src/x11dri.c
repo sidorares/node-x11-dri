@@ -244,6 +244,8 @@ typedef char GLchar;
 typedef intptr_t GLintptr;
 typedef intptr_t GLsizeiptr;
 typedef uint32_t GLbitfield;
+typedef uint64_t GLuint64;
+typedef void *GLsync; // a pointer (struct __GLsync * in gl3.h), not a name
 
 #if defined(__APPLE__)
 // ---------------------------------------------------------------------------
@@ -399,6 +401,9 @@ static struct {
     void (*StencilOp)(GLenum, GLenum, GLenum);
     void (*StencilMask)(GLuint);
     void (*ClearStencil)(GLint);
+    void (*StencilFuncSeparate)(GLenum, GLenum, GLint, GLuint);
+    void (*StencilOpSeparate)(GLenum, GLenum, GLenum, GLenum);
+    void (*StencilMaskSeparate)(GLenum, GLuint);
     // the rest of the uniform setters
     void (*Uniform2f)(GLint, GLfloat, GLfloat);
     void (*Uniform2i)(GLint, GLint, GLint);
@@ -479,6 +484,28 @@ static struct {
     void (*FramebufferTextureLayer)(GLenum, GLenum, GLuint, GLint, GLint);
     void (*TexStorage2D)(GLenum, GLsizei, GLenum, GLsizei, GLsizei);
     void (*TexStorage3D)(GLenum, GLsizei, GLenum, GLsizei, GLsizei, GLsizei);
+    // multisampled renderbuffers, the blit that resolves them, and the read
+    // buffer a blit (or readPixels) takes its pixels from
+    void (*RenderbufferStorageMultisample)(GLenum, GLsizei, GLenum, GLsizei, GLsizei);
+    void (*BlitFramebuffer)(GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint,
+                            GLbitfield, GLenum);
+    void (*ReadBuffer)(GLenum);
+    // sync objects
+    GLsync (*FenceSync)(GLenum, GLbitfield);
+    GLenum (*ClientWaitSync)(GLsync, GLbitfield, GLuint64);
+    void (*WaitSync)(GLsync, GLbitfield, GLuint64);
+    void (*DeleteSync)(GLsync);
+    void (*GetSynciv)(GLsync, GLenum, GLsizei, GLsizei *, GLint *);
+    // query objects, for the GPU timers
+    void (*GenQueries)(GLsizei, GLuint *);
+    void (*DeleteQueries)(GLsizei, const GLuint *);
+    GLboolean (*IsQuery)(GLuint);
+    void (*BeginQuery)(GLenum, GLuint);
+    void (*EndQuery)(GLenum);
+    void (*GetQueryiv)(GLenum, GLenum, GLint *);
+    void (*GetQueryObjectuiv)(GLuint, GLenum, GLuint *);
+    void (*GetQueryObjectui64v)(GLuint, GLenum, GLuint64 *);
+    void (*QueryCounter)(GLuint, GLenum);
 } gl;
 
 #if defined(__APPLE__)
@@ -665,6 +692,9 @@ static const char *fill_gl_table(void *h) {
     S(PolygonOffset, "glPolygonOffset");
     S(StencilFunc, "glStencilFunc"); S(StencilOp, "glStencilOp");
     S(StencilMask, "glStencilMask"); S(ClearStencil, "glClearStencil");
+    S(StencilFuncSeparate, "glStencilFuncSeparate");
+    S(StencilOpSeparate, "glStencilOpSeparate");
+    S(StencilMaskSeparate, "glStencilMaskSeparate");
     S(Uniform2f, "glUniform2f"); S(Uniform2i, "glUniform2i");
     S(Uniform3i, "glUniform3i"); S(Uniform4i, "glUniform4i");
     S(Uniform1fv, "glUniform1fv"); S(Uniform2fv, "glUniform2fv");
@@ -843,14 +873,34 @@ typedef struct {
     const char *ext; // NULL means the core spelling, which needs ES 3.0 —
                      // or, on desktop GL (the macOS CGL path), `desk`
     int desk;        // ×10 desktop version the core spelling appeared in;
-                     // 0 = ES only, never satisfied by a desktop version
+                     // 0 = ES only, never satisfied by a desktop version;
+                     // DESKTOP_ONLY(v) = that version and never ES
 } GlCandidate;
+
+// For a core spelling that never entered ES at all: ES has only an
+// extension's suffixed name for it, and eglGetProcAddress may answer for any
+// name whatever, so the ES 3.0 rule must not admit it.
+#define DESKTOP_ONLY(v) (-(v))
 
 typedef struct {
     void **slot;
     const char *feature; // the name this is reported and complained about under
     GlCandidate cand[4];
 } GlOptional;
+
+// Fences: core in ES 3.0 and desktop 3.2, ARB_sync on the 2.1 legacy
+// profile, APPLE_sync on the ES 2.0 drivers that have one.
+#define SYNC_FN(field, name)                                                  \
+    { (void **)&gl.field, "sync", {                                           \
+        { name, NULL, 32 },                                                   \
+        { name, "GL_ARB_sync", 0 },                                           \
+        { name "APPLE", "GL_APPLE_sync", 0 } } }
+// Query objects: core since desktop 1.5 and ES 3.0, and on ES 2.0 the same
+// names suffixed, from the timer extension itself.
+#define QUERY_FN(field, name)                                                 \
+    { (void **)&gl.field, "timerQuery", {                                     \
+        { name, NULL, 15 },                                                   \
+        { name "EXT", "GL_EXT_disjoint_timer_query", 0 } } }
 
 static const GlOptional gl_optional[] = {
     { (void **)&gl.GenVertexArrays, "vertexArrayObject", {
@@ -913,8 +963,60 @@ static const GlOptional gl_optional[] = {
     { (void **)&gl.TexStorage3D, "textureStorage", {
         { "glTexStorage3D", NULL, 42 },
         { "glTexStorage3D", "GL_ARB_texture_storage", 0 },
-        { "glTexStorage3DEXT", "GL_EXT_texture_storage", 0 } } }
+        { "glTexStorage3DEXT", "GL_EXT_texture_storage", 0 } } },
+    // A multisampled renderbuffer cannot be read or sampled until a blit has
+    // resolved it, so the two make one feature. Core in ES 3.0 and desktop
+    // 3.0, ARB_framebuffer_object on the 2.1 legacy profile, and a vendor
+    // pair on ES 2.0 drivers (ANGLE's blit refuses to scale; a resolve never
+    // does).
+    { (void **)&gl.RenderbufferStorageMultisample, "multisample", {
+        { "glRenderbufferStorageMultisample", NULL, 30 },
+        { "glRenderbufferStorageMultisample", "GL_ARB_framebuffer_object", 0 },
+        { "glRenderbufferStorageMultisampleANGLE", "GL_ANGLE_framebuffer_multisample", 0 },
+        { "glRenderbufferStorageMultisampleNV", "GL_NV_framebuffer_multisample", 0 } } },
+    { (void **)&gl.BlitFramebuffer, "multisample", {
+        { "glBlitFramebuffer", NULL, 30 },
+        { "glBlitFramebuffer", "GL_ARB_framebuffer_object", 0 },
+        { "glBlitFramebufferANGLE", "GL_ANGLE_framebuffer_blit", 0 },
+        { "glBlitFramebufferNV", "GL_NV_framebuffer_blit", 0 } } },
+    // Desktop GL has had it since 1.0; ES 2.0 reads one colour attachment
+    // and so has nothing to choose between.
+    { (void **)&gl.ReadBuffer, "readBuffer", {
+        { "glReadBuffer", NULL, 10 },
+        { "glReadBufferNV", "GL_NV_read_buffer", 0 } } },
+    SYNC_FN(FenceSync, "glFenceSync"),
+    SYNC_FN(ClientWaitSync, "glClientWaitSync"),
+    SYNC_FN(WaitSync, "glWaitSync"),
+    SYNC_FN(DeleteSync, "glDeleteSync"),
+    SYNC_FN(GetSynciv, "glGetSynciv"),
+    QUERY_FN(GenQueries, "glGenQueries"),
+    QUERY_FN(DeleteQueries, "glDeleteQueries"),
+    QUERY_FN(IsQuery, "glIsQuery"),
+    QUERY_FN(BeginQuery, "glBeginQuery"),
+    QUERY_FN(EndQuery, "glEndQuery"),
+    QUERY_FN(GetQueryiv, "glGetQueryiv"),
+    QUERY_FN(GetQueryObjectuiv, "glGetQueryObjectuiv"),
+    // ES 3.0 made query objects core but gave them no timer: TIME_ELAPSED is
+    // an ES target only through GL_EXT_disjoint_timer_query, and this 64-bit
+    // getter has no core ES spelling at all. So it is this entry that
+    // decides `timerQuery` — the ones above resolve on any ES 3.0 driver,
+    // timer or no. Desktop timers are core in 3.3; the 2.1 legacy profile
+    // has EXT_timer_query.
+    { (void **)&gl.GetQueryObjectui64v, "timerQuery", {
+        { "glGetQueryObjectui64v", NULL, DESKTOP_ONLY(33) },
+        { "glGetQueryObjectui64v", "GL_ARB_timer_query", 0 },
+        { "glGetQueryObjectui64vEXT", "GL_EXT_disjoint_timer_query", 0 },
+        { "glGetQueryObjectui64vEXT", "GL_EXT_timer_query", 0 } } },
+    // A timestamp in the command stream came with ARB_timer_query. The older
+    // EXT_timer_query, all the legacy profile has, times spans only — hence
+    // a feature of its own.
+    { (void **)&gl.QueryCounter, "timestampQuery", {
+        { "glQueryCounter", NULL, DESKTOP_ONLY(33) },
+        { "glQueryCounter", "GL_ARB_timer_query", 0 },
+        { "glQueryCounterEXT", "GL_EXT_disjoint_timer_query", 0 } } }
 };
+#undef SYNC_FN
+#undef QUERY_FN
 
 // GL's extension string is space-separated, and one name can be a prefix of
 // another (GL_EXT_draw_buffers / GL_EXT_draw_buffers_indexed), so match on
@@ -930,8 +1032,15 @@ static int has_gl_ext(const char *list, const char *want) {
 
 // Which context the table was last resolved against, so switching contexts
 // re-resolves and destroying one forces it. (EGLContext and CGLContextObj are
-// both opaque pointers, so the one slot serves either backend.)
+// both opaque pointers, so the one slot serves either backend.) While a
+// context is current this is that context, which is also how the sync
+// object table below tells whose a fence is.
 static EGLContext optional_ctx;
+
+// Whether that context has GL_EXT_disjoint_timer_query: the one place GL
+// reports that a timer reading cannot be trusted (GPU_DISJOINT_EXT, in
+// getParameter).
+static int disjoint_timer;
 
 // A core-profile desktop context (the macOS path) answers NULL +
 // INVALID_ENUM to GetString(GL_EXTENSIONS); the modern replacement is one
@@ -1006,10 +1115,11 @@ static void resolve_optional_gl(EGLContext ctx) {
         const GlOptional *o = &gl_optional[i];
         *o->slot = NULL;
         for (int c = 0; c < 4 && o->cand[c].name; c++) {
+            int need = o->cand[c].desk < 0 ? -o->cand[c].desk : o->cand[c].desk;
             if (o->cand[c].ext
                     ? !has_gl_ext(exts, o->cand[c].ext)
-                    : (desk ? (!o->cand[c].desk || desk < o->cand[c].desk)
-                            : es_major < 3))
+                    : (desk ? (!need || desk < need)
+                            : (es_major < 3 || o->cand[c].desk < 0)))
                 continue;
             void *fn = gl.lib ? dlsym(gl.lib, o->cand[c].name) : NULL;
             if (!fn && egl.GetProcAddress)
@@ -1020,6 +1130,71 @@ static void resolve_optional_gl(EGLContext ctx) {
             }
         }
     }
+    disjoint_timer = has_gl_ext(exts, "GL_EXT_disjoint_timer_query");
+}
+
+// ---------------------------------------------------------------------------
+// Sync object handles
+//
+// GLsync is the one GL object that is a pointer rather than a name, and GL
+// does not validate a GLsync it is handed: a deleted or made-up one is a
+// wild pointer inside the driver. So JS never sees it. fenceSync hands out a
+// small number from this table instead, like every other object here, and a
+// number the table does not hold — deleted, never issued, or fenced in
+// another context — is refused before GL is called.
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    GLsync sync; // NULL marks a free slot
+    void *ctx;   // the context it was fenced in, the only one that may use it
+} SyncSlot;
+
+static SyncSlot *sync_slots;
+static uint32_t sync_nslots;
+
+// The handle for a new sync — its slot number, counted from 1 so that 0
+// stays "no sync" — or 0 when the table cannot grow.
+static uint32_t sync_store(GLsync sync) {
+    uint32_t i = 0;
+    while (i < sync_nslots && sync_slots[i].sync)
+        i++;
+    if (i == sync_nslots) {
+        uint32_t n = sync_nslots ? sync_nslots * 2 : 16;
+        SyncSlot *grown = realloc(sync_slots, n * sizeof(SyncSlot));
+        if (!grown)
+            return 0;
+        memset(grown + sync_nslots, 0, (n - sync_nslots) * sizeof(SyncSlot));
+        sync_slots = grown;
+        sync_nslots = n;
+    }
+    sync_slots[i].sync = sync;
+    sync_slots[i].ctx = optional_ctx;
+    return i + 1;
+}
+
+// The slot behind a handle, live or free; NULL for a number never issued.
+static SyncSlot *sync_slot(uint32_t handle) {
+    return handle && handle <= sync_nslots ? &sync_slots[handle - 1] : NULL;
+}
+
+// The sync a JS argument names, or NULL with an exception pending.
+static GLsync sync_arg(napi_env env, napi_value v, const char *what) {
+    uint32_t h = arg_u32(env, v);
+    SyncSlot *s = sync_slot(h);
+    if (!s || !s->sync)
+        THROWF(env, "%s: %u is not a live sync object (deleted, or never "
+                    "made by fenceSync)", what, h);
+    if (s->ctx != optional_ctx)
+        THROWF(env, "%s: sync %u was fenced in another context", what, h);
+    return s->sync;
+}
+
+// A destroyed context takes its sync objects with it, so their slots are
+// freed without a word to GL — there is no context left to say it to.
+static void sync_forget_context(void *ctx) {
+    for (uint32_t i = 0; i < sync_nslots; i++)
+        if (sync_slots[i].ctx == ctx)
+            sync_slots[i] = (SyncSlot){ NULL, NULL };
 }
 
 // ---------------------------------------------------------------------------
@@ -1057,6 +1232,7 @@ static void gpu_finalize(napi_env env, void *data, void *hint) {
     if (!g->destroyed) {
         // JS forgot destroy(); release what we can without touching EGL
         // current state (finalizers can run late in teardown).
+        sync_forget_context(g->ctx);
         if (g->ctx) egl.DestroyContext(g->dpy, g->ctx);
         if (g->dpy) egl.Terminate(g->dpy);
         if (g->gbm) gbm.device_destroy(g->gbm);
@@ -1365,6 +1541,7 @@ static napi_value DestroyGpu(napi_env env, napi_callback_info info) {
         has_current = 0;
         if (optional_ctx == g->ctx)
             optional_ctx = NULL; // a later context could land on this address
+        sync_forget_context(g->ctx);
         egl.DestroyContext(g->dpy, g->ctx);
         egl.Terminate(g->dpy);
         gbm.device_destroy(g->gbm);
@@ -1868,6 +2045,33 @@ static napi_value Gl_clearStencil(napi_env env, napi_callback_info info) {
     return NULL;
 }
 
+// The *Separate forms set one facing's stencil state (FRONT, BACK or
+// FRONT_AND_BACK) and leave the other's alone. What that buys: a
+// winding-number fill can count up on front faces and down on back faces in
+// the same draw, where the one-facing forms take a pass per facing with face
+// culling in between. Core since ES 2.0 and desktop 2.0, so never optional.
+//
+// stencilFuncSeparate(face, func, ref, mask)
+static napi_value Gl_stencilFuncSeparate(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 4); NEED_GL(env);
+    gl.StencilFuncSeparate(arg_u32(env, args[0]), arg_u32(env, args[1]),
+                           arg_i32(env, args[2]), arg_u32(env, args[3]));
+    return NULL;
+}
+// stencilOpSeparate(face, fail, zfail, zpass)
+static napi_value Gl_stencilOpSeparate(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 4); NEED_GL(env);
+    gl.StencilOpSeparate(arg_u32(env, args[0]), arg_u32(env, args[1]),
+                         arg_u32(env, args[2]), arg_u32(env, args[3]));
+    return NULL;
+}
+// stencilMaskSeparate(face, mask)
+static napi_value Gl_stencilMaskSeparate(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 2); NEED_GL(env);
+    gl.StencilMaskSeparate(arg_u32(env, args[0]), arg_u32(env, args[1]));
+    return NULL;
+}
+
 // --- uniforms --------------------------------------------------------------
 
 static napi_value Gl_uniform2f(napi_env env, napi_callback_info info) {
@@ -2130,6 +2334,26 @@ static napi_value Gl_getParameter(napi_env env, napi_callback_info info) {
                 napi_set_element(env, out, (uint32_t)i, mk_i32(env, v[i]));
             free(v);
             return out;
+        }
+        // The stencil masks are GLuint bit patterns, and the initial ones
+        // are all ones — which GetIntegerv, being signed, answers as -1.
+        case 0x0B93: case 0x0B98: // STENCIL_VALUE_MASK, STENCIL_WRITEMASK
+        case 0x8CA4: case 0x8CA5: { // STENCIL_BACK_VALUE_MASK, STENCIL_BACK_WRITEMASK
+            GLint v = 0;
+            gl.GetIntegerv(pname, &v);
+            return mk_u32(env, (uint32_t)v);
+        }
+        // GPU_DISJOINT_EXT: whether anything since the last ask (asking
+        // resets it) disturbed the GPU clock, voiding the timer results read
+        // in between. Only GL_EXT_disjoint_timer_query has the notion —
+        // desktop GL answers the question with INVALID_ENUM — so without the
+        // extension the answer is false without asking, and one frame loop
+        // can check it on every flavor.
+        case 0x8FBB: {
+            GLint v = 0;
+            if (disjoint_timer)
+                gl.GetIntegerv(pname, &v);
+            return mk_bool(env, v != 0);
         }
         // four booleans
         case 0x0C23: { // COLOR_WRITEMASK
@@ -2615,8 +2839,287 @@ static napi_value Gl_texStorage3D(napi_env env, napi_callback_info info) {
     return NULL;
 }
 
+// --- multisampling, blits and the read buffer ------------------------------
+//
+// Antialiasing a fill's edges gets from the hardware rather than from a
+// shader: draw into a framebuffer whose renderbuffers keep several coverage
+// samples per pixel, then let blitFramebuffer average them into a
+// single-sample framebuffer — the only way to read or sample what was drawn.
+
+// renderbufferStorageMultisample(target, samples, internalformat, width,
+// height). The driver may give more samples than asked for:
+// getRenderbufferParameter(RENDERBUFFER_SAMPLES) says what it gave,
+// getParameter(MAX_SAMPLES) what it could.
+static napi_value Gl_renderbufferStorageMultisample(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 5); NEED_GL(env);
+    NEED_FN(env, RenderbufferStorageMultisample, "multisampled renderbuffers");
+    gl.RenderbufferStorageMultisample(arg_u32(env, args[0]), arg_i32(env, args[1]),
+                                      arg_u32(env, args[2]), arg_i32(env, args[3]),
+                                      arg_i32(env, args[4]));
+    return NULL;
+}
+// blitFramebuffer(srcX0, srcY0, srcX1, srcY1, dstX0, dstY0, dstX1, dstY1,
+//                 mask, filter) — copy a rectangle of the READ_FRAMEBUFFER's
+// read buffer into the DRAW_FRAMEBUFFER. Out of a multisampled source into a
+// single-sample destination, that copy is the resolve.
+static napi_value Gl_blitFramebuffer(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 10); NEED_GL(env);
+    NEED_FN(env, BlitFramebuffer, "framebuffer blits");
+    gl.BlitFramebuffer(arg_i32(env, args[0]), arg_i32(env, args[1]),
+                       arg_i32(env, args[2]), arg_i32(env, args[3]),
+                       arg_i32(env, args[4]), arg_i32(env, args[5]),
+                       arg_i32(env, args[6]), arg_i32(env, args[7]),
+                       arg_u32(env, args[8]), arg_u32(env, args[9]));
+    return NULL;
+}
+// readBuffer(src) — which colour attachment (or BACK) readPixels and a blit
+// read from; without it a framebuffer with several offers only its first
+static napi_value Gl_readBuffer(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 1); NEED_GL(env);
+    NEED_FN(env, ReadBuffer, "readBuffer");
+    gl.ReadBuffer(arg_u32(env, args[0]));
+    return NULL;
+}
+
+// --- sync objects ----------------------------------------------------------
+//
+// A fence goes into the command stream after a frame and is signaled once
+// the GPU has finished everything before it, so a caller can ask "is that
+// frame done?" and have the answer at once — where glFinish answers only by
+// stalling this thread until it is. The handles are the table's (see "Sync
+// object handles" above), never the driver's pointers.
+
+// A GLuint64 nanosecond timeout, from a Number or a BigInt. A negative Number
+// is TIMEOUT_IGNORED, all ones — which WebGL 2 spells -1, because a Number
+// cannot hold 2^64 - 1 — and a Number past what uint64 holds is clamped
+// rather than left to C's undefined conversion.
+static bool arg_timeout(napi_env env, napi_value v, uint64_t *out) {
+    napi_valuetype t;
+    if (napi_typeof(env, v, &t) != napi_ok)
+        return false;
+    if (t == napi_bigint) {
+        bool lossless; // a negative BigInt wraps to its low 64 bits: -1n is all ones
+        return napi_get_value_bigint_uint64(env, v, out, &lossless) == napi_ok;
+    }
+    double d;
+    if (napi_get_value_double(env, v, &d) != napi_ok)
+        return false;
+    if (d != d)                             // NaN: poll
+        *out = 0;
+    else if (d < 0)
+        *out = UINT64_MAX;
+    else if (d >= 18446744073709551616.0)   // 2^64
+        *out = UINT64_MAX;
+    else
+        *out = (uint64_t)d;
+    return true;
+}
+
+// fenceSync(condition, flags) -> handle, or 0 when GL refused the arguments
+// (getError() says why), as for any object GL will not make
+static napi_value Gl_fenceSync(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 2); NEED_GL(env);
+    NEED_FN(env, FenceSync, "sync objects");
+    GLsync s = gl.FenceSync(arg_u32(env, args[0]), arg_u32(env, args[1]));
+    if (!s)
+        return mk_u32(env, 0);
+    uint32_t h = sync_store(s);
+    if (!h) {
+        if (gl.DeleteSync) gl.DeleteSync(s);
+        THROW(env, "fenceSync: out of memory");
+    }
+    return mk_u32(env, h);
+}
+// clientWaitSync(sync, flags, timeout) -> ALREADY_SIGNALED | TIMEOUT_EXPIRED
+// | CONDITION_SATISFIED | WAIT_FAILED. A timeout of 0 polls and never
+// blocks. SYNC_FLUSH_COMMANDS_BIT makes sure the fence has been sent to the
+// GPU at all, without which a longer wait can wait forever.
+static napi_value Gl_clientWaitSync(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 3); NEED_GL(env);
+    NEED_FN(env, ClientWaitSync, "sync objects");
+    GLsync s = sync_arg(env, args[0], "clientWaitSync");
+    if (!s) return NULL;
+    uint64_t timeout;
+    if (!arg_timeout(env, args[2], &timeout))
+        THROW(env, "clientWaitSync: the timeout is nanoseconds, a Number or a BigInt");
+    return mk_u32(env, gl.ClientWaitSync(s, arg_u32(env, args[1]), timeout));
+}
+// waitSync(sync, flags, timeout) — make the GPU wait for the fence rather
+// than this thread. GL takes flags 0 and timeout TIMEOUT_IGNORED only.
+static napi_value Gl_waitSync(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 3); NEED_GL(env);
+    NEED_FN(env, WaitSync, "sync objects");
+    GLsync s = sync_arg(env, args[0], "waitSync");
+    if (!s) return NULL;
+    uint64_t timeout;
+    if (!arg_timeout(env, args[2], &timeout))
+        THROW(env, "waitSync: the timeout is TIMEOUT_IGNORED, a Number or a BigInt");
+    gl.WaitSync(s, arg_u32(env, args[1]), timeout);
+    return NULL;
+}
+// getSyncParameter(sync, pname) -> SYNC_STATUS (SIGNALED or UNSIGNALED),
+// OBJECT_TYPE (SYNC_FENCE), SYNC_CONDITION or SYNC_FLAGS. Never waits.
+static napi_value Gl_getSyncParameter(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 2); NEED_GL(env);
+    NEED_FN(env, GetSynciv, "sync objects");
+    GLsync s = sync_arg(env, args[0], "getSyncParameter");
+    if (!s) return NULL;
+    GLint v = 0;
+    GLsizei n = 0;
+    gl.GetSynciv(s, arg_u32(env, args[1]), 1, &n, &v);
+    return mk_i32(env, v);
+}
+// deleteSync(sync). 0, or a handle already deleted, is ignored: deleting
+// twice is a no-op, as it is for WebGL's objects.
+static napi_value Gl_deleteSync(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 1); NEED_GL(env);
+    NEED_FN(env, DeleteSync, "sync objects");
+    uint32_t h = arg_u32(env, args[0]);
+    SyncSlot *slot = sync_slot(h);
+    if (!slot || !slot->sync)
+        return NULL;
+    if (slot->ctx != optional_ctx)
+        THROWF(env, "deleteSync: sync %u was fenced in another context", h);
+    gl.DeleteSync(slot->sync);
+    slot->sync = NULL;
+    slot->ctx = NULL;
+    return NULL;
+}
+// isSync(sync) — whether the handle names a live sync object of the current
+// context. The table is the whole truth here: a handle is live exactly while
+// its slot holds a sync.
+static napi_value Gl_isSync(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 1); NEED_GL(env);
+    NEED_FN(env, FenceSync, "sync objects");
+    SyncSlot *slot = sync_slot(arg_u32(env, args[0]));
+    return mk_bool(env, slot && slot->sync && slot->ctx == optional_ctx);
+}
+
+// --- query objects: GPU timers ---------------------------------------------
+//
+// beginQuery(TIME_ELAPSED, q) ... endQuery(TIME_ELAPSED) brackets a stretch
+// of the command stream, and the GPU writes into q how long it took to run
+// — a frame or two later, which is the point: asking QUERY_RESULT_AVAILABLE
+// never waits, so a frame loop reads each frame's GPU time once it is ready
+// instead of stalling on glFinish to have it now.
+//
+// Results are 64-bit nanosecond counts. getQueryParameter answers a Number,
+// exact below 2^53 ns (104 days) — every duration a frame can have;
+// getQueryObjectui64v answers a BigInt holding all 64 bits, for an absolute
+// TIMESTAMP, which is the GPU clock's own reading and can be past that.
+
+// Timers are the one optional family ES 3.0 does not bring whole: its query
+// objects have no timer, which on ES needs GL_EXT_disjoint_timer_query
+// whatever the version — so NEED_FN's "not ES 3.0" would send a reader after
+// the wrong thing.
+#define NEED_QUERY(env, field)                                                \
+    do {                                                                      \
+        if (!gl.field)                                                        \
+            THROW(env, "GPU timer queries are not available here: the "      \
+                       "driver has neither GL 3.3 timer queries nor "         \
+                       "GL_EXT_disjoint_timer_query "                         \
+                       "(see features.timerQuery)");                          \
+    } while (0)
+
+static napi_value Gl_createQuery(napi_env env, napi_callback_info info) {
+    (void)info; NEED_GL(env);
+    NEED_QUERY(env, GenQueries);
+    GLuint q = 0;
+    gl.GenQueries(1, &q);
+    return mk_u32(env, q);
+}
+static napi_value Gl_deleteQuery(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 1); NEED_GL(env);
+    NEED_QUERY(env, DeleteQueries);
+    GLuint q = arg_u32(env, args[0]);
+    gl.DeleteQueries(1, &q);
+    return NULL;
+}
+static napi_value Gl_isQuery(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 1); NEED_GL(env);
+    NEED_QUERY(env, IsQuery);
+    return mk_bool(env, gl.IsQuery(arg_u32(env, args[0])) != 0);
+}
+// beginQuery(target, query) / endQuery(target) — one active query per
+// target at a time; TIME_ELAPSED is the target that times
+static napi_value Gl_beginQuery(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 2); NEED_GL(env);
+    NEED_QUERY(env, BeginQuery);
+    gl.BeginQuery(arg_u32(env, args[0]), arg_u32(env, args[1]));
+    return NULL;
+}
+static napi_value Gl_endQuery(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 1); NEED_GL(env);
+    NEED_QUERY(env, EndQuery);
+    gl.EndQuery(arg_u32(env, args[0]));
+    return NULL;
+}
+// getQuery(target, pname) -> CURRENT_QUERY (the query active on target, 0
+// for none) or QUERY_COUNTER_BITS — the timer's width, where 0 means the
+// driver has no working timer for that target after all
+static napi_value Gl_getQuery(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 2); NEED_GL(env);
+    NEED_QUERY(env, GetQueryiv);
+    GLint v = 0;
+    gl.GetQueryiv(arg_u32(env, args[0]), arg_u32(env, args[1]), &v);
+    return mk_i32(env, v);
+}
+// getQueryParameter(query, pname) -> a boolean for QUERY_RESULT_AVAILABLE,
+// a Number for QUERY_RESULT. QUERY_RESULT waits for a result not yet
+// available — the very stall this is here to avoid — so ask the first
+// before the second.
+static napi_value Gl_getQueryParameter(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 2); NEED_GL(env);
+    NEED_QUERY(env, GetQueryObjectuiv);
+    GLuint q = arg_u32(env, args[0]);
+    GLenum pname = arg_u32(env, args[1]);
+    if (pname == 0x8867 /* QUERY_RESULT_AVAILABLE */) {
+        GLuint v = 0;
+        gl.GetQueryObjectuiv(q, pname, &v);
+        return mk_bool(env, v != 0);
+    }
+    // All 64 bits where the driver has the getter, which every timer does;
+    // the 32-bit form otherwise (an ES 3.0 driver without the timer
+    // extension still has query objects).
+    napi_value out;
+    if (gl.GetQueryObjectui64v) {
+        GLuint64 v = 0;
+        gl.GetQueryObjectui64v(q, pname, &v);
+        NAPI_CALL(env, napi_create_double(env, (double)v, &out));
+    } else {
+        GLuint v = 0;
+        gl.GetQueryObjectuiv(q, pname, &v);
+        out = mk_u32(env, v);
+    }
+    return out;
+}
+// getQueryObjectui64v(query, pname) -> BigInt: the raw form, every bit of
+// the 64-bit result
+static napi_value Gl_getQueryObjectui64v(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 2); NEED_GL(env);
+    NEED_QUERY(env, GetQueryObjectui64v);
+    GLuint64 v = 0;
+    gl.GetQueryObjectui64v(arg_u32(env, args[0]), arg_u32(env, args[1]), &v);
+    napi_value out;
+    NAPI_CALL(env, napi_create_bigint_uint64(env, v, &out));
+    return out;
+}
+// queryCounter(query, TIMESTAMP) — the GPU clock's reading when the command
+// stream reaches this point. Two of them bracket a span as beginQuery and
+// endQuery do, without the one-active-query limit.
+static napi_value Gl_queryCounter(napi_env env, napi_callback_info info) {
+    GET_ARGS(env, info, 2); NEED_GL(env);
+    if (!gl.QueryCounter)
+        THROW(env, "GPU timestamps are not available here: the driver has "
+                   "neither GL 3.3 timer queries nor "
+                   "GL_EXT_disjoint_timer_query (see features.timestampQuery)");
+    gl.QueryCounter(arg_u32(env, args[0]), arg_u32(env, args[1]));
+    return NULL;
+}
+
 // getFeatures() -> { vertexArrayObject, instancedArrays, drawBuffers,
-//                    texture3D, textureStorage }
+//                    texture3D, textureStorage, multisample, readBuffer,
+//                    sync, timerQuery, timestampQuery }
 //
 // A feature is present only when every entry point it needs resolved, so a
 // driver offering half an extension reports it as absent rather than
@@ -2675,6 +3178,7 @@ static void apple_ctx_finalize(napi_env env, void *data, void *hint) {
     (void)env; (void)hint;
     AppleCtx *a = data;
     if (!a->destroyed) {
+        sync_forget_context(a->ctx);
         if (a->ctx) cgl.DestroyContext(a->ctx);
         if (a->pf) cgl.DestroyPixelFormat(a->pf);
         if (a->sid) xp.destroy_surface(a->sid);
@@ -3147,6 +3651,7 @@ static napi_value AppleDestroyContext(napi_env env, napi_callback_info info) {
         }
         if (optional_ctx == (EGLContext)a->ctx)
             optional_ctx = NULL; // a later context could land on this address
+        sync_forget_context(a->ctx);
         cgl.ClearDrawable(a->ctx);
         cgl.DestroyContext(a->ctx);
         cgl.DestroyPixelFormat(a->pf);
@@ -3466,6 +3971,9 @@ NAPI_MODULE_INIT() {
     EXPORT("glStencilOp", Gl_stencilOp);
     EXPORT("glStencilMask", Gl_stencilMask);
     EXPORT("glClearStencil", Gl_clearStencil);
+    EXPORT("glStencilFuncSeparate", Gl_stencilFuncSeparate);
+    EXPORT("glStencilOpSeparate", Gl_stencilOpSeparate);
+    EXPORT("glStencilMaskSeparate", Gl_stencilMaskSeparate);
 
     EXPORT("glUniform2f", Gl_uniform2f);
     EXPORT("glUniform2i", Gl_uniform2i);
@@ -3544,6 +4052,24 @@ NAPI_MODULE_INIT() {
     EXPORT("glFramebufferTextureLayer", Gl_framebufferTextureLayer);
     EXPORT("glTexStorage2D", Gl_texStorage2D);
     EXPORT("glTexStorage3D", Gl_texStorage3D);
+    EXPORT("glRenderbufferStorageMultisample", Gl_renderbufferStorageMultisample);
+    EXPORT("glBlitFramebuffer", Gl_blitFramebuffer);
+    EXPORT("glReadBuffer", Gl_readBuffer);
+    EXPORT("glFenceSync", Gl_fenceSync);
+    EXPORT("glClientWaitSync", Gl_clientWaitSync);
+    EXPORT("glWaitSync", Gl_waitSync);
+    EXPORT("glGetSyncParameter", Gl_getSyncParameter);
+    EXPORT("glDeleteSync", Gl_deleteSync);
+    EXPORT("glIsSync", Gl_isSync);
+    EXPORT("glCreateQuery", Gl_createQuery);
+    EXPORT("glDeleteQuery", Gl_deleteQuery);
+    EXPORT("glIsQuery", Gl_isQuery);
+    EXPORT("glBeginQuery", Gl_beginQuery);
+    EXPORT("glEndQuery", Gl_endQuery);
+    EXPORT("glGetQuery", Gl_getQuery);
+    EXPORT("glGetQueryParameter", Gl_getQueryParameter);
+    EXPORT("glGetQueryObjectui64v", Gl_getQueryObjectui64v);
+    EXPORT("glQueryCounter", Gl_queryCounter);
     EXPORT("glGetFeatures", GlFeatures);
 #undef EXPORT
     return exports;

@@ -109,6 +109,17 @@ const GL = {
     STENCIL_BUFFER_BIT: 0x0400, STENCIL_TEST: 0x0B90,
     KEEP: 0x1E00, REPLACE: 0x1E01, INCR: 0x1E02, DECR: 0x1E03,
     INVERT: 0x150A, INCR_WRAP: 0x8507, DECR_WRAP: 0x8508,
+    // the stencil state getParameter reads back — front-facing (and the
+    // one-facing setters') first, then the back-facing copy the *Separate
+    // setters can make differ
+    STENCIL_FUNC: 0x0B92, STENCIL_REF: 0x0B97, STENCIL_VALUE_MASK: 0x0B93,
+    STENCIL_FAIL: 0x0B94, STENCIL_PASS_DEPTH_FAIL: 0x0B95,
+    STENCIL_PASS_DEPTH_PASS: 0x0B96, STENCIL_WRITEMASK: 0x0B98,
+    STENCIL_CLEAR_VALUE: 0x0B91,
+    STENCIL_BACK_FUNC: 0x8800, STENCIL_BACK_REF: 0x8CA3,
+    STENCIL_BACK_VALUE_MASK: 0x8CA4, STENCIL_BACK_FAIL: 0x8801,
+    STENCIL_BACK_PASS_DEPTH_FAIL: 0x8802, STENCIL_BACK_PASS_DEPTH_PASS: 0x8803,
+    STENCIL_BACK_WRITEMASK: 0x8CA5,
 
     // framebuffer and renderbuffer objects
     FRAMEBUFFER: 0x8D40, RENDERBUFFER: 0x8D41,
@@ -262,7 +273,34 @@ const GL = {
     UNSIGNED_INT_SAMPLER_CUBE: 0x8DD4, UNSIGNED_INT_SAMPLER_2D_ARRAY: 0x8DD7,
     FLOAT_MAT2x3: 0x8B65, FLOAT_MAT2x4: 0x8B66,
     FLOAT_MAT3x2: 0x8B67, FLOAT_MAT3x4: 0x8B68,
-    FLOAT_MAT4x2: 0x8B69, FLOAT_MAT4x3: 0x8B6A
+    FLOAT_MAT4x2: 0x8B69, FLOAT_MAT4x3: 0x8B6A,
+
+    // ---- multisampling, blits and the read buffer ----
+    // (features.multisample, features.readBuffer)
+    READ_FRAMEBUFFER: 0x8CA8, DRAW_FRAMEBUFFER: 0x8CA9,
+    READ_FRAMEBUFFER_BINDING: 0x8CAA, DRAW_FRAMEBUFFER_BINDING: 0x8CA6,
+    MAX_SAMPLES: 0x8D57, SAMPLES: 0x80A9, SAMPLE_BUFFERS: 0x80A8,
+    RENDERBUFFER_SAMPLES: 0x8CAB, FRAMEBUFFER_INCOMPLETE_MULTISAMPLE: 0x8D56,
+    READ_BUFFER: 0x0C02,
+
+    // ---- sync objects (features.sync) ----
+    SYNC_GPU_COMMANDS_COMPLETE: 0x9117, SYNC_FLUSH_COMMANDS_BIT: 0x00000001,
+    ALREADY_SIGNALED: 0x911A, TIMEOUT_EXPIRED: 0x911B,
+    CONDITION_SATISFIED: 0x911C, WAIT_FAILED: 0x911D,
+    OBJECT_TYPE: 0x9112, SYNC_CONDITION: 0x9113, SYNC_STATUS: 0x9114,
+    SYNC_FLAGS: 0x9115, SYNC_FENCE: 0x9116,
+    UNSIGNALED: 0x9118, SIGNALED: 0x9119,
+    // GL's value is 2^64 - 1, which a Number cannot hold; WebGL 2 spells it
+    // -1, and so do the wrappers
+    TIMEOUT_IGNORED: -1,
+
+    // ---- query objects, for the GPU timers ----
+    // (features.timerQuery, features.timestampQuery). The WebGL extension
+    // spells the first three with an _EXT suffix; the values are the same.
+    // GPU_DISJOINT_EXT has no other name: only the ES extension has it.
+    TIME_ELAPSED: 0x88BF, TIMESTAMP: 0x8E28, QUERY_COUNTER_BITS: 0x8864,
+    CURRENT_QUERY: 0x8865, QUERY_RESULT: 0x8866, QUERY_RESULT_AVAILABLE: 0x8867,
+    GPU_DISJOINT_EXT: 0x8FBB
 };
 
 // WebGL-flavored view over the flat native functions ("gl.clearColor" etc).
@@ -484,8 +522,8 @@ class Gpu {
     // here rather than in the constructor: `glVersion`, what the driver
     // actually gave (which can be higher than `contextVersion` — Mesa answers
     // an ES 2.0 request with an ES 3.0 context), and `features`, which of
-    // vertex array objects, instanced drawing and multiple render targets
-    // this driver offers.
+    // the optional entry points (the README's "What is optional") this
+    // driver offers.
     makeCurrent(surface) {
         native.makeCurrent(this._handle, surface ? surface._handle : null);
         this.glVersion = surface ? parseGlVersion(gl.getString(GL.VERSION)) : null;

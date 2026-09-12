@@ -24,6 +24,11 @@ export type GLfloat = number;
 export type GLbitfield = number;
 /** A byte offset into the currently bound buffer. */
 export type GLintptr = number;
+/**
+ * A sync object as `fenceSync` hands it out: a small number this binding
+ * issues and checks, never the driver's pointer. 0 is "no sync".
+ */
+export type GLsync = number;
 
 /**
  * Anything `napi_get_typedarray_info` accepts. Note this excludes `DataView`,
@@ -53,11 +58,16 @@ export interface ShaderPrecisionFormat {
 }
 
 /**
- * Which optional entry points this driver and context actually have. Every
- * one of them is core in ES 3.0 and an extension before it, so a `false` here
- * is a property of the machine rather than of the build. A feature is `true`
- * only when every entry point it needs resolved; calling one that is missing
- * throws.
+ * Which optional entry points this driver and context actually have. Most
+ * are core in ES 3.0 and extensions before it; the GPU timers are an
+ * extension on every ES version. Either way a `false` here is a property of
+ * the machine rather than of the build. A feature is `true` only when every
+ * entry point it needs resolved; calling one that is missing throws.
+ *
+ * This is the probe, not `typeof`: the `gl` object is shared by every
+ * context of both flavors, so its functions are always there. Read it after
+ * `makeCurrent`/`attach` — `Gpu.features`, `AppleContext.features`, or
+ * `gl.getFeatures()` for whichever context is current.
  */
 export interface GlFeatures {
     /** `createVertexArray`, `bindVertexArray`, `deleteVertexArray`, `isVertexArray` */
@@ -70,6 +80,41 @@ export interface GlFeatures {
     texture3D: boolean;
     /** `texStorage2D`, `texStorage3D` */
     textureStorage: boolean;
+    /**
+     * `renderbufferStorageMultisample`, `blitFramebuffer`. Core in ES 3.0
+     * and desktop 3.0 — so always on the CGL flavor, the legacy profile too
+     * (ARB_framebuffer_object) — and the ANGLE or NV
+     * framebuffer_multisample/_blit pair on an ES 2.0 driver.
+     * `getParameter(MAX_SAMPLES)` says how many samples.
+     */
+    multisample: boolean;
+    /** `readBuffer`: ES 3.0 or NV_read_buffer; desktop has had it since 1.0. */
+    readBuffer: boolean;
+    /**
+     * `fenceSync`, `clientWaitSync`, `waitSync`, `getSyncParameter`,
+     * `deleteSync`, `isSync`. Core in ES 3.0 and desktop 3.2 (ARB_sync on the
+     * legacy profile), APPLE_sync on ES 2.0.
+     */
+    sync: boolean;
+    /**
+     * `createQuery`, `deleteQuery`, `isQuery`, `beginQuery`, `endQuery`,
+     * `getQuery`, `getQueryParameter`, `getQueryObjectui64v`: GPU time
+     * elapsed, with `TIME_ELAPSED`. On the GLES flavor it needs
+     * GL_EXT_disjoint_timer_query, on ES 3.0 as much as 2.0 — ES's own query
+     * objects have no timer. Core in desktop 3.3, so always on the CGL
+     * flavor (EXT_timer_query on the legacy profile). A driver may still
+     * have a 0-bit counter, so ask `getQuery(TIME_ELAPSED,
+     * QUERY_COUNTER_BITS) > 0` before trusting the readings.
+     */
+    timerQuery: boolean;
+    /**
+     * `queryCounter`: a GPU timestamp in the command stream. With
+     * GL_EXT_disjoint_timer_query on the GLES flavor, desktop 3.3 on the CGL
+     * flavor (not the legacy profile). Whether that clock ticks is
+     * `getQuery(TIMESTAMP, QUERY_COUNTER_BITS) > 0` — which Apple's GL on
+     * Apple Silicon answers with 0.
+     */
+    timestampQuery: boolean;
 }
 
 /** What the driver reports through `glGetString(GL_VERSION)`, parsed. */
@@ -488,6 +533,24 @@ export interface GLConstants {
     readonly INVERT: GLenum;
     readonly INCR_WRAP: GLenum;
     readonly DECR_WRAP: GLenum;
+    // the stencil state getParameter reads back: front-facing (and the
+    // one-facing setters') first, then the back-facing copy the *Separate
+    // setters can make differ
+    readonly STENCIL_FUNC: GLenum;
+    readonly STENCIL_REF: GLenum;
+    readonly STENCIL_VALUE_MASK: GLenum;
+    readonly STENCIL_FAIL: GLenum;
+    readonly STENCIL_PASS_DEPTH_FAIL: GLenum;
+    readonly STENCIL_PASS_DEPTH_PASS: GLenum;
+    readonly STENCIL_WRITEMASK: GLenum;
+    readonly STENCIL_CLEAR_VALUE: GLenum;
+    readonly STENCIL_BACK_FUNC: GLenum;
+    readonly STENCIL_BACK_REF: GLenum;
+    readonly STENCIL_BACK_VALUE_MASK: GLenum;
+    readonly STENCIL_BACK_FAIL: GLenum;
+    readonly STENCIL_BACK_PASS_DEPTH_FAIL: GLenum;
+    readonly STENCIL_BACK_PASS_DEPTH_PASS: GLenum;
+    readonly STENCIL_BACK_WRITEMASK: GLenum;
 
     // framebuffer and renderbuffer objects
     readonly FRAMEBUFFER: GLenum;
@@ -756,6 +819,52 @@ export interface GLConstants {
     readonly FLOAT_MAT3x4: GLenum;
     readonly FLOAT_MAT4x2: GLenum;
     readonly FLOAT_MAT4x3: GLenum;
+
+    // ---- multisampling, blits and the read buffer ----
+    // (features.multisample, features.readBuffer)
+    readonly READ_FRAMEBUFFER: GLenum;
+    readonly DRAW_FRAMEBUFFER: GLenum;
+    readonly READ_FRAMEBUFFER_BINDING: GLenum;
+    readonly DRAW_FRAMEBUFFER_BINDING: GLenum;
+    readonly MAX_SAMPLES: GLenum;
+    readonly SAMPLES: GLenum;
+    readonly SAMPLE_BUFFERS: GLenum;
+    readonly RENDERBUFFER_SAMPLES: GLenum;
+    readonly FRAMEBUFFER_INCOMPLETE_MULTISAMPLE: GLenum;
+    readonly READ_BUFFER: GLenum;
+
+    // ---- sync objects (features.sync) ----
+    readonly SYNC_GPU_COMMANDS_COMPLETE: GLenum;
+    readonly SYNC_FLUSH_COMMANDS_BIT: GLbitfield;
+    readonly ALREADY_SIGNALED: GLenum;
+    readonly TIMEOUT_EXPIRED: GLenum;
+    readonly CONDITION_SATISFIED: GLenum;
+    readonly WAIT_FAILED: GLenum;
+    readonly OBJECT_TYPE: GLenum;
+    readonly SYNC_CONDITION: GLenum;
+    readonly SYNC_STATUS: GLenum;
+    readonly SYNC_FLAGS: GLenum;
+    readonly SYNC_FENCE: GLenum;
+    readonly UNSIGNALED: GLenum;
+    readonly SIGNALED: GLenum;
+    /** -1: WebGL 2's spelling of GL's 2^64 - 1, which a Number cannot hold. */
+    readonly TIMEOUT_IGNORED: number;
+
+    // ---- query objects, for the GPU timers ----
+    // (features.timerQuery, features.timestampQuery). WebGL's extension
+    // spells the first three with an _EXT suffix; the values are the same.
+    readonly TIME_ELAPSED: GLenum;
+    readonly TIMESTAMP: GLenum;
+    readonly QUERY_COUNTER_BITS: GLenum;
+    readonly CURRENT_QUERY: GLenum;
+    readonly QUERY_RESULT: GLenum;
+    readonly QUERY_RESULT_AVAILABLE: GLenum;
+    /**
+     * `getParameter` answers a boolean on every flavor: whether timer results
+     * read since the last ask are void. Only the ES extension has the notion,
+     * so it has no other name — and elsewhere the answer is `false`.
+     */
+    readonly GPU_DISJOINT_EXT: GLenum;
 }
 
 /**
@@ -766,8 +875,8 @@ export interface GLConstants {
  * returns a `GLuint`, and `getUniformLocation` answers -1 for a name the
  * program does not have, where WebGL answers `null`.
  *
- * Everything under "optional" throws unless the matching `Gpu.features` flag
- * is set.
+ * Everything under "optional" throws unless the matching `features` flag is
+ * set (`Gpu.features`, `AppleContext.features`, or `getFeatures()`).
  */
 export interface GLContext extends GLConstants {
     // ---- programs and shaders ----
@@ -894,6 +1003,15 @@ export interface GLContext extends GLConstants {
     stencilFunc(func: GLenum, ref: GLint, mask: GLuint): void;
     stencilOp(fail: GLenum, zfail: GLenum, zpass: GLenum): void;
     stencilMask(mask: GLuint): void;
+    /**
+     * The *Separate forms set one facing's state — `face` is `FRONT`, `BACK`
+     * or `FRONT_AND_BACK` — and leave the other's alone: how a non-zero
+     * winding fill counts front faces up and back faces down in one pass.
+     * Core since ES 2.0, so never optional.
+     */
+    stencilFuncSeparate(face: GLenum, func: GLenum, ref: GLint, mask: GLuint): void;
+    stencilOpSeparate(face: GLenum, fail: GLenum, zfail: GLenum, zpass: GLenum): void;
+    stencilMaskSeparate(face: GLenum, mask: GLuint): void;
     clearStencil(s: GLint): void;
     cullFace(mode: GLenum): void;
     frontFace(mode: GLenum): void;
@@ -919,7 +1037,10 @@ export interface GLContext extends GLConstants {
     /**
      * Answers in the type the parameter has: a number, a boolean, or an array
      * for `VIEWPORT`, `SCISSOR_BOX`, `COLOR_CLEAR_VALUE`, `COLOR_WRITEMASK`
-     * and `COMPRESSED_TEXTURE_FORMATS`.
+     * and `COMPRESSED_TEXTURE_FORMATS`. The stencil masks come back unsigned
+     * (all ones is 4294967295, not -1), and `GPU_DISJOINT_EXT` is a boolean
+     * on every flavor — `false`, without asking GL, where GL has no such
+     * notion.
      */
     getParameter(pname: GLenum): GLParameterValue;
     /** The raw single-value escape hatch, for anything `getParameter` does not know. */
@@ -1000,6 +1121,82 @@ export interface GLContext extends GLConstants {
         width: GLsizei, height: GLsizei): void;
     texStorage3D(target: GLenum, levels: GLsizei, internalformat: GLenum,
         width: GLsizei, height: GLsizei, depth: GLsizei): void;
+
+    // ---- optional: multisampling (features.multisample) ----
+    /**
+     * Storage keeping `samples` coverage samples per pixel. It cannot be read
+     * or sampled as it is: `blitFramebuffer` resolves it into a single-sample
+     * framebuffer first. The driver may give more samples than asked
+     * (`getRenderbufferParameter(RENDERBUFFER_SAMPLES)`), up to
+     * `getParameter(MAX_SAMPLES)`.
+     */
+    renderbufferStorageMultisample(target: GLenum, samples: GLsizei,
+        internalformat: GLenum, width: GLsizei, height: GLsizei): void;
+    /**
+     * Copy a rectangle of the `READ_FRAMEBUFFER`'s read buffer into the
+     * `DRAW_FRAMEBUFFER`. Out of a multisampled source into a single-sample
+     * one, the copy is the resolve.
+     */
+    blitFramebuffer(srcX0: GLint, srcY0: GLint, srcX1: GLint, srcY1: GLint,
+        dstX0: GLint, dstY0: GLint, dstX1: GLint, dstY1: GLint,
+        mask: GLbitfield, filter: GLenum): void;
+
+    // ---- optional: choosing the read buffer (features.readBuffer) ----
+    /** Which colour attachment (or `BACK`) `readPixels` and `blitFramebuffer` read. */
+    readBuffer(src: GLenum): void;
+
+    // ---- optional: sync objects (features.sync) ----
+    /**
+     * A fence after everything issued so far: `condition` is
+     * `SYNC_GPU_COMMANDS_COMPLETE`, `flags` 0. The handle is a number like
+     * every other object here, never the driver's pointer, and 0 means GL
+     * refused the arguments (`getError()` says why).
+     */
+    fenceSync(condition: GLenum, flags: GLbitfield): GLsync;
+    /**
+     * `ALREADY_SIGNALED`, `CONDITION_SATISFIED`, `TIMEOUT_EXPIRED` or
+     * `WAIT_FAILED`. A `timeout` of 0 polls without blocking; anything else
+     * is nanoseconds, as a Number or a BigInt. Pass `SYNC_FLUSH_COMMANDS_BIT`
+     * (or `flush()` first), or the fence may never reach the GPU to signal.
+     * Throws for a handle that is not a live sync of the current context.
+     */
+    clientWaitSync(sync: GLsync, flags: GLbitfield, timeout: number | bigint): GLenum;
+    /** Make the GPU wait for the fence, not this thread: `flags` 0, `timeout` `TIMEOUT_IGNORED`. */
+    waitSync(sync: GLsync, flags: GLbitfield, timeout: number | bigint): void;
+    /** `SYNC_STATUS` (`SIGNALED` or `UNSIGNALED`), `OBJECT_TYPE`, `SYNC_CONDITION`, `SYNC_FLAGS`. Never waits. */
+    getSyncParameter(sync: GLsync, pname: GLenum): number;
+    /** 0, or a handle already deleted, is ignored. */
+    deleteSync(sync: GLsync): void;
+    /** Whether the handle names a live sync object of the current context. */
+    isSync(sync: GLsync): boolean;
+
+    // ---- optional: GPU timers (features.timerQuery, timestampQuery) ----
+    createQuery(): GLuint;
+    deleteQuery(query: GLuint): void;
+    /** False for a name from `createQuery` until `beginQuery` has used it — GL's rule. */
+    isQuery(query: GLuint): boolean;
+    /** One active query per target; `TIME_ELAPSED` is the one that times. */
+    beginQuery(target: GLenum, query: GLuint): void;
+    endQuery(target: GLenum): void;
+    /**
+     * `CURRENT_QUERY` (the query active on `target`, 0 for none) or
+     * `QUERY_COUNTER_BITS` — the timer's width, where 0 means the driver has
+     * no working timer for that target: the probe to make before trusting
+     * one.
+     */
+    getQuery(target: GLenum, pname: GLenum): number;
+    /**
+     * A boolean for `QUERY_RESULT_AVAILABLE`, which never waits; a Number for
+     * `QUERY_RESULT` — nanoseconds for a timer, exact below 2^53 (104 days,
+     * so every duration a frame can have). `QUERY_RESULT` waits for a result
+     * that is not available yet, which is the stall timers exist to avoid:
+     * ask `QUERY_RESULT_AVAILABLE` first.
+     */
+    getQueryParameter(query: GLuint, pname: GLenum): number | boolean;
+    /** The raw form: every bit of the 64-bit result, as a BigInt — for an absolute `TIMESTAMP`. */
+    getQueryObjectui64v(query: GLuint, pname: GLenum): bigint;
+    /** The GPU clock's reading when the command stream reaches this point: `target` is `TIMESTAMP`. */
+    queryCounter(query: GLuint, target: GLenum): void;
 }
 
 /** DRM fourcc buffer formats. Must match the depth of the window being fed. */

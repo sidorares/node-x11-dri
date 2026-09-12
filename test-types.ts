@@ -11,7 +11,8 @@ import {
     probe, dup, listRenderNodes, createUdmabuf, dmabufSync,
     Gpu, GL, gl as sharedGl, apple,
     FORMAT, GBM_USE, MODIFIER, DMABUF_SYNC,
-    ActiveInfo, GlFeatures, GLContext, ProbeResult, Surface, SwapResult, TypedArray
+    ActiveInfo, GlFeatures, GLContext, GLenum, GLsync, ProbeResult, Surface,
+    SwapResult, TypedArray
 } from './index';
 
 // ---- probe and the plumbing ------------------------------------------------
@@ -149,6 +150,61 @@ if (features?.drawBuffers) {
     gl.drawBuffers(new Uint32Array([gl.COLOR_ATTACHMENT0]));
 }
 
+// ---- stencil per facing, multisampling, fences and GPU timers --------------
+
+// the non-zero fill in one pass: front faces count up, back faces down
+gl.stencilFunc(gl.ALWAYS, 0, 0xff);
+gl.stencilOpSeparate(gl.FRONT, gl.KEEP, gl.KEEP, gl.INCR_WRAP);
+gl.stencilOpSeparate(gl.BACK, gl.KEEP, gl.KEEP, gl.DECR_WRAP);
+gl.stencilFuncSeparate(gl.FRONT_AND_BACK, gl.NOTEQUAL, 0, 0xff);
+gl.stencilMaskSeparate(gl.BACK, 0x0f);
+// @ts-expect-error — the face comes first, and is not optional
+gl.stencilOpSeparate(gl.KEEP, gl.KEEP, gl.INCR_WRAP);
+
+if (features?.multisample) {
+    gl.renderbufferStorageMultisample(gl.RENDERBUFFER, 4, gl.RGBA8, 256, 256);
+    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, 1);
+    gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, 2);
+    gl.blitFramebuffer(0, 0, 256, 256, 0, 0, 256, 256, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+}
+if (features?.readBuffer)
+    gl.readBuffer(gl.COLOR_ATTACHMENT1);
+
+if (features?.sync) {
+    const fence: GLsync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+    // a zero timeout polls; a longer one is nanoseconds, a Number or a BigInt
+    const status: GLenum = gl.clientWaitSync(fence, gl.SYNC_FLUSH_COMMANDS_BIT, 0);
+    gl.clientWaitSync(fence, 0, 1_000_000n);
+    gl.waitSync(fence, 0, gl.TIMEOUT_IGNORED);
+    const done: boolean = gl.getSyncParameter(fence, gl.SYNC_STATUS) === gl.SIGNALED;
+    gl.deleteSync(fence);
+    // @ts-expect-error — a timeout is not a string
+    gl.clientWaitSync(fence, 0, '0');
+}
+
+// Timing a frame without stalling it: ask whether the result is ready, which
+// never waits, and read it when it is.
+let frameNs = 0;
+if (features?.timerQuery && gl.getQuery(gl.TIME_ELAPSED, gl.QUERY_COUNTER_BITS) > 0) {
+    const query = gl.createQuery();
+    gl.beginQuery(gl.TIME_ELAPSED, query);
+    gl.endQuery(gl.TIME_ELAPSED);
+    if (gl.getQueryParameter(query, gl.QUERY_RESULT_AVAILABLE) === true &&
+        gl.getParameter(gl.GPU_DISJOINT_EXT) === false) {
+        const result = gl.getQueryParameter(query, gl.QUERY_RESULT);
+        if (typeof result === 'number')
+            frameNs = result;
+        const exact: bigint = gl.getQueryObjectui64v(query, gl.QUERY_RESULT);
+    }
+    // @ts-expect-error — getQueryParameter can answer a boolean
+    const ns: number = gl.getQueryParameter(query, gl.QUERY_RESULT);
+    // @ts-expect-error — the raw 64-bit form is a BigInt, not a Number
+    const lossy: number = gl.getQueryObjectui64v(query, gl.QUERY_RESULT);
+    if (features.timestampQuery)
+        gl.queryCounter(query, gl.TIMESTAMP);
+    gl.deleteQuery(query);
+}
+
 // ---- queries answer in the shape the parameter has -------------------------
 
 const viewport = gl.getParameter(gl.VIEWPORT);
@@ -219,5 +275,5 @@ export {
     usable, why, nodes, copy, eglVendor, contextVersion, major, compiled, log,
     viewport, maxTexture, dithering, extensions, live, notANumber, bits,
     alsoGl, modifierLinear, constantsOnly, nope, gl, out, info, value, precision,
-    appledriWhy, cid, hz, actxGl
+    appledriWhy, cid, hz, actxGl, frameNs
 };
