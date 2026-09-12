@@ -212,7 +212,14 @@ export interface ImportedImage {
     readonly texture: GLuint;
     /** `TEXTURE_2D`, or `TEXTURE_EXTERNAL_OES` — which needs a `samplerExternalOES`. */
     readonly target: GLenum;
-    /** `glDeleteTextures` + `eglDestroyImageKHR`. Idempotent. */
+    /**
+     * `glDeleteTextures` + `eglDestroyImageKHR`. Idempotent, and already
+     * done once the `Gpu` that owned the objects has been destroyed.
+     *
+     * Throws if the context the import was made into is not the current one:
+     * a texture name means something else in every other context, so there
+     * is no safe thing to delete. `makeCurrent` it first.
+     */
     destroy(): void;
 }
 
@@ -221,6 +228,12 @@ export interface MappedDmabuf {
     /** The buffer's memory. Detached by `close()`. */
     buffer: ArrayBuffer;
     size: number;
+    /**
+     * False when the descriptor was exported read-only, which is common —
+     * `DRM_RDWR` is opt-in, and `gbm_bo_get_fd` does not pass it. Writing
+     * through the mapping then faults, so check this before you do.
+     */
+    writable: boolean;
     /** Bracket CPU access with `START | READ` and `END | READ`. */
     sync(flags: number): void;
     /** Unmap now rather than at the next GC. The fd is not touched. */

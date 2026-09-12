@@ -500,6 +500,7 @@ report('mapDmabuf reads a dma-buf through a borrowed descriptor', () => {
 
         const m = dri.mapDmabuf(ud.fd); // size taken from the descriptor
         assert.ok(m.size >= 4096, `mapped ${m.size} bytes`);
+        assert.strictEqual(m.writable, true, 'a udmabuf descriptor is read-write');
         m.sync(dri.DMABUF_SYNC.START | dri.DMABUF_SYNC.READ);
         assert.strictEqual(new Uint32Array(m.buffer)[0], 0xdeadbeef,
             'the mapping sees the same memory');
@@ -514,6 +515,136 @@ report('mapDmabuf reads a dma-buf through a borrowed descriptor', () => {
     } finally {
         ud.close();
     }
+});
+
+// A dma-buf descriptor carries an access mode like any other fd, and the one
+// a GPU exports is commonly read-only: DRM_RDWR is opt-in and gbm_bo_get_fd
+// does not pass it. Mapping has to cope rather than fail, and has to say
+// which kind of mapping came back — writing through a read-only one faults,
+// and a segfault is no way to learn that.
+report('mapDmabuf copes with a read-only descriptor', () => {
+    const { gpu, surf, gl } = glSurface(32, {});
+    try {
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        const out = surf.swap();
+        assert.ok(out && out.isNew, 'a descriptor to map');
+        // ground truth for what the kernel will allow, straight from the fd
+        const flags = /flags:\s*(\d+)/.exec(
+            fs.readFileSync(`/proc/self/fdinfo/${out.fd}`, 'utf8'))[1];
+        const readOnly = (parseInt(flags, 8) & 3) === 0; // O_RDONLY is 0
+
+        let m;
+        try {
+            m = dri.mapDmabuf(out.fd);
+        } catch (e) {
+            // Not every exporter implements mmap at all — a tiled buffer
+            // does not, and that is a different answer from "read-only".
+            surf.release(out.key);
+            fs.closeSync(out.fd);
+            skip(`this buffer does not map: ${e.message}`);
+        }
+        assert.strictEqual(m.writable, !readOnly,
+            `writable reports the descriptor's own access mode (flags 0${flags})`);
+        // reading is what a read-only mapping is for, and must not fault
+        const bytes = new Uint8Array(m.buffer);
+        assert.strictEqual(bytes.length, m.size);
+        let sum = 0;
+        for (let i = 0; i < Math.min(bytes.length, 4096); i++)
+            sum += bytes[i];
+        assert.ok(sum >= 0, 'the mapping reads without faulting');
+        m.close();
+        surf.release(out.key);
+        fs.closeSync(out.fd);
+        return readOnly ? 'exported read-only, mapped for reading'
+                        : 'exported read-write';
+    } finally {
+        surf.destroy();
+        gpu.destroy();
+    }
+});
+
+// A texture name is meaningful only inside the context that issued it, so an
+// imported image may only be destroyed while that context is current —
+// otherwise glDeleteTextures would delete whatever the *current* context
+// happens to be calling by that number. Two contexts hand out the same low
+// names, so this is not a remote possibility.
+report('an imported image is destroyed only by its own context', () => {
+    const b = glSurface(32, {});
+    let a = null;
+    try {
+        if (!b.gpu.features.dmabufImport)
+            skip('driver has no EGL_EXT_image_dma_buf_import');
+        b.gl.clear(b.gl.COLOR_BUFFER_BIT);
+        const out = b.surf.swap();
+        const image = b.gl.importDmabuf({
+            width: 32, height: 32, fourcc: b.gpu.format,
+            modifier: b.gpu.features.dmabufImportModifiers ? out.modifier : undefined,
+            planes: [{ fd: out.fd, stride: out.stride, offset: out.offset }]
+        });
+
+        try {
+            a = glSurface(32, {});
+        } catch (e) {
+            image.destroy();
+            b.surf.release(out.key);
+            skip(`no second context to collide with: ${e.message}`);
+        }
+        // a fresh context issues names from 1 again, so this is the same
+        // number the image above holds in the other one
+        const texA = a.gl.createTexture();
+        a.gl.bindTexture(a.gl.TEXTURE_2D, texA);
+        a.gl.texImage2D(a.gl.TEXTURE_2D, 0, a.gl.RGBA, 8, 8, 0,
+            a.gl.RGBA, a.gl.UNSIGNED_BYTE, null);
+        assert.strictEqual(a.gl.isTexture(texA), true);
+
+        assert.throws(() => image.destroy(), /not current/,
+            'destroying B\'s image while A is current is refused');
+        assert.strictEqual(a.gl.isTexture(texA), true,
+            "A's texture survived B's image being destroyed");
+
+        // and with the right context current it works, twice over
+        b.gpu.makeCurrent(b.surf);
+        image.destroy();
+        image.destroy();
+        a.gpu.makeCurrent(a.surf);
+        assert.strictEqual(a.gl.isTexture(texA), true, "A's texture is still A's");
+        a.gl.deleteTexture(texA);
+
+        b.gpu.makeCurrent(b.surf);
+        b.surf.release(out.key);
+        return `texture name ${texA} in both contexts, deleted only in its own`;
+    } finally {
+        if (a) { a.surf.destroy(); a.gpu.destroy(); }
+        b.surf.destroy();
+        b.gpu.destroy();
+    }
+});
+
+// Destroying the Gpu takes its imported images with it — eglTerminate frees
+// every image on the display and the context takes its texture names — so a
+// destroy() that arrives afterwards has nothing left to do and must not go
+// looking for it on a terminated display.
+report('imported images outlive nothing: the Gpu takes them', () => {
+    const { gpu, surf, gl } = glSurface(32, {});
+    let image = null;
+    try {
+        if (!gpu.features.dmabufImport)
+            skip('driver has no EGL_EXT_image_dma_buf_import');
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        const out = surf.swap();
+        image = gl.importDmabuf({
+            width: 32, height: 32, fourcc: gpu.format,
+            modifier: gpu.features.dmabufImportModifiers ? out.modifier : undefined,
+            planes: [{ fd: out.fd, stride: out.stride, offset: out.offset }]
+        });
+        surf.release(out.key);
+    } finally {
+        surf.destroy();
+        gpu.destroy();
+    }
+    image.destroy(); // a no-op, not a call into a destroyed context
+    image.destroy();
+    return 'destroy() after gpu.destroy() is a no-op';
 });
 
 // The round trip, which is the whole point: render a frame, export it as a
