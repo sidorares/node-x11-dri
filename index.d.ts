@@ -112,7 +112,8 @@ export interface GlFeatures {
      * GL_EXT_disjoint_timer_query on the GLES flavor, desktop 3.3 on the CGL
      * flavor (not the legacy profile). Whether that clock ticks is
      * `getQuery(TIMESTAMP, QUERY_COUNTER_BITS) > 0` — which Apple's GL on
-     * Apple Silicon answers with 0.
+     * Apple Silicon answers with 0. A non-zero width is only a claim: virgl
+     * reports 64 bits over a clock stuck at 0, so compare two readings.
      */
     timestampQuery: boolean;
 }

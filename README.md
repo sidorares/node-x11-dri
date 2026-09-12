@@ -368,7 +368,9 @@ while (pending.length && gl.getQueryParameter(pending[0], gl.QUERY_RESULT_AVAILA
   for the one kind of value that can pass 2^53: an absolute `TIMESTAMP`.
 - **Timestamps.** `queryCounter(q, gl.TIMESTAMP)` (`features.timestampQuery`)
   needs `getQuery(gl.TIMESTAMP, gl.QUERY_COUNTER_BITS) > 0` as well, and
-  Apple's GL answers 0 — on macOS, time spans with `TIME_ELAPSED`.
+  Apple's GL answers 0 — on macOS, time spans with `TIME_ELAPSED`. That width
+  is a claim rather than a promise: virgl answers 64 bits and then reads back
+  0 every time, so a clock counts as ticking only once two readings differ.
 - **The stall is still there if asked for.** `QUERY_RESULT` for a result not
   yet available waits for it. Ask `QUERY_RESULT_AVAILABLE` first.
 

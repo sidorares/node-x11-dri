@@ -1907,8 +1907,12 @@ report('GL timer queries: a frame\'s GPU time, read once it is ready', () => {
         assert.strictEqual(gl.isQuery(q), false);
 
         // Timestamps: two readings of the GPU clock around the same work.
-        // queryCounter can exist with a clock that does not tick, which is
-        // what QUERY_COUNTER_BITS for TIMESTAMP says.
+        // queryCounter can exist with a clock that does not tick. A driver
+        // can say so up front through a 0-bit QUERY_COUNTER_BITS, or not say
+        // it at all — virgl claims 64 bits and then hands back the same
+        // reading every time — so an unmoving clock is a note about the
+        // driver rather than a failure here. Only a clock running backwards
+        // would be one, and every reading must still be a whole 64-bit value.
         let stamps = 'no timestamps';
         if (features.timestampQuery) {
             const stampBits = gl.getQuery(gl.TIMESTAMP, gl.QUERY_COUNTER_BITS);
@@ -1924,10 +1928,13 @@ report('GL timer queries: a frame\'s GPU time, read once it is ready', () => {
                 const a = gl.getQueryObjectui64v(t0, gl.QUERY_RESULT);
                 const b = gl.getQueryObjectui64v(t1, gl.QUERY_RESULT);
                 assert.strictEqual(typeof a, 'bigint');
-                assert.ok(b > a, `the clock moved forward: ${a} -> ${b}`);
+                assert.strictEqual(typeof b, 'bigint');
+                assert.ok(b >= a, `the clock did not run backwards: ${a} -> ${b}`);
                 gl.deleteQuery(t0);
                 gl.deleteQuery(t1);
-                stamps = `timestamps ${b - a} ns apart`;
+                stamps = b > a
+                    ? `timestamps ${b - a} ns apart`
+                    : `a ${stampBits}-bit TIMESTAMP counter that does not tick (stuck at ${a})`;
             }
         }
         t.destroy();
