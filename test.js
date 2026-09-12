@@ -1104,6 +1104,95 @@ report('GL ES 3.0 context selection', () => {
     return note;
 });
 
+// A stencil buffer on the surface itself, rather than on a framebuffer the
+// test built for itself. EGL_STENCIL_SIZE is part of the config query, so the
+// Gpu constructor is the only place it can be asked for — and a default
+// framebuffer with no stencil bits *passes every stencil test*, quietly, with
+// no GL error to notice. That silence is what makes the negative half of this
+// worth asserting rather than assuming.
+report('GL stencil on the surface: stencilSize picks the config', () => {
+    const W = 64;
+    const quad = (gl, positions) => {
+        const b = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, b);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(positions), gl.STATIC_DRAW);
+        return b;
+    };
+    // Stencil-then-cover, the shape a vector-path fill has: mark a region
+    // with colour writes off, then paint the whole viewport through an EQUAL
+    // test so only the marked part survives. Answers what the two halves of
+    // the surface came out as.
+    const stencilThenCover = gl => {
+        const p = buildProgram(gl,
+            'attribute vec2 position;\nvoid main() { gl_Position = vec4(position, 0.0, 1.0); }',
+            'precision mediump float;\nvoid main() { gl_FragColor = vec4(1.0, 0.0, 0.0, 1.0); }');
+        gl.useProgram(p);
+        const loc = gl.getAttribLocation(p, 'position');
+        gl.enableVertexAttribArray(loc);
+        const left = quad(gl, [-1, -1, 0, -1, -1, 1, 0, 1]);
+        const full = quad(gl, [-1, -1, 1, -1, -1, 1, 1, 1]);
+        const draw = buffer => {
+            gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+            gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+            gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        };
+
+        gl.clearColor(0, 0, 0, 1);
+        gl.clearStencil(0);
+        gl.stencilMask(0xff);
+        gl.clear(gl.COLOR_BUFFER_BIT | gl.STENCIL_BUFFER_BIT);
+        gl.enable(gl.STENCIL_TEST);
+        gl.colorMask(false, false, false, false);
+        gl.stencilFunc(gl.ALWAYS, 1, 0xff);
+        gl.stencilOp(gl.KEEP, gl.KEEP, gl.REPLACE);
+        draw(left);
+        gl.colorMask(true, true, true, true);
+        gl.stencilFunc(gl.EQUAL, 1, 0xff);
+        gl.stencilOp(gl.KEEP, gl.KEEP, gl.KEEP);
+        draw(full);
+        gl.disable(gl.STENCIL_TEST);
+
+        const px = new Uint8Array(W * W * 4);
+        gl.readPixels(0, 0, W, W, gl.RGBA, gl.UNSIGNED_BYTE, px);
+        const e = gl.getError();
+        assert.strictEqual(e, gl.NO_ERROR, `stencil-then-cover: GL error 0x${e.toString(16)}`);
+        const red = x => px[((W / 2) * W + x) * 4] > 127;
+        return { marked: red(W / 4), unmarked: red((W * 3) / 4) };
+    };
+
+    // The default asks for no stencil bits, and nothing about that changed:
+    // the cover pass paints everywhere because there is no buffer to hold
+    // the mark. (EGL only promises *at least* what was asked, so a driver
+    // handing back stencil bits unbidden is allowed — read back, don't
+    // assume, and skip the demonstration in that case.)
+    const plain = glSurface(W, { format: dri.FORMAT.ARGB8888 });
+    assert.strictEqual(typeof plain.gpu.stencilSize, 'number', 'the config reports its stencil bits');
+    assert.ok(plain.gpu.depthSize >= 16, `depthSize defaults to at least 16: ${plain.gpu.depthSize}`);
+    let note = `default: ${plain.gpu.depthSize}-bit depth, ${plain.gpu.stencilSize}-bit stencil`;
+    if (plain.gpu.stencilSize === 0) {
+        const none = stencilThenCover(plain.gl);
+        assert.deepStrictEqual(none, { marked: true, unmarked: true },
+            'with no stencil bits every stencil test passes — the cover pass paints everywhere');
+    }
+    plain.surf.destroy();
+    plain.gpu.destroy();
+
+    // And with the option, the same draw fills only what was marked.
+    const { gpu, surf, gl } = glSurface(W, { format: dri.FORMAT.ARGB8888, stencilSize: 8 });
+    assert.ok(gpu.stencilSize >= 8,
+        `stencilSize: 8 got a config with stencil bits: ${gpu.stencilSize}`);
+    assert.deepStrictEqual(stencilThenCover(gl), { marked: true, unmarked: false },
+        'the cover pass fills only where the stencil was marked');
+    note += `; stencilSize 8 -> ${gpu.depthSize}-bit depth, ${gpu.stencilSize}-bit stencil`;
+    surf.destroy();
+    gpu.destroy();
+
+    // Bit counts, so a negative one is refused before EGL is asked anything.
+    assert.throws(() => new dri.Gpu({ stencilSize: -1 }), /not negative/);
+    assert.throws(() => new dri.Gpu({ depthSize: -1 }), /not negative/);
+    return note;
+});
+
 // 3D textures, array textures and immutable storage. The distinction the
 // pixels have to show is that TEXTURE_3D filters across its third axis while
 // TEXTURE_2D_ARRAY does not — same call, same data, different target, and a

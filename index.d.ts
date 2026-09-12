@@ -197,8 +197,22 @@ export interface GpuOptions {
     fd?: number;
     /** A `FORMAT` value; must match the depth of the window it will feed. */
     format?: number;
-    /** EGL depth buffer bits. Defaults to 16. */
+    /**
+     * EGL depth buffer bits. Defaults to 16. A floor, not an exact size —
+     * read `Gpu.depthSize` for what the chosen config carries.
+     */
     depthSize?: number;
+    /**
+     * EGL stencil buffer bits. Defaults to 0 — ask for 8 to fill vector
+     * paths, where the winding number is counted into the stencil buffer and
+     * covered in a second pass.
+     *
+     * Part of the config query, so it cannot be turned on later: a default
+     * framebuffer with no stencil bits passes every stencil test, and the
+     * `stencil*` entry points quietly do nothing. Read `Gpu.stencilSize` for
+     * what was granted.
+     */
+    stencilSize?: number;
     /**
      * `'auto'` (the default) asks for ES 3.0 and falls back to ES 2.0. `3`
      * insists, erroring rather than downgrading silently; `2` pins.
@@ -242,6 +256,18 @@ export declare class Gpu {
     readonly eglVersion: string;
     /** The ES version EGL was asked for and granted: 2 or 3. */
     readonly contextVersion: 2 | 3;
+
+    /**
+     * Depth bits on the chosen config, which can exceed `GpuOptions.depthSize`
+     * — a request for 16 usually lands on 24.
+     */
+    readonly depthSize: number;
+    /**
+     * Stencil bits on the chosen config. `0` unless `GpuOptions.stencilSize`
+     * asked, and possibly more than it asked for; this, not the request, is
+     * what says whether the default framebuffer can stencil.
+     */
+    readonly stencilSize: number;
 
     /**
      * What the driver reports, which can be higher than `contextVersion` —

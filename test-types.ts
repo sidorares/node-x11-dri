@@ -39,6 +39,7 @@ createUdmabuf();
 const gpu = new Gpu({
     format: FORMAT.ARGB8888,
     depthSize: 24,
+    stencilSize: 8,
     glVersion: 'auto'
 });
 new Gpu();
@@ -58,6 +59,12 @@ gpu.makeCurrent(surface);
 const gl: GLContext = gpu.gl;
 const eglVendor: string = gpu.eglVendor;
 const contextVersion: 2 | 3 = gpu.contextVersion;
+
+// what the chosen config carries, which the request is only a floor for —
+// known from the constructor, unlike glVersion
+const depthBits: number = gpu.depthSize;
+if (gpu.stencilSize >= 8)
+    gl.enable(gl.STENCIL_TEST);
 
 // glVersion and features only exist once a context is current, so strict mode
 // makes the check compulsory — which is the intent, not an inconvenience.

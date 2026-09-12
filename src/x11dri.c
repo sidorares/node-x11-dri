@@ -222,6 +222,7 @@ typedef intptr_t EGLAttrib;
 #define EGL_GREEN_SIZE            0x3023
 #define EGL_RED_SIZE              0x3024
 #define EGL_DEPTH_SIZE            0x3025
+#define EGL_STENCIL_SIZE          0x3026
 #define EGL_SURFACE_TYPE          0x3033
 #define EGL_NATIVE_VISUAL_ID      0x302E
 #define EGL_RENDERABLE_TYPE       0x3040
@@ -1209,6 +1210,8 @@ typedef struct {
     EGLContext ctx;
     uint32_t format;   // GBM_FORMAT_* fourcc
     int es_version;    // the ES version EGL actually gave us: 2 or 3
+    int depth_bits;    // what the chosen config carries, which the request
+    int stencil_bits;  //   is only a floor for
     int destroyed;
 } Gpu;
 
@@ -1261,19 +1264,28 @@ static napi_value get_external(napi_env env, napi_value v, void **out) {
     return v;
 }
 
-// createGpu(drmFd, formatFourcc, depthSize, glVersion) -> external
+// createGpu(drmFd, formatFourcc, depthSize, stencilSize, glVersion) -> external
 // The fd is dup'ed; the caller keeps (and eventually closes) its own.
 // glVersion is 2 or 3 to insist on that ES version, or 0 to take the highest
 // on offer.
+//
+// depthSize and stencilSize are part of the config query, not of the context,
+// so they can only be asked for here: a surface whose config has no stencil
+// bits passes every stencil test for the rest of its life, whatever the
+// stencil entry points are told afterwards.
 static napi_value CreateGpu(napi_env env, napi_callback_info info) {
-    GET_ARGS(env, info, 4);
+    GET_ARGS(env, info, 5);
     int fd = arg_i32(env, args[0]);
     uint32_t format = arg_u32(env, args[1]);
     int depth_size = arg_i32(env, args[2]);
-    int want_es = arg_i32(env, args[3]);
+    int stencil_size = arg_i32(env, args[3]);
+    int want_es = arg_i32(env, args[4]);
     if (want_es != 0 && want_es != 2 && want_es != 3)
         THROWF(env, "glVersion must be 2, 3, or 0 for the highest available (got %d)",
                want_es);
+    if (depth_size < 0 || stencil_size < 0)
+        THROWF(env, "depthSize and stencilSize are bit counts, not negative (got %d, %d)",
+               depth_size, stencil_size);
 
     const char *e;
     if ((e = load_gbm()) || (e = load_egl()) || (e = load_gles()))
@@ -1323,6 +1335,7 @@ static napi_value CreateGpu(napi_env env, napi_callback_info info) {
             EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8,
             EGL_ALPHA_SIZE, want_alpha,
             EGL_DEPTH_SIZE, depth_size,
+            EGL_STENCIL_SIZE, stencil_size,
             EGL_NONE
         };
         EGLConfig cfgs[64];
@@ -1344,6 +1357,15 @@ static napi_value CreateGpu(napi_env env, napi_callback_info info) {
             g->ctx = egl.CreateContext(g->dpy, g->cfg, NULL, ctx_attribs);
             if (g->ctx) {
                 g->es_version = es;
+                // The request was a floor: EGL is free to hand back a config
+                // with more (a 16-bit depth request usually lands on 24), so
+                // what the config says is the honest answer.
+                EGLint bits = 0;
+                if (egl.GetConfigAttrib(g->dpy, g->cfg, EGL_DEPTH_SIZE, &bits))
+                    g->depth_bits = bits;
+                bits = 0;
+                if (egl.GetConfigAttrib(g->dpy, g->cfg, EGL_STENCIL_SIZE, &bits))
+                    g->stencil_bits = bits;
                 break;
             }
         }
@@ -1353,10 +1375,14 @@ static napi_value CreateGpu(napi_env env, napi_callback_info info) {
     if (!g->ctx) {
         EGLint ec = egl.GetError();
         egl.Terminate(g->dpy); gbm.device_destroy(g->gbm); close(dupfd); free(g);
+        // Name what was asked for: depth and stencil bits narrow the config
+        // query, so an over-large request is a real way to end up here.
         if (want_es)
             THROWF(env, "no ES %d context: neither a config nor a context for "
-                        "rgb888 + depth at that version (0x%x)", want_es, ec);
-        THROWF(env, "no EGL config or context for rgb888 + depth on this device (0x%x)", ec);
+                        "rgb888 + %d-bit depth + %d-bit stencil at that version (0x%x)",
+                   want_es, depth_size, stencil_size, ec);
+        THROWF(env, "no EGL config or context for rgb888 + %d-bit depth + "
+                    "%d-bit stencil on this device (0x%x)", depth_size, stencil_size, ec);
     }
 
     napi_value ext;
@@ -1364,7 +1390,7 @@ static napi_value CreateGpu(napi_env env, napi_callback_info info) {
     return ext;
 }
 
-// gpuInfo(gpu) -> { eglVendor, eglVersion, contextVersion }
+// gpuInfo(gpu) -> { eglVendor, eglVersion, contextVersion, depthSize, stencilSize }
 static napi_value GpuInfo(napi_env env, napi_callback_info info) {
     GET_ARGS(env, info, 1);
     Gpu *g;
@@ -1374,6 +1400,8 @@ static napi_value GpuInfo(napi_env env, napi_callback_info info) {
     obj_set(env, obj, "eglVendor", mk_str(env, egl.QueryString(g->dpy, EGL_VENDOR)));
     obj_set(env, obj, "eglVersion", mk_str(env, egl.QueryString(g->dpy, EGL_VERSION)));
     obj_set(env, obj, "contextVersion", mk_i32(env, g->es_version));
+    obj_set(env, obj, "depthSize", mk_i32(env, g->depth_bits));
+    obj_set(env, obj, "stencilSize", mk_i32(env, g->stencil_bits));
     return obj;
 }
 
