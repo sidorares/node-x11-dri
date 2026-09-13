@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.0](https://github.com/sidorares/node-x11-dri/compare/v0.8.1...v0.9.0) (2026-09-13)
+
+
+### Features
+
+* **unixsock:** a unix socket that passes descriptors, on the event loop ([#32](https://github.com/sidorares/node-x11-dri/issues/32)) ([d35b9e6](https://github.com/sidorares/node-x11-dri/commit/d35b9e600edd9836910b3d7db4eb1d74419093cf))
+
 ## [0.8.1](https://github.com/sidorares/node-x11-dri/compare/v0.8.0...v0.8.1) (2026-09-12)
 
 
