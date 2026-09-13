@@ -1453,3 +1453,75 @@ export declare function mapDmabuf(fd: number, size?: number): MappedDmabuf;
 
 /** Bracket CPU access to a dma-buf. Flags come from `DMABUF_SYNC`. */
 export declare function dmabufSync(fd: number, flags: number): void;
+
+// ---- unix sockets that pass descriptors ------------------------------------
+
+/** The events a `UnixSocket` emits. */
+export interface UnixSocketEvents {
+    connect: () => void;
+    ready: () => void;
+    data: (chunk: Uint8Array) => void;
+    drain: () => void;
+    end: () => void;
+    error: (err: Error) => void;
+    close: (hadError: boolean) => void;
+}
+
+/**
+ * A unix-domain stream socket that can send and receive file descriptors,
+ * driven by the event loop (`uv_poll`, no thread).
+ *
+ * Node's own sockets cannot receive descriptors — libuv aborts on control
+ * data it does not expect — and Wayland sends them routinely (the keymap,
+ * shm pools, clipboard pipes). The shape is `net.Socket`'s where it matters:
+ * `'connect'`, `'data'`, `'drain'`, `'end'`, `'error'`, `'close'`; `write()`
+ * answers `false` for backpressure; plus `sendFds()` and `takeFds()`.
+ *
+ * Descriptors given to `sendFds()` are consumed. Descriptors that arrive
+ * belong to the caller from `takeFds()` on — call it from the parser, in
+ * stream order, because the wire matches descriptors to messages by
+ * position — and any never taken are closed with the socket.
+ *
+ * Throws on a runtime that does not export libuv; the rest of the addon is
+ * unaffected by that.
+ */
+export declare class UnixSocket {
+    constructor(path: string);
+    /** Wrap an already-connected descriptor, e.g. one end of `socketpair()`. */
+    static fromFd(fd: number): UnixSocket;
+    readonly destroyed: boolean;
+    readonly connecting: boolean;
+    readonly writableEnded: boolean;
+    readonly readableEnded: boolean;
+    /** bytes queued and not yet handed to the kernel */
+    readonly writableLength: number;
+    write(chunk: Uint8Array | string, cb?: (err?: Error | null) => void): boolean;
+    write(chunk: string, encoding: string, cb?: (err?: Error | null) => void): boolean;
+    /** Write `buf` with `fds` attached to its first byte. Consumes the descriptors. */
+    sendFds(buf: Uint8Array, fds: ArrayLike<number>, cb?: (err?: Error | null) => void): boolean;
+    /** The next `n` received descriptors, oldest first. */
+    takeFds(n: number): number[];
+    ref(): this;
+    unref(): this;
+    end(data?: Uint8Array | string, cb?: () => void): this;
+    destroy(err?: Error): this;
+    // the EventEmitter surface, typed by event
+    on<E extends keyof UnixSocketEvents>(event: E, listener: UnixSocketEvents[E]): this;
+    once<E extends keyof UnixSocketEvents>(event: E, listener: UnixSocketEvents[E]): this;
+    off<E extends keyof UnixSocketEvents>(event: E, listener: UnixSocketEvents[E]): this;
+    emit<E extends keyof UnixSocketEvents>(event: E, ...args: Parameters<UnixSocketEvents[E]>): boolean;
+    setMaxListeners(n: number): this;
+    listenerCount(event: keyof UnixSocketEvents): number;
+}
+
+/** `pipe(2)`, close-on-exec. */
+export declare function pipe(): { read: number; write: number };
+
+/** A connected pair of unix stream sockets. For tests and in-process peers. */
+export declare function socketpair(): [number, number];
+
+/**
+ * A sealed memfd of `size` bytes — shareable memory a `wl_shm` pool or a
+ * udmabuf can be built on. Linux only.
+ */
+export declare function memfdCreate(size: number, name?: string): number;

@@ -2,7 +2,7 @@
   "targets": [
     {
       "target_name": "x11dri",
-      "sources": ["src/x11dri.c"],
+      "sources": ["src/x11dri.c", "src/unixsock.c"],
       "cflags": ["-fvisibility=hidden", "-Wall"],
       "conditions": [
         # macOS: dlopen lives in libSystem (there is no libdl to link), and

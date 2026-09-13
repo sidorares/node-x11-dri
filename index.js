@@ -848,6 +848,165 @@ function mapDmabuf(fd, size) {
     };
 }
 
+
+// ---------------------------------------------------------------------------
+// UnixSocket: a unix-domain stream socket that passes file descriptors
+// ---------------------------------------------------------------------------
+//
+// The shape is net.Socket's where it matters — 'connect'/'data'/'drain'/
+// 'end'/'error'/'close', write() answering false for backpressure — plus the
+// two descriptor calls node-x11's fd transports have: sendFds() and
+// takeFds(). A Wayland client library that takes an injected socket can be
+// handed one of these unchanged.
+//
+// Ownership: descriptors given to sendFds() are consumed; descriptors that
+// arrive are the caller's from takeFds() on, and any never taken are closed
+// with the socket. Descriptors are matched to messages by their position in
+// the stream, so takeFds() is called by the parser, in order, and nothing
+// else.
+const { EventEmitter } = require('events');
+
+class UnixSocket extends EventEmitter {
+    constructor(pathOrOpts) {
+        super();
+        this.setMaxListeners(0);
+        this.destroyed = false;
+        this.connecting = true;
+        this.writableEnded = false;
+        this.readableEnded = false;
+        this.pending = true;
+        // what lib/ext/{shm,dri3}.js and wayland clients check
+        this._fdCapable = true;
+        this._fdReceiving = true;
+        // Bun exports libuv's names but several are stubs that abort the
+        // process — uv_poll_init among them — so there is nothing to probe
+        // for at runtime; the only safe rule is not to try. Bun clients use
+        // its own bun:ffi transport (node-x11's lib/fdpass-bun.js).
+        if (typeof Bun !== 'undefined') {
+            throw new Error('UnixSocket needs libuv polling, which Bun does not provide to addons; use a bun:ffi transport instead');
+        }
+        const onEvent = (kind, payload) => this._onEvent(kind, payload);
+        if (pathOrOpts && typeof pathOrOpts === 'object' && typeof pathOrOpts.fd === 'number') {
+            this._handle = native.sockFromFd(pathOrOpts.fd, onEvent);
+        } else {
+            this._handle = native.sockConnect(String(pathOrOpts), onEvent);
+        }
+        if (native.sockConnected(this._handle)) {
+            // connected synchronously (the normal case for a unix socket with
+            // a listener): report it the way net.Socket would, next tick
+            process.nextTick(() => {
+                if (!this.destroyed && this.connecting) this._onEvent('connect');
+            });
+        }
+    }
+
+    /** Wrap an already-connected descriptor — a socketpair end, say. */
+    static fromFd(fd) {
+        return new UnixSocket({ fd });
+    }
+
+    _onEvent(kind, payload) {
+        switch (kind) {
+            case 'connect':
+                this.connecting = false;
+                this.pending = false;
+                this.emit('connect');
+                this.emit('ready');
+                break;
+            case 'data':
+                this.emit('data', payload);
+                break;
+            case 'drain':
+                this.emit('drain');
+                break;
+            case 'end':
+                this.readableEnded = true;
+                this.emit('end');
+                break;
+            case 'error':
+                this.emit('error', new Error(payload));
+                break;
+            case 'close':
+                this.destroyed = true;
+                this._handle = null;
+                this.emit('close', false);
+                break;
+        }
+    }
+
+    get writableLength() {
+        return this._handle ? native.sockPending(this._handle) : 0;
+    }
+
+    write(chunk, encoding, cb) {
+        if (typeof encoding === 'function') { cb = encoding; encoding = undefined; }
+        if (typeof chunk === 'string') chunk = Buffer.from(chunk, encoding || 'utf8');
+        if (this.destroyed || this.writableEnded || !this._handle) {
+            if (cb) process.nextTick(cb, new Error('write after end'));
+            return false;
+        }
+        const ok = native.sockWrite(this._handle, chunk);
+        if (cb) process.nextTick(cb);
+        return ok;
+    }
+
+    /** Write `buf` with `fds` attached to its first byte. Consumes the fds. */
+    sendFds(buf, fds, cb) {
+        const list = Array.from(fds, (fd) => fd | 0);
+        if (this.destroyed || this.writableEnded || !this._handle) {
+            for (const fd of list) { try { require('fs').closeSync(fd); } catch { /* */ } }
+            if (cb) process.nextTick(cb, new Error('connection is not fd-capable or already closed'));
+            return false;
+        }
+        const ok = native.sockSendFds(this._handle, buf, list);
+        if (cb) process.nextTick(cb);
+        return ok;
+    }
+
+    /** The next `n` received descriptors, oldest first. The caller owns them. */
+    takeFds(n) {
+        return this._handle ? native.sockTakeFds(this._handle, n) : [];
+    }
+
+    ref() { if (this._handle) native.sockRef(this._handle, true); return this; }
+    unref() { if (this._handle) native.sockRef(this._handle, false); return this; }
+    setNoDelay() { return this; }
+    setKeepAlive() { return this; }
+
+    end(data, cb) {
+        if (typeof data === 'function') { cb = data; data = undefined; }
+        if (data) this.write(data);
+        this.writableEnded = true;
+        // no half-close on this socket: once the queue is out, close it
+        const finish = () => { this.destroy(); if (cb) cb(); };
+        if (this.writableLength === 0) process.nextTick(finish);
+        else this.once('drain', finish);
+        return this;
+    }
+
+    destroy(err) {
+        if (this.destroyed || !this._handle) return this;
+        if (err) this.emit('error', err);
+        native.sockClose(this._handle);
+        return this;
+    }
+}
+
+/** pipe(2), close-on-exec: `{ read, write }`. */
+function pipe() {
+    return native.pipe();
+}
+
+/** A connected pair of unix stream sockets, as descriptors. */
+function socketpair() {
+    return native.socketpair();
+}
+
+/** A sealed memfd of `size` bytes — shareable memory for wl_shm and friends. Linux only. */
+function memfdCreate(size, name = 'x11-dri') {
+    return native.memfdCreate(name, size);
+}
+
 module.exports = {
     probe: native.probe,
     dup: native.dup,
@@ -862,5 +1021,9 @@ module.exports = {
     FORMAT,
     GBM_USE,
     MODIFIER,
-    DMABUF_SYNC
+    DMABUF_SYNC,
+    UnixSocket,
+    pipe,
+    socketpair,
+    memfdCreate
 };
