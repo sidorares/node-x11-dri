@@ -380,6 +380,13 @@ export interface Surface {
      * torn down.
      */
     resize(width: number, height: number): void;
+    /**
+     * Release every locked buffer and free the swapchain. A surface that is
+     * current is unbound first, and no context is current afterwards — as
+     * after `gpu.makeCurrent(null)` — until the next `makeCurrent`. EGL would
+     * defer deleting a current surface, but not the gbm surface under it,
+     * and NVIDIA's driver failed every later swap after one went that way.
+     */
     destroy(): void;
 }
 

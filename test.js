@@ -27,6 +27,20 @@ const skip = why => { const e = new Error(why); e.skip = why; throw e; };
 const caps = dri.probe();
 console.log('probe:', caps);
 
+// A surface in the GPU's own layout, or a linear one where the driver will
+// not give EGL a window surface over a tiled buffer: NVIDIA's answers
+// eglCreateWindowSurface over a render-only gbm surface with an error and
+// takes the same size once it is linear — the retry ntk's swap chain makes
+// (its `linearFallback`). Without it none of the GL tests below ran there.
+const makeSurface = (gpu, width, height) => {
+    try {
+        return gpu.createSurface(width, height);
+    } catch (e) {
+        if (!/eglCreateWindowSurface/.test(e.message)) throw e;
+        return gpu.createSurface(width, height, dri.GBM_USE.LINEAR);
+    }
+};
+
 // Every GL test needs the same preamble — a render node, a context on it, a
 // surface to draw into — and every one of them should skip rather than fail
 // on a machine with no GPU to offer.
@@ -42,7 +56,7 @@ const glSurface = (size, opts) => {
     } catch (e) {
         skip(`render node unusable: ${e.message}`);
     }
-    const surf = gpu.createSurface(size, size);
+    const surf = makeSurface(gpu, size, size);
     gpu.makeCurrent(surf);
     gpu.gl.viewport(0, 0, size, size);
     return { gpu, surf, gl: gpu.gl };
@@ -380,7 +394,7 @@ report('GPU render + readback + dma-buf export', () => {
     } catch (e) {
         skip(`render node unusable: ${e.message}`);
     }
-    const surf = gpu.createSurface(64, 64);
+    const surf = makeSurface(gpu, 64, 64);
     gpu.makeCurrent(surf);
     const gl = gpu.gl;
     gl.viewport(0, 0, 64, 64);
@@ -468,6 +482,41 @@ report('GPU surface resize: same identity, new buffers, new generation', () => {
     assert.throws(() => surf.swap(), /destroyed/);
     gpu.destroy();
     return `64x64 -> ${out.width}x${out.height}, generation ${surf.generation}`;
+});
+
+// A caller that replaces a surface with a new one — ntk's swap chain makes
+// one per size — destroys the old one, which is usually the current one.
+// EGL defers deleting a current EGL surface, but the gbm surface under it
+// went at once, and on NVIDIA's driver every swap after that failed with
+// EGL_BAD_SURFACE, on whichever surface was made current next. So a current
+// surface is unbound before it goes, and nothing is current afterwards.
+report('destroying the current surface leaves the next one drawable', () => {
+    const { gpu, surf, gl } = glSurface(32);
+    gl.clearColor(0, 0, 0, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    const first = surf.swap();
+    if (first.isNew) fs.closeSync(first.fd);
+    surf.release(first);
+
+    surf.destroy(); // current when it goes
+    assert.throws(() => gl.clear(gl.COLOR_BUFFER_BIT), /no current GL context/,
+        'the destroyed surface is not current any more, and nothing else is');
+
+    const next = makeSurface(gpu, 48, 40);
+    gpu.makeCurrent(next);
+    gl.viewport(0, 0, 48, 40);
+    gl.clearColor(0.2, 0.4, 0.6, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    const out = next.swap(); // threw EGL_BAD_SURFACE (0x300d) on NVIDIA
+    assert.ok(out, 'the new surface swaps');
+    assert.deepStrictEqual([out.width, out.height], [48, 40]);
+    const px = new Uint8Array(4);
+    gl.readPixels(47, 39, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    assert.deepStrictEqual(Array.from(px), [51, 102, 153, 255]);
+    if (out.isNew) fs.closeSync(out.fd);
+    next.release(out);
+    next.destroy();
+    gpu.destroy();
 });
 
 // Every argument check happens in JavaScript, before the addon is asked for
