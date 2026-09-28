@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.1](https://github.com/sidorares/node-x11-dri/compare/v0.9.0...v0.9.1) (2026-09-28)
+
+
+### Bug Fixes
+
+* **surface:** a current surface is unbound before it is destroyed ([#34](https://github.com/sidorares/node-x11-dri/issues/34)) ([429ccf4](https://github.com/sidorares/node-x11-dri/commit/429ccf466d27cf22010fc459820dc1ef583ca650))
+
 ## [0.9.0](https://github.com/sidorares/node-x11-dri/compare/v0.8.1...v0.9.0) (2026-09-13)
 
 
