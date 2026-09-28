@@ -555,6 +555,8 @@ class Surface {
         this.width = width >>> 0;
         this.height = height >>> 0;
     }
+    // A current surface is unbound first: nothing is current afterwards,
+    // as after gpu.makeCurrent(null) (see destroySurface in src/x11dri.c).
     destroy() {
         native.destroySurface(this._handle);
     }

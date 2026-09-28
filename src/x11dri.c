@@ -1738,12 +1738,26 @@ static napi_value ResizeSurface(napi_env env, napi_callback_info info) {
     return mk_u32(env, s->generation);
 }
 
-// destroySurface(surface) — all locked buffers are released first
+// destroySurface(surface) — all locked buffers are released first, and a
+// surface that is current is unbound before it goes: no context is current
+// afterwards, as after makeCurrent(gpu, null).
+//
+// EGL tolerates destroying a current EGL surface — it defers the delete until
+// the surface stops being current — but the gbm_surface under it is gone at
+// once, and on NVIDIA's driver every swap after that, on any surface made
+// current next, failed with EGL_BAD_SURFACE. resizeSurface has always unbound
+// first; this is the same rule for a caller that replaces a surface with a
+// new one instead (ntk's swap chain does, one generation per size).
 static napi_value DestroySurface(napi_env env, napi_callback_info info) {
     GET_ARGS(env, info, 1);
     Surface *s;
     if (!get_external(env, args[0], (void **)&s)) return NULL;
     if (!s->destroyed) {
+        if (current_surface == s) {
+            egl.MakeCurrent(s->gpu->dpy, NULL, NULL, NULL);
+            has_current = 0;
+            current_surface = NULL;
+        }
         for (int i = 0; i < s->nlocked; i++)
             gbm.surface_release_buffer(s->gs, s->locked[i].bo);
         s->nlocked = 0;
@@ -1751,7 +1765,6 @@ static napi_value DestroySurface(napi_env env, napi_callback_info info) {
         gbm.surface_destroy(s->gs);
         s->esurf = NULL;
         s->gs = NULL;
-        if (current_surface == s) current_surface = NULL;
         s->destroyed = 1;
     }
     return NULL;
